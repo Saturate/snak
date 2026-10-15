@@ -1,0 +1,10 @@
+[package]
+name = "snak-demo"
+description = "In-memory workspace for developing the UI without a Teams account."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono = "0.4"
+snak-chat = { version = "0.1.0", path = "../snak-chat" }
+tokio = { version = "1", features = ["sync", "time", "rt"] }

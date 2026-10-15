@@ -1,0 +1,322 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Endpoints derived from Squads (https://github.com/IanTerzo/Squads, src/api.rs, MPL-2.0).
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+
+use crate::auth::{self, AccessToken, scope};
+use crate::error::{CoreError, Result};
+use crate::models::{ChannelPage, Me, MessagePage, Person, ReplyChain, UserDetails};
+
+const TEAMS: &str = "https://teams.microsoft.com";
+const GRAPH_BATCH_LIMIT: usize = 20;
+// Skype tokens share the access token cache; this key can never collide with a scope URL.
+const SKYPE_TOKEN_KEY: &str = "skypetoken";
+
+pub struct TeamsClient {
+    http: reqwest::Client,
+    refresh_token: Mutex<String>,
+    tokens: Mutex<HashMap<&'static str, AccessToken>>,
+    region: String,
+    me: Me,
+}
+
+impl TeamsClient {
+    /// Builds a client from a stored refresh token: finds the tenant's region and the signed-in user.
+    pub async fn connect(http: reqwest::Client, refresh_token: String) -> Result<Self> {
+        let mut client = Self {
+            http,
+            refresh_token: Mutex::new(refresh_token),
+            tokens: Mutex::new(HashMap::new()),
+            region: String::new(),
+            me: Me {
+                id: String::new(),
+                display_name: None,
+                mail: None,
+                user_principal_name: None,
+            },
+        };
+        client.region = client.discover_region().await?;
+        client.me = client
+            .get_json(scope::GRAPH, "https://graph.microsoft.com/v1.0/me")
+            .await?;
+        Ok(client)
+    }
+
+    pub fn me(&self) -> &Me {
+        &self.me
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub(crate) async fn token(&self, scope: &'static str) -> Result<String> {
+        if let Some(token) = self.tokens.lock().await.get(scope)
+            && token.expires_at > Instant::now()
+        {
+            return Ok(token.value.clone());
+        }
+
+        let mut refresh = self.refresh_token.lock().await;
+        let (token, rotated) = auth::access_token(&self.http, &refresh, scope).await?;
+        if let Some(rotated) = rotated {
+            auth::save_refresh_token(&rotated)?;
+            *refresh = rotated;
+        }
+        let value = token.value.clone();
+        self.tokens.lock().await.insert(scope, token);
+        Ok(value)
+    }
+
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Skype token for services that predate Entra auth (Trouter, the registrar).
+    /// Derived from Squads (src/api.rs, `gen_skype_token`).
+    pub(crate) async fn skype_token(&self) -> Result<String> {
+        if let Some(token) = self.tokens.lock().await.get(SKYPE_TOKEN_KEY)
+            && token.expires_at > Instant::now()
+        {
+            return Ok(token.value.clone());
+        }
+        let (body, url) = self.authz().await?;
+        self.cache_skype_token(&body)
+            .await
+            .ok_or(CoreError::MissingField {
+                url,
+                field: "tokens.skypeToken",
+            })
+    }
+
+    /// Drops a cached Skype token the server has rejected before its expiry.
+    pub(crate) async fn forget_skype_token(&self) {
+        self.tokens.lock().await.remove(SKYPE_TOKEN_KEY);
+    }
+
+    // The same authz response carries both the region and a Skype token, so
+    // one call at connect time fills both.
+    async fn authz(&self) -> Result<(Value, String)> {
+        let token = self.token(scope::SKYPE).await?;
+        let url = format!("{TEAMS}/api/authsvc/v1.0/authz");
+        let res = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .header("Content-Length", "0")
+            .send()
+            .await?;
+        let body = decode(res, &url).await?;
+        Ok((body, url))
+    }
+
+    async fn cache_skype_token(&self, authz: &Value) -> Option<String> {
+        let tokens = authz.get("tokens")?;
+        let value = tokens.get("skypeToken")?.as_str()?.to_string();
+        let lifetime = auth::expires_in_secs(tokens.get("expiresIn")).saturating_sub(60);
+        self.tokens.lock().await.insert(
+            SKYPE_TOKEN_KEY,
+            AccessToken {
+                value: value.clone(),
+                expires_at: Instant::now() + Duration::from_secs(lifetime),
+            },
+        );
+        Some(value)
+    }
+
+    // Squads hardcodes `emea`. The authz response says which regional chat
+    // service this tenant lives on, e.g. https://emea.ng.msg.teams.microsoft.com.
+    async fn discover_region(&self) -> Result<String> {
+        let (body, _) = self.authz().await?;
+        self.cache_skype_token(&body).await;
+
+        if let Some(region) = body.get("region").and_then(Value::as_str) {
+            return Ok(region.to_string());
+        }
+        let from_chat_service = body
+            .pointer("/regionGtms/chatService")
+            .and_then(Value::as_str)
+            .and_then(|url| url.strip_prefix("https://"))
+            .and_then(|host| host.split('.').next())
+            .map(str::to_string);
+        Ok(from_chat_service.unwrap_or_else(|| "emea".to_string()))
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, scope: &'static str, url: &str) -> Result<T> {
+        let token = self.token(scope).await?;
+        let res = self.http.get(url).bearer_auth(token).send().await?;
+        decode(res, url).await
+    }
+
+    /// All joined teams with their channels, plus all chats.
+    pub async fn teams_and_chats(&self) -> Result<UserDetails> {
+        let url = format!(
+            "{TEAMS}/api/csa/{}/api/v2/teams/users/me?isPrefetch=false&enableMembershipSummary=true&enableRC2Fetch=false",
+            self.region
+        );
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
+    }
+
+    /// Newest-first page of a chat's messages.
+    pub async fn chat_messages(&self, conversation_id: &str) -> Result<MessagePage> {
+        let url = format!(
+            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/messages?pageSize=200",
+            self.region,
+            urlencode(conversation_id)
+        );
+        self.get_json(scope::CHAT, &url).await
+    }
+
+    /// Recent channel posts, each with its replies.
+    pub async fn channel_posts(&self, team_id: &str, channel_id: &str) -> Result<Vec<ReplyChain>> {
+        let url = format!(
+            "{TEAMS}/api/csa/{}/api/v2/teams/{}/channels/{}",
+            self.region,
+            urlencode(team_id),
+            urlencode(channel_id)
+        );
+        let page: ChannelPage = self.get_json(scope::CHAT_AGGREGATOR, &url).await?;
+        Ok(page.reply_chains)
+    }
+
+    /// Sends to a chat or channel. Pass `reply_to` to reply in a channel thread.
+    pub async fn send_message(
+        &self,
+        conversation_id: &str,
+        reply_to: Option<&str>,
+        text: &str,
+    ) -> Result<()> {
+        let target = match reply_to {
+            Some(root) => format!("{conversation_id};messageid={root}"),
+            None => conversation_id.to_string(),
+        };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let client_message_id = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_string();
+        let body = json!({
+            "id": "-1",
+            "type": "Message",
+            "conversationid": target,
+            "conversationLink": format!("blah/{target}"),
+            "from": format!("8:orgid:{}", self.me.id),
+            "composetime": now,
+            "originalarrivaltime": now,
+            "content": crate::html::from_text(text),
+            "messagetype": "RichText/Html",
+            "contenttype": "Text",
+            "imdisplayname": self.me.display_name,
+            "clientmessageid": client_message_id,
+            "callId": "",
+            "state": 0,
+            "version": "0",
+            "amsreferences": [],
+            "properties": {
+                "importance": "",
+                "subject": null,
+                "title": "",
+                "cards": "[]",
+                "links": "[]",
+                "mentions": "[]",
+                "files": "[]",
+                "formatVariant": "TEAMS",
+            },
+            "postType": "Standard",
+            "crossPostChannels": [],
+        });
+
+        let url = format!(
+            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/messages",
+            self.region,
+            urlencode(&target)
+        );
+        let token = self.token(scope::CHAT).await?;
+        let res = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        let _: Value = decode(res, &url).await?;
+        Ok(())
+    }
+
+    /// Names and UPNs for user object IDs, via Graph batch requests.
+    pub async fn people(&self, ids: &[String]) -> Result<HashMap<String, Person>> {
+        let mut people = HashMap::new();
+        let url = "https://graph.microsoft.com/v1.0/$batch";
+        for chunk in ids.chunks(GRAPH_BATCH_LIMIT) {
+            let requests: Vec<Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    json!({
+                        "id": i.to_string(),
+                        "method": "GET",
+                        "url": format!("/users/{id}?$select=id,displayName,userPrincipalName"),
+                    })
+                })
+                .collect();
+            let token = self.token(scope::GRAPH).await?;
+            let res = self
+                .http
+                .post(url)
+                .bearer_auth(token)
+                .json(&json!({ "requests": requests }))
+                .send()
+                .await?;
+            let body: Value = decode(res, url).await?;
+            for response in body["responses"].as_array().into_iter().flatten() {
+                let user = &response["body"];
+                if let Some(id) = user["id"].as_str() {
+                    people.insert(
+                        id.to_string(),
+                        Person {
+                            display_name: user["displayName"].as_str().map(str::to_string),
+                            upn: user["userPrincipalName"].as_str().map(str::to_string),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(people)
+    }
+}
+
+pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &str) -> Result<T> {
+    let status = res.status();
+    let body = res.text().await?;
+    if !status.is_success() {
+        return Err(CoreError::Http {
+            status: status.as_u16(),
+            url: url.to_string(),
+            body,
+        });
+    }
+    // Some write endpoints answer 201 with an empty body.
+    let body = if body.trim().is_empty() {
+        "null"
+    } else {
+        &body
+    };
+    serde_json::from_str(body).map_err(|source| CoreError::Decode {
+        url: url.to_string(),
+        source,
+    })
+}
+
+// Conversation IDs look like `19:abc@thread.v2`; Teams expects them unescaped
+// apart from characters that would break the path.
+fn urlencode(id: &str) -> String {
+    id.replace('#', "%23").replace('?', "%3F")
+}

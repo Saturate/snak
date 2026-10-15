@@ -1,0 +1,10 @@
+[package]
+name = "snak-chat"
+description = "Backend-neutral chat model and the trait every backend implements."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }

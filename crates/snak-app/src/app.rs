@@ -768,6 +768,8 @@ impl Snak {
         const PENDING_TIMEOUT_SECS: i64 = 120;
         let now = chrono::Utc::now();
         let selected = self.selected.clone();
+        // Oldest first, so each server copy goes to the send it belongs to.
+        let mut claimed = std::collections::HashSet::new();
         self.pending.retain(|p| {
             let fresh = p
                 .message
@@ -775,7 +777,11 @@ impl Snak {
                 .is_some_and(|t| (now - t).num_seconds() < PENDING_TIMEOUT_SECS);
             // Rows only say anything about the conversation they came from.
             let here = Some(&p.conversation) == selected.as_ref();
-            fresh && !(here && arrived(&rows, p))
+            let copy = here.then(|| arrival(&rows, p, &claimed)).flatten();
+            if let Some(id) = &copy {
+                claimed.insert(id.clone());
+            }
+            fresh && copy.is_none()
         });
         rows.retain(|m| !m.pending);
         for row in &mut rows {
@@ -1090,6 +1096,7 @@ impl Snak {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct Pending {
     conversation: ConversationId,
     reply_to: Option<MessageId>,
@@ -1101,9 +1108,21 @@ struct Pending {
 
 /// Whether the service's copy of a locally sent message is in `rows`:
 /// same author, same text, sent within a couple of minutes.
+#[cfg(test)]
 fn arrived(rows: &[Message], pending: &Pending) -> bool {
+    arrival(rows, pending, &Default::default()).is_some()
+}
+
+/// The service's copy of `pending` in `rows`, if any, skipping copies another
+/// pending message already claimed: two quick sends of the same text must
+/// each get their own copy.
+fn arrival(
+    rows: &[Message],
+    pending: &Pending,
+    claimed: &std::collections::HashSet<MessageId>,
+) -> Option<MessageId> {
     let Body::Text(text) = &pending.message.body else {
-        return false;
+        return None;
     };
     let candidates: Vec<&Message> = match &pending.reply_to {
         None => rows.iter().collect(),
@@ -1116,8 +1135,8 @@ fn arrived(rows: &[Message], pending: &Pending) -> bool {
     let want = normalise(text);
     candidates
         .into_iter()
-        .filter(|m| !m.pending && !pending.seen.contains(&m.id))
-        .any(|m| {
+        .filter(|m| !m.pending && !pending.seen.contains(&m.id) && !claimed.contains(&m.id))
+        .find(|m| {
             m.author_id == pending.message.author_id
             // An older copy of the same text is an earlier message, not this
             // one; a little slack covers clock skew against the server.
@@ -1131,6 +1150,7 @@ fn arrived(rows: &[Message], pending: &Pending) -> bool {
                 _ => false,
             }
         })
+        .map(|m| m.id.clone())
 }
 
 /// A refetch returns the newest page only. When a new message pushes the
@@ -2697,6 +2717,25 @@ mod tests {
         assert!(!arrived(&[earlier], &local));
         let just_now = at(message("2", "me", Body::Html("<p>ok</p>".into()), false), 0);
         assert!(arrived(&[just_now], &local));
+    }
+
+    #[test]
+    fn two_quick_sends_of_the_same_text_each_need_their_own_copy() {
+        let first = Pending {
+            conversation: ConversationId("c".into()),
+            reply_to: None,
+            message: message("pending-1", "me", Body::Text("ok".into()), true),
+            seen: Default::default(),
+        };
+        let second = Pending {
+            message: message("pending-2", "me", Body::Text("ok".into()), true),
+            ..first.clone()
+        };
+        let copy = at(message("9", "me", Body::Html("<p>ok</p>".into()), false), 0);
+        let mut claimed = std::collections::HashSet::new();
+        let id = super::arrival(std::slice::from_ref(&copy), &first, &claimed).expect("first");
+        claimed.insert(id);
+        assert!(super::arrival(&[copy], &second, &claimed).is_none());
     }
 
     #[test]

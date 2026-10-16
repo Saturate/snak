@@ -37,6 +37,15 @@ struct State {
     last_op_write: Option<Instant>,
 }
 
+/// Held for every read, write, move and clear. Sign-out clears on a
+/// background thread (1Password may wait on Touch ID), and nothing may read,
+/// move or save the login until that has finished.
+static STORE_OPS: Mutex<()> = Mutex::new(());
+
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    STORE_OPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // Process-wide because token rotation saves from deep inside the client.
 static STATE: Mutex<State> = Mutex::new(State {
     storage: Storage::Keychain,
@@ -57,6 +66,7 @@ pub async fn set_storage(storage: Storage) {
     }
     let target = storage.clone();
     let moved = tokio::task::spawn_blocking(move || {
+        let _ops = exclusive();
         let Some(token) = read(&previous) else {
             return Ok(false);
         };
@@ -89,10 +99,13 @@ pub fn use_storage_without_moving(storage: Storage) {
 
 pub async fn load() -> Option<String> {
     let storage = state().storage.clone();
-    tokio::task::spawn_blocking(move || read(&storage))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        let _ops = exclusive();
+        read(&storage)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// `force` skips the 1Password write throttle, for a fresh login.
@@ -109,9 +122,12 @@ pub(crate) async fn save(token: String, force: bool) -> Result<()> {
         }
         state.storage.clone()
     };
-    let written = tokio::task::spawn_blocking(move || write(&storage, &token))
-        .await
-        .map_err(|e| CoreError::Keychain(e.to_string()))?;
+    let written = tokio::task::spawn_blocking(move || {
+        let _ops = exclusive();
+        write(&storage, &token)
+    })
+    .await
+    .map_err(|e| CoreError::Keychain(e.to_string()))?;
     if written.is_ok() {
         state().last_op_write = Some(Instant::now());
     }
@@ -120,6 +136,7 @@ pub(crate) async fn save(token: String, force: bool) -> Result<()> {
 
 /// Signs out everywhere Snak might have put the login.
 pub fn clear() {
+    let _ops = exclusive();
     delete(&Storage::Keychain);
     delete(&Storage::File);
     if let Storage::OnePassword { account } = state().storage.clone() {
@@ -200,14 +217,21 @@ fn write(storage: &Storage, token: &str) -> Result<()> {
 
 /// Ids of our items, most recently updated first.
 fn op_item_ids(account: &str) -> Vec<String> {
-    let Ok(out) = op(
+    let out = match op(
         account,
         &["item", "list", "--tags", "snak", "--format", "json"],
         None,
-    ) else {
-        return Vec::new();
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            // Usually 1Password locked or the prompt dismissed. On sign-out
+            // this means the item stays, so say so rather than fail silently.
+            tracing::warn!(error = %e, "could not list Snak's 1Password items");
+            return Vec::new();
+        }
     };
     let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
+        tracing::warn!("unexpected output from op item list");
         return Vec::new();
     };
     let mut ours: Vec<(&str, &str)> = items

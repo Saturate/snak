@@ -112,6 +112,18 @@ impl TeamsClient {
         self.tokens.lock().await.remove(SKYPE_TOKEN_KEY);
     }
 
+    /// Drops the Skype token only if it is still the one that was rejected,
+    /// so parallel 401s don't each throw away a token another just fetched.
+    async fn forget_skype_token_if(&self, rejected: &str) {
+        let mut tokens = self.tokens.lock().await;
+        if tokens
+            .get(SKYPE_TOKEN_KEY)
+            .is_some_and(|t| t.value == rejected)
+        {
+            tokens.remove(SKYPE_TOKEN_KEY);
+        }
+    }
+
     // The same authz response carries both the region and a Skype token, so
     // one call at connect time fills both.
     async fn authz(&self) -> Result<(Value, String)> {
@@ -269,8 +281,10 @@ impl TeamsClient {
             crate::backend::MediaHost::Giphy => None,
         };
         let mut res = request(token.clone()).send().await?;
-        if res.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_some() {
-            self.forget_skype_token().await;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = &token
+        {
+            self.forget_skype_token_if(rejected).await;
             res = request(Some(self.skype_token().await?)).send().await?;
         }
         let status = res.status();

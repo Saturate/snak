@@ -1,0 +1,4 @@
+# changesetter bumps the workspace version but leaves the members at the old
+# version in Cargo.lock, so the release commit would leave the lock stale.
+[hooks]
+post_bump = ["cargo update --workspace"]

@@ -163,7 +163,7 @@ impl SettingsWindow {
                                 },
                                 |cx: &App| Settings::get(cx).ui_font_size,
                                 |value: f64, cx: &mut App| {
-                                    Settings::update(cx, |s| s.ui_font_size = value)
+                                    Settings::update_when_idle(cx, |s| s.ui_font_size = value)
                                 },
                             )
                             .default_value(defaults.ui_font_size),
@@ -184,7 +184,9 @@ impl SettingsWindow {
                                 ..Default::default()
                             },
                             |cx: &App| Settings::get(cx).dm_limit,
-                            |value: f64, cx: &mut App| Settings::update(cx, |s| s.dm_limit = value),
+                            |value: f64, cx: &mut App| {
+                                Settings::update_when_idle(cx, |s| s.dm_limit = value)
+                            },
                         )
                         .default_value(defaults.dm_limit),
                     )

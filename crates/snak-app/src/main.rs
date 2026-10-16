@@ -50,9 +50,18 @@ pub fn io<T: Send + 'static>(
             .build()
             .unwrap_or_else(|e| panic!("cannot start the network runtime: {e}"))
     });
-    let handle = runtime.spawn(future);
+    // Aborted when the caller stops waiting: a replaced sign-in task must
+    // stop polling Entra, and `end_session` must cancel requests in flight.
+    // Blocking store work runs on spawn_blocking, which an abort doesn't cut.
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut handle = AbortOnDrop(runtime.spawn(future));
     async move {
-        handle
+        (&mut handle.0)
             .await
             .map_err(|e| ChatError::Other(format!("background task stopped: {e}")))?
     }

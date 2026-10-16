@@ -130,6 +130,13 @@ pub struct Snak {
     screen: Screen,
     error: Option<SharedString>,
     live: bool,
+    /// Bumped whenever a session ends. Detached requests (send, mark read)
+    /// outlive `end_session`, so they check it before reporting back: an old
+    /// session's "expired" must not sign the next one out.
+    session: u64,
+    /// The `session` value of the last sign-out, which throws drafts away;
+    /// an expiry keeps them.
+    drafts_cleared: u64,
 
     conversations: Vec<Conversation>,
     jump: Entity<InputState>,
@@ -226,6 +233,8 @@ impl Snak {
             screen: Screen::Starting,
             error: None,
             live: false,
+            session: 0,
+            drafts_cleared: 0,
             conversations: Vec::new(),
             jump,
             palette: cx.new(|cx| CommandState::new(window, cx)),
@@ -374,7 +383,9 @@ impl Snak {
     /// Drops everything tied to the signed-in account, including requests in
     /// flight, so nothing from it lands after the next sign-in.
     fn end_session(&mut self, clear_drafts: bool, cx: &mut Context<Self>) {
+        self.session += 1;
         if clear_drafts {
+            self.drafts_cleared = self.session;
             self.drafts.clear();
             self.thread_drafts.clear();
         } else {
@@ -405,6 +416,27 @@ impl Snak {
     }
 
     /// Keeps what's typed in both composers as drafts of where it was typed.
+    /// Puts text that didn't send back into its conversation's (or thread's)
+    /// draft, ahead of anything typed there since.
+    fn keep_unsent(
+        &mut self,
+        to: &ConversationId,
+        in_thread: bool,
+        root: Option<MessageId>,
+        text: &str,
+    ) {
+        if in_thread {
+            if let Some(root) = root {
+                let key = (to.clone(), root);
+                let existing = self.thread_drafts.remove(&key).unwrap_or_default();
+                self.thread_drafts.insert(key, join_drafts(text, &existing));
+            }
+        } else {
+            let existing = self.drafts.remove(to).unwrap_or_default();
+            self.drafts.insert(to.clone(), join_drafts(text, &existing));
+        }
+    }
+
     fn stash_drafts(&mut self, cx: &mut Context<Self>) {
         if let Some(conversation) = self.selected.clone() {
             let typed = self.composer.read(cx).value().to_string();
@@ -771,10 +803,18 @@ impl Snak {
         }
         conversation.unread = false;
         let id = id.clone();
+        let session = self.session;
         cx.spawn(async move |this, cx| {
             let result = io(async move { backend.mark_read(&id).await }).await;
             if let Err(e) = result {
-                this.update(cx, |this, cx| this.show_error(e, cx)).ok();
+                this.update(cx, |this, cx| {
+                    if this.session == session {
+                        this.show_error(e, cx);
+                    } else {
+                        tracing::debug!(error = %e, "ignoring a mark-read error from an ended session");
+                    }
+                })
+                .ok();
             }
         })
         .detach();
@@ -1023,10 +1063,21 @@ impl Snak {
         let started = std::time::Instant::now();
         let sent_to = id.clone();
         let sent_in_thread = reply_to.clone();
+        let session = self.session;
         cx.spawn_in(window, async move |this, cx| {
             let sent = text.clone();
             let result = io(async move { backend.send(&id, reply_to.as_ref(), &sent).await }).await;
             this.update_in(cx, |this, window, cx| match result {
+                // The session it was sent from is gone. A sign-out threw its
+                // text away; an expiry keeps unsent text, and the composer
+                // was already emptied, so this text goes back into its draft.
+                Err(_) if this.session != session => {
+                    if this.drafts_cleared <= session {
+                        this.keep_unsent(&sent_to, in_thread, sent_in_thread.clone(), &text);
+                    }
+                    tracing::debug!("a send from an ended session failed");
+                }
+                Ok(()) if this.session != session => {}
                 Ok(()) => {
                     tracing::debug!(elapsed_ms = started.elapsed().as_millis() as u64, "sent");
                     this.refetch_soon(cx);
@@ -1048,17 +1099,8 @@ impl Snak {
                         let current = input.read(cx).value().to_string();
                         let restored = join_drafts(&text, &current);
                         input.update(cx, |state, cx| state.set_value(restored, window, cx));
-                    } else if in_thread {
-                        if let Some(root) = sent_in_thread.clone() {
-                            let key = (sent_to.clone(), root);
-                            let existing = this.thread_drafts.remove(&key).unwrap_or_default();
-                            this.thread_drafts
-                                .insert(key, join_drafts(&text, &existing));
-                        }
                     } else {
-                        let existing = this.drafts.remove(&sent_to).unwrap_or_default();
-                        this.drafts
-                            .insert(sent_to.clone(), join_drafts(&text, &existing));
+                        this.keep_unsent(&sent_to, in_thread, sent_in_thread.clone(), &text);
                     }
                     this.show_error(e, cx);
                 }

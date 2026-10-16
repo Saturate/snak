@@ -142,6 +142,14 @@ impl Default for Settings {
 
 impl Global for Settings {}
 
+/// The save-and-apply [`Settings::update_when_idle`] has scheduled, held so
+/// the next keystroke can drop (cancel) it.
+struct PendingApply {
+    _task: gpui_kit::Task<()>,
+}
+
+impl Global for PendingApply {}
+
 impl Settings {
     pub fn get(cx: &App) -> &Settings {
         cx.global::<Settings>()
@@ -210,6 +218,23 @@ impl Settings {
         change(cx.global_mut::<Settings>());
         Settings::get(cx).save();
         Settings::apply(cx);
+    }
+
+    /// For number fields, which report every keystroke: typing "14" passes
+    /// through 1 (clamped to the minimum) first. The value is stored and saved
+    /// at once, so the field reads it back and a quick quit keeps it, but
+    /// applying it to the windows waits for a pause in typing.
+    pub fn update_when_idle(cx: &mut App, change: impl FnOnce(&mut Settings)) {
+        change(cx.global_mut::<Settings>());
+        Settings::get(cx).save();
+        let task = cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            cx.update(Settings::apply);
+        });
+        // Replacing the previous task cancels it.
+        cx.set_global(PendingApply { _task: task });
     }
 
     pub fn dark_theme_name(&self, cx: &App) -> String {

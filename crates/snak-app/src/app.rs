@@ -976,6 +976,7 @@ impl Snak {
             images: Vec::new(),
             replies: Vec::new(),
             pending: true,
+            mentions_me: false,
         };
         let local_id = local.id.clone();
         let seen = self
@@ -1244,6 +1245,14 @@ fn avatar_color(name: &str) -> Hsla {
     hsla((hash % 360) as f32 / 360., 0.45, 0.45, 1.)
 }
 
+/// Slack-style marker for a message that @mentions you: a tint and an accent bar.
+fn mentioned<E: Styled>(el: E, cx: &App) -> E {
+    let accent = cx.theme().warning;
+    el.bg(accent.opacity(0.10))
+        .border_l_2()
+        .border_color(accent)
+}
+
 fn is_safe_link(url: &str) -> bool {
     let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
     matches!(scheme.as_str(), "https" | "http" | "mailto" | "msteams")
@@ -1414,6 +1423,10 @@ fn render_row(
                 // Message HTML is written by other people; a click must not
                 // open file:, smb: or some app's custom scheme.
                 .on_link_click(|url, _, _, cx| {
+                    // Mentions are drawn as links but go nowhere yet.
+                    if url.starts_with("snak-mention:") {
+                        return;
+                    }
                     if is_safe_link(url) {
                         cx.open_url(url);
                     } else {
@@ -1505,6 +1518,7 @@ fn render_row(
             .pr_4()
             .py_0p5()
             .hover(|s| s.bg(theme.muted))
+            .when(row.mentions_me, |el| mentioned(el, cx))
             .child(content)
             .into_any_element();
     }
@@ -1518,6 +1532,7 @@ fn render_row(
         .pt_3()
         .pb_0p5()
         .hover(|s| s.bg(theme.muted))
+        .when(row.mentions_me, |el| mentioned(el, cx))
         .child(
             div()
                 .flex_none()
@@ -2728,6 +2743,7 @@ mod tests {
             images: Vec::new(),
             replies: Vec::new(),
             pending,
+            mentions_me: false,
         }
     }
 

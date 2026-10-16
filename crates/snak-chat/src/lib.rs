@@ -110,6 +110,8 @@ pub struct Message {
     pub replies: Vec<Message>,
     /// Sent from this client but not yet seen back from the service.
     pub pending: bool,
+    /// The message @mentions the signed-in user.
+    pub mentions_me: bool,
 }
 
 impl Message {
@@ -244,6 +246,7 @@ mod tests {
             images: Vec::new(),
             replies: Vec::new(),
             pending: false,
+            mentions_me: false,
         }
     }
 

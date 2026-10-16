@@ -121,9 +121,12 @@ impl ChatBackend for TeamsBackend {
                 Address::Channel {
                     team_id,
                     channel_id,
-                } => channel_messages(&self.client.channel_posts(&team_id, &channel_id).await?),
+                } => channel_messages(
+                    &self.client.channel_posts(&team_id, &channel_id).await?,
+                    &self.me.id,
+                ),
                 Address::Chat { id, .. } => {
-                    chat_messages(&self.client.chat_messages(&id).await?.messages)
+                    chat_messages(&self.client.chat_messages(&id).await?.messages, &self.me.id)
                 }
             })
         })
@@ -440,7 +443,14 @@ fn unnamed_members(chats: &[Chat], me_id: &str, names: &HashMap<String, String>)
     ids
 }
 
-fn to_message(message: &models::Message) -> Option<Message> {
+fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
+    // Mentions name people by MRI (8:orgid:<object id>); ours is the object id.
+    let my_mentions: Vec<String> = message
+        .mentions()
+        .into_iter()
+        .filter(|(_, mri)| !me_id.is_empty() && mri.rsplit(':').next() == Some(me_id))
+        .map(|(item, _)| item)
+        .collect();
     let message_type = message.message_type.as_deref().unwrap_or("");
     if message_type.starts_with("Control/") || message_type.starts_with("ThreadActivity/") {
         return None;
@@ -453,7 +463,7 @@ fn to_message(message: &models::Message) -> Option<Message> {
         let content = message.content.as_deref().unwrap_or("");
         let subject = message.subject();
         if message_type.starts_with("RichText/Html") {
-            let content = display_html(content);
+            let content = display_html(content, &my_mentions);
             Body::Html(match subject {
                 Some(s) => format!("<p><b>{}</b></p>{content}", html_escape::encode_text(&s)),
                 None => content,
@@ -499,6 +509,7 @@ fn to_message(message: &models::Message) -> Option<Message> {
         },
         replies: Vec::new(),
         pending: false,
+        mentions_me: !my_mentions.is_empty(),
     })
 }
 
@@ -591,7 +602,8 @@ fn message_images(html: &str) -> Vec<ImageRef> {
 /// Images in Teams messages sit behind Teams auth, so the renderer can't fetch
 /// them. Emoji become their alt text, media we fetch is drawn under the text,
 /// and every other image becomes a placeholder: no `<img>` reaches the renderer.
-fn display_html(html: &str) -> String {
+fn display_html(html: &str, my_mentions: &[String]) -> String {
+    let html = &render_mentions(html, my_mentions);
     let mut out = String::with_capacity(html.len());
     let mut copied = 0;
     for (start, end) in img_tags(html) {
@@ -630,6 +642,90 @@ fn collapse_blank_paragraphs(html: &str) -> String {
     out.trim_end_matches("<p>&nbsp;</p>").to_string()
 }
 
+/// Teams marks a mention as `<span itemtype="http://schema.skype.com/Mention"
+/// itemid="N">Name</span>`, and splits a full name into one span per word that
+/// share the itemid. Each run becomes one `@Full Name` link to `snak-mention:N`,
+/// bold when it's the signed-in user. The link scheme is never opened.
+fn render_mentions(html: &str, my_mentions: &[String]) -> String {
+    const MARKER: &str = "schema.skype.com/mention";
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while let Some(found) = lower[at..].find("<span") {
+        let start = at + found;
+        let Some(open_len) = lower[start..].find('>') else {
+            break;
+        };
+        let open_end = start + open_len + 1;
+        let tag = &html[start..open_end];
+        if !tag.to_ascii_lowercase().contains(MARKER) {
+            at = open_end;
+            continue;
+        }
+        let Some(item) = attribute(tag, "itemid") else {
+            at = open_end;
+            continue;
+        };
+        // Collect this span and any directly following spans for the same person.
+        let mut words = Vec::new();
+        let mut end = start;
+        let mut cursor = start;
+        while let Some(open_len) = lower[cursor..].find('>') {
+            let inner_start = cursor + open_len + 1;
+            let Some(close) = lower[inner_start..].find("</span>") else {
+                break;
+            };
+            let inner = &html[inner_start..inner_start + close];
+            words.push(crate::html::to_text(inner));
+            end = inner_start + close + "</span>".len();
+            // Next span for the same itemid, separated only by spaces?
+            let rest = &lower[end..];
+            let gap = rest.len()
+                - rest
+                    .trim_start_matches(|c: char| c.is_whitespace())
+                    .trim_start_matches("&nbsp;")
+                    .trim_start_matches(|c: char| c.is_whitespace())
+                    .len();
+            let next = end + gap;
+            let same_person = lower[next..].starts_with("<span")
+                && lower[next..].find('>').is_some_and(|next_len| {
+                    let next_tag = &html[next..next + next_len + 1];
+                    next_tag.to_ascii_lowercase().contains(MARKER)
+                        && attribute(next_tag, "itemid").as_deref() == Some(item.as_str())
+                });
+            if !same_person {
+                break;
+            }
+            cursor = next;
+        }
+        if words.is_empty() {
+            at = open_end;
+            continue;
+        }
+        let name = words
+            .iter()
+            .map(|w| w.trim())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&html[copied..start]);
+        let label = html_escape::encode_text(&name);
+        let item = html_escape::encode_double_quoted_attribute(&item);
+        if my_mentions.iter().any(|m| m.as_str() == item.as_ref()) {
+            out.push_str(&format!(
+                "<a href=\"snak-mention:{item}\"><b>@{label}</b></a>"
+            ));
+        } else {
+            out.push_str(&format!("<a href=\"snak-mention:{item}\">@{label}</a>"));
+        }
+        copied = end;
+        at = end;
+    }
+    out.push_str(&html[copied..]);
+    out
+}
+
 /// A quoted attribute value. Only matches the whole attribute name, so
 /// `data-src` is not mistaken for `src`.
 fn attribute(tag: &str, name: &str) -> Option<String> {
@@ -663,26 +759,29 @@ fn reaction_glyph(key: &str) -> &str {
 }
 
 /// Chat pages arrive newest first; the timeline wants oldest first.
-fn chat_messages(messages: &[models::Message]) -> Vec<Message> {
-    let mut list: Vec<Message> = messages.iter().filter_map(to_message).collect();
+fn chat_messages(messages: &[models::Message], me_id: &str) -> Vec<Message> {
+    let mut list: Vec<Message> = messages
+        .iter()
+        .filter_map(|m| to_message(m, me_id))
+        .collect();
     list.sort_by_key(|m| m.sent_at);
     list
 }
 
 /// One message per channel post, with its replies folded in.
-fn channel_messages(chains: &[ReplyChain]) -> Vec<Message> {
+fn channel_messages(chains: &[ReplyChain], me_id: &str) -> Vec<Message> {
     let mut posts: Vec<Message> = chains
         .iter()
         .filter_map(|chain| {
             let is_root = |m: &&models::Message| m.id.as_deref() == Some(chain.id.as_str());
-            let mut post = to_message(chain.messages.iter().find(is_root)?)?;
+            let mut post = to_message(chain.messages.iter().find(is_root)?, me_id)?;
             let replies: Vec<models::Message> = chain
                 .messages
                 .iter()
                 .filter(|m| !is_root(m))
                 .cloned()
                 .collect();
-            post.replies = chat_messages(&replies);
+            post.replies = chat_messages(&replies, me_id);
             Some(post)
         })
         .collect();
@@ -715,17 +814,20 @@ mod tests {
 
     #[test]
     fn chats_are_oldest_first_and_skip_control_messages() {
-        let list = chat_messages(&[
-            message(
-                "2",
-                "a",
-                "2026-10-15T10:01:00Z",
-                "RichText/Html",
-                "<p>second</p>",
-            ),
-            message("x", "a", "2026-10-15T10:00:30Z", "Control/Typing", ""),
-            message("1", "a", "2026-10-15T10:00:00Z", "Text", "first"),
-        ]);
+        let list = chat_messages(
+            &[
+                message(
+                    "2",
+                    "a",
+                    "2026-10-15T10:01:00Z",
+                    "RichText/Html",
+                    "<p>second</p>",
+                ),
+                message("x", "a", "2026-10-15T10:00:30Z", "Control/Typing", ""),
+                message("1", "a", "2026-10-15T10:00:00Z", "Text", "first"),
+            ],
+            "me",
+        );
         let texts: Vec<&str> = list.iter().map(text).collect();
         assert_eq!(texts, ["first", "<p>second</p>"]);
     }
@@ -741,7 +843,7 @@ mod tests {
             ]
         }))
         .expect("valid chain");
-        let posts = channel_messages(&[chain]);
+        let posts = channel_messages(&[chain], "me");
         assert_eq!(posts.len(), 1);
         assert_eq!(text(&posts[0]), "post");
         let replies: Vec<&str> = posts[0].replies.iter().map(text).collect();
@@ -751,7 +853,7 @@ mod tests {
     #[test]
     fn images_are_replaced_and_emoji_keep_alt_text() {
         let html = r#"<p>hi <img itemtype="http://schema.skype.com/Emoji" alt="😀" src="x"> <img src="https://asm/x"></p>"#;
-        assert_eq!(display_html(html), "<p>hi 😀 <i>[image]</i></p>");
+        assert_eq!(display_html(html, &[]), "<p>hi 😀 <i>[image]</i></p>");
     }
 
     #[test]
@@ -802,9 +904,46 @@ mod tests {
     }
 
     #[test]
+    fn split_mention_spans_become_one_mention() {
+        let html = concat!(
+            r#"<p>hi <span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Allan</span>&nbsp;"#,
+            r#"<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Kimmer</span> "#,
+            r#"<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Jensen</span> and "#,
+            r#"<span itemtype="http://schema.skype.com/Mention" itemid="1">Maja</span></p>"#,
+        );
+        assert_eq!(
+            display_html(html, &["0".to_string()]),
+            r#"<p>hi <a href="snak-mention:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:1">@Maja</a></p>"#
+        );
+    }
+
+    #[test]
+    fn mention_names_are_escaped() {
+        let html = r#"<span itemtype="http://schema.skype.com/Mention" itemid="0">&lt;img src=x&gt;</span>"#;
+        assert!(!display_html(html, &[]).contains("<img"));
+    }
+
+    #[test]
+    fn messages_that_mention_me_are_flagged() {
+        let message: models::Message = serde_json::from_value(serde_json::json!({
+            "id": "1", "from": "8:orgid:other", "messagetype": "RichText/Html",
+            "originalarrivaltime": "2026-10-15T10:00:00Z",
+            "content": r#"<p><span itemtype="http://schema.skype.com/Mention" itemid="0">Allan</span></p>"#,
+            "properties": { "mentions": r#"[{"itemid":"0","mri":"8:orgid:me-guid","mentionType":"person"}]"# }
+        }))
+        .expect("parses");
+        assert!(to_message(&message, "me-guid").expect("kept").mentions_me);
+        assert!(
+            !to_message(&message, "someone-else")
+                .expect("kept")
+                .mentions_me
+        );
+    }
+
+    #[test]
     fn emoji_alt_text_cannot_carry_markup() {
         let html = r#"<p><img itemtype="http://schema.skype.com/Emoji" alt="<img src=https://tracker.example/p.gif x="></p>"#;
-        let out = display_html(html);
+        let out = display_html(html, &[]);
         assert!(!out.to_ascii_lowercase().contains("<img"), "{out}");
     }
 
@@ -821,7 +960,10 @@ mod tests {
     #[test]
     fn uppercase_and_data_src_images_never_reach_the_renderer() {
         let html = r#"<p><IMG SRC="https://tracker.example/p.gif"><img data-src="https://eu-api.asm.skype.com/x" src="https://tracker.example/q.gif"></p>"#;
-        assert_eq!(display_html(html), "<p><i>[image]</i><i>[image]</i></p>");
+        assert_eq!(
+            display_html(html, &[]),
+            "<p><i>[image]</i><i>[image]</i></p>"
+        );
         assert!(message_images(html).is_empty());
     }
 
@@ -831,13 +973,13 @@ mod tests {
         let images = message_images(html);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].width, Some(250.));
-        assert_eq!(display_html(html), "<p>look <i>[image]</i></p>");
+        assert_eq!(display_html(html, &[]), "<p>look <i>[image]</i></p>");
     }
 
     #[test]
     fn runs_of_blank_paragraphs_collapse_to_one() {
         let html = "<p>a</p><p>&nbsp;</p><p></p><p>&nbsp;</p><p>b</p><p>&nbsp;</p>";
-        assert_eq!(display_html(html), "<p>a</p><p>&nbsp;</p><p>b</p>");
+        assert_eq!(display_html(html, &[]), "<p>a</p><p>&nbsp;</p><p>b</p>");
     }
 
     #[test]

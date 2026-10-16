@@ -193,6 +193,29 @@ impl Message {
         (!value.is_empty()).then(|| value.to_string())
     }
 
+    /// `(itemid, mri)` for each @mention; the itemid ties it to its spans in
+    /// the HTML. Teams sends the list as a JSON string or, sometimes, inline.
+    pub fn mentions(&self) -> Vec<(String, String)> {
+        let Some(raw) = self.properties.as_ref().and_then(|p| p.get("mentions")) else {
+            return Vec::new();
+        };
+        let list: Option<Vec<Value>> = match raw {
+            Value::String(s) => serde_json::from_str(s).ok(),
+            other => serde_json::from_value(other.clone()).ok(),
+        };
+        list.unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| {
+                let id = match &m["itemid"] {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => return None,
+                };
+                Some((id, m["mri"].as_str()?.to_string()))
+            })
+            .collect()
+    }
+
     pub fn reactions(&self) -> Vec<Reaction> {
         let Some(raw) = self.properties.as_ref().and_then(|p| p.get("emotions")) else {
             return Vec::new();

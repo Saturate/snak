@@ -154,6 +154,10 @@ pub trait ChatBackend: Send + Sync {
         text: &'a str,
     ) -> BoxFuture<'a, ()>;
 
+    /// Tells the service the user has read everything up to now, so other
+    /// clients stop showing it as unread.
+    fn mark_read<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, ()>;
+
     /// Link that hands a call for this conversation to another app, if any.
     fn call_url(&self, id: &ConversationId) -> Option<String>;
 

@@ -212,6 +212,29 @@ impl TeamsClient {
         Ok(page.reply_chains)
     }
 
+    /// Moves the read marker to now, which clears unread in every Teams client.
+    pub async fn mark_read(&self, conversation_id: &str) -> Result<()> {
+        let url = format!(
+            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+            self.region,
+            urlencode(conversation_id)
+        );
+        // Squads sends the current time in all three slots (message id;
+        // timestamp; client message id) and Teams accepts it.
+        let now = chrono::Utc::now().timestamp_millis();
+        let body = json!({ "consumptionhorizon": format!("{now};{now};{now}") });
+        let token = self.token(scope::CHAT).await?;
+        let res = self
+            .http
+            .put(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        let _: Value = decode(res, &url).await?;
+        Ok(())
+    }
+
     /// Sends to a chat or channel. Pass `reply_to` to reply in a channel thread.
     pub async fn send_message(
         &self,

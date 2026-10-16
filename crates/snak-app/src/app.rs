@@ -433,16 +433,37 @@ impl Snak {
                 match result {
                     Ok(rows) => {
                         this.set_rows(rows, cx);
-                        // Opening it read it; reflect that without waiting for a refresh.
-                        if let Some(c) = this.conversations.iter_mut().find(|c| c.id == requested) {
-                            c.unread = false;
-                        }
+                        this.mark_read(&requested, cx);
                     }
                     Err(e) => this.show_error(e, cx),
                 }
             })
             .ok();
         }));
+    }
+
+    /// Only conversations the service still calls unread get a request, so
+    /// refetches of an already-read conversation stay free.
+    fn mark_read(&mut self, id: &ConversationId, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) else {
+            return;
+        };
+        if !conversation.unread {
+            return;
+        }
+        conversation.unread = false;
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = io(async move { backend.mark_read(&id).await }).await;
+            if let Err(e) = result {
+                this.update(cx, |this, cx| this.show_error(e, cx)).ok();
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn set_rows(&mut self, rows: Vec<Message>, cx: &mut Context<Self>) {

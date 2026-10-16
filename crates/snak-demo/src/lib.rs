@@ -192,6 +192,13 @@ impl ChatBackend for DemoBackend {
         Box::pin(async move { result })
     }
 
+    fn mark_read<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, ()> {
+        if let Some(thread) = self.state().thread(id) {
+            thread.conversation.unread = false;
+        }
+        Box::pin(async { Ok(()) })
+    }
+
     fn call_url(&self, id: &ConversationId) -> Option<String> {
         let state = self.state();
         let thread = state.threads.iter().find(|t| &t.conversation.id == id)?;

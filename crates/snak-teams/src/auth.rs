@@ -4,6 +4,8 @@
 //
 // Login flow derived from Squads (https://github.com/IanTerzo/Squads, src/api.rs, MPL-2.0).
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
@@ -207,18 +209,94 @@ fn keychain_entry() -> Result<keyring::Entry> {
         .map_err(|e| CoreError::Keychain(e.to_string()))
 }
 
-pub fn load_refresh_token() -> Option<String> {
+// Process-wide because token rotation saves from deep inside the client.
+static USE_FILE: AtomicBool = AtomicBool::new(false);
+
+fn token_file() -> Option<PathBuf> {
+    Some(std::env::home_dir()?.join("Library/Application Support/dev.snak.app/teams-refresh-token"))
+}
+
+fn read_file() -> Option<String> {
+    let token = std::fs::read_to_string(token_file()?).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+fn write_file(token: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let io_error = |e: std::io::Error| CoreError::Keychain(format!("token file: {e}"));
+    let path = token_file().ok_or_else(|| CoreError::Keychain("no home directory".into()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io_error)?;
+    }
+    let tmp = path.with_extension("tmp");
+    // Created owner-only from the start, so the token is never briefly world-readable.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(io_error)?;
+    file.write_all(token.as_bytes()).map_err(io_error)?;
+    std::fs::rename(tmp, path).map_err(io_error)
+}
+
+fn delete_file() {
+    if let Some(path) = token_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn read_keychain() -> Option<String> {
     keychain_entry().ok()?.get_password().ok()
 }
 
+fn delete_keychain() {
+    if let Ok(entry) = keychain_entry() {
+        let _ = entry.delete_credential();
+    }
+}
+
+/// Switches where the login is kept, moving an existing one across.
+/// The file avoids Keychain prompts on every rebuild of an unsigned binary,
+/// at the cost of any process running as the user being able to read it.
+pub fn use_file_storage(file: bool) {
+    let was_file = USE_FILE.swap(file, Ordering::SeqCst);
+    if was_file == file {
+        return;
+    }
+    let token = if file { read_keychain() } else { read_file() };
+    if let Some(token) = token
+        && save_refresh_token(&token).is_ok()
+    {
+        if file {
+            delete_keychain();
+        } else {
+            delete_file();
+        }
+    }
+}
+
+pub fn load_refresh_token() -> Option<String> {
+    if USE_FILE.load(Ordering::SeqCst) {
+        read_file()
+    } else {
+        read_keychain()
+    }
+}
+
 pub(crate) fn save_refresh_token(token: &str) -> Result<()> {
+    if USE_FILE.load(Ordering::SeqCst) {
+        return write_file(token);
+    }
     keychain_entry()?
         .set_password(token)
         .map_err(|e| CoreError::Keychain(e.to_string()))
 }
 
 pub fn clear_refresh_token() {
-    if let Ok(entry) = keychain_entry() {
-        let _ = entry.delete_credential();
-    }
+    delete_file();
+    delete_keychain();
 }

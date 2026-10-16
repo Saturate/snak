@@ -266,6 +266,8 @@ impl Connector for DemoConnector {
     }
 
     fn sign_out(&self) {}
+
+    fn set_credential_storage(&self, _: snak_chat::CredentialStorage) {}
 }
 
 fn escape(text: &str) -> String {

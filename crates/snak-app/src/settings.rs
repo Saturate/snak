@@ -54,6 +54,8 @@ pub struct Settings {
     pub ui_font_size: f64,
     pub dm_limit: f64,
     pub show_team_names: bool,
+    /// Keep the login in a plain file instead of the Keychain.
+    pub insecure_credentials: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +67,7 @@ impl Default for Settings {
             ui_font_size: 14.,
             dm_limit: 40.,
             show_team_names: true,
+            insecure_credentials: false,
         }
     }
 }

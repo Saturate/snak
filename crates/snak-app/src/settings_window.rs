@@ -69,6 +69,7 @@ impl SettingsWindow {
         let (dark_options, light_options) = (options(true), options(false));
         let (zed_dark, zed_light) = (installed.zed_dark.clone(), installed.zed_light.clone());
         let main = self.main.clone();
+        let main_for_storage = self.main.clone();
         let signed_in = main
             .upgrade()
             .and_then(|m| m.read(cx).signed_in_as())
@@ -208,7 +209,33 @@ impl SettingsWindow {
                                 })
                         }),
                     )
-                    .description("Removes the saved login from the Keychain."),
+                    .description("Removes the saved login."),
+                    SettingItem::new(
+                        "Store login in a file",
+                        SettingField::switch(
+                            |cx: &App| Settings::get(cx).insecure_credentials,
+                            {
+                                let main = main_for_storage.clone();
+                                move |value: bool, cx: &mut App| {
+                                    Settings::update(cx, |s| s.insecure_credentials = value);
+                                    let storage = if value {
+                                        snak_chat::CredentialStorage::Insecure
+                                    } else {
+                                        snak_chat::CredentialStorage::Keychain
+                                    };
+                                    if let Some(main) = main.upgrade() {
+                                        main.read(cx).set_credential_storage(storage);
+                                    }
+                                }
+                            },
+                        )
+                        .default_value(false),
+                    )
+                    .description(
+                        "Less secure. Stops the Keychain prompts that unsigned development \
+                         builds trigger after every rebuild, but any program running as you can \
+                         read the file and use your session.",
+                    ),
                 ])),
             SettingPage::new("About")
                 .icon(Icon::new(IconName::Info))

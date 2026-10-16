@@ -198,6 +198,17 @@ pub trait Connector: Send + Sync {
     fn finish_login<'a>(&'a self, prompt: &'a LoginPrompt) -> BoxFuture<'a, Arc<dyn ChatBackend>>;
 
     fn sign_out(&self);
+
+    /// Where saved credentials live. `Insecure` trades the OS keychain for a
+    /// plain file the user's own processes can read.
+    fn set_credential_storage(&self, storage: CredentialStorage);
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStorage {
+    #[default]
+    Keychain,
+    Insecure,
 }
 
 #[cfg(test)]

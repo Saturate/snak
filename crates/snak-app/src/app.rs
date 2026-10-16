@@ -364,6 +364,10 @@ impl Snak {
             .filter(|n| !n.is_empty())
     }
 
+    pub fn set_credential_storage(&self, storage: snak_chat::CredentialStorage) {
+        self.connector.set_credential_storage(storage);
+    }
+
     pub fn service_name(&self) -> String {
         self.connector.service_name().to_string()
     }
@@ -1710,7 +1714,10 @@ impl Render for Snak {
             .key_context("Snak")
             .on_action(cx.listener(Self::jump_to))
             .on_action(cx.listener(|_, _: &OpenSettings, _, cx| {
-                SettingsWindow::open(cx.entity().downgrade(), cx)
+                // The settings window reads this view while rendering, which
+                // GPUI forbids while this view is mid-update; open it after.
+                let main = cx.entity().downgrade();
+                cx.defer(move |cx| SettingsWindow::open(main, cx));
             }))
             .on_action(cx.listener(|this, _: &NextConversation, window, cx| {
                 this.step_conversation(1, window, cx)

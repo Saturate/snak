@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, Reaction,
+    ConversationKind, CredentialStorage, Event, Group, LoginPrompt, Me, Message, MessageId,
+    Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -283,6 +284,10 @@ impl Connector for TeamsConnector {
 
     fn sign_out(&self) {
         auth::clear_refresh_token();
+    }
+
+    fn set_credential_storage(&self, storage: CredentialStorage) {
+        auth::use_file_storage(storage == CredentialStorage::Insecure);
     }
 }
 

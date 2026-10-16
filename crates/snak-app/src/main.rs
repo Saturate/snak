@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::*;
-use snak_chat::{ChatError, Connector};
+use snak_chat::{ChatError, Connector, CredentialStorage};
 
 actions!(
     snak,
@@ -55,6 +55,12 @@ fn connector() -> Arc<dyn Connector> {
 
 fn main() {
     let connector = connector();
+    // Before restoring the session, so it's read from the right place.
+    connector.set_credential_storage(if settings::Settings::load().insecure_credentials {
+        CredentialStorage::Insecure
+    } else {
+        CredentialStorage::Keychain
+    });
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {

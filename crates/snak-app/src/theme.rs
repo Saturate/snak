@@ -1,5 +1,5 @@
 //! Zed themes in Snak. Zed theme files are converted to GPUI Kit's format at
-//! startup: the bundled One Dark/Light (MIT, see assets/one.LICENSE), plus
+//! startup: the bundled themes (all MIT, see assets/themes/LICENSES.md), plus
 //! whatever the user has in Zed's theme folders. Snak follows the theme names
 //! picked in Zed's settings when it can find them.
 
@@ -9,7 +9,17 @@ use gpui_kit::component::{Theme, ThemeRegistry};
 use gpui_kit::{App, Global};
 use serde_json::{Map, Value, json};
 
-const BUNDLED: &str = include_str!("../assets/one.json");
+const BUNDLED: [&str; 9] = [
+    include_str!("../assets/themes/one.json"),
+    include_str!("../assets/themes/ayu.json"),
+    include_str!("../assets/themes/gruvbox.json"),
+    include_str!("../assets/themes/catppuccin.json"),
+    include_str!("../assets/themes/rose-pine.json"),
+    include_str!("../assets/themes/rose-pine-moon.json"),
+    include_str!("../assets/themes/rose-pine-dawn.json"),
+    include_str!("../assets/themes/dracula.json"),
+    include_str!("../assets/themes/tokyo-night.json"),
+];
 const DEFAULT_DARK: &str = "One Dark";
 const DEFAULT_LIGHT: &str = "One Light";
 
@@ -26,7 +36,7 @@ pub struct InstalledThemes {
 impl Global for InstalledThemes {}
 
 pub fn install(cx: &mut App) {
-    let mut families = vec![BUNDLED.to_string()];
+    let mut families: Vec<String> = BUNDLED.iter().map(|f| f.to_string()).collect();
     for dir in user_theme_dirs() {
         families.extend(read_json_files(&dir));
     }
@@ -324,7 +334,7 @@ mod tests {
 
     #[test]
     fn bundled_one_themes_convert() {
-        let family: Value = serde_json::from_str(BUNDLED).expect("bundled theme parses");
+        let family: Value = serde_json::from_str(BUNDLED[0]).expect("bundled theme parses");
         let themes = family["themes"].as_array().expect("themes");
         let names: Vec<&str> = themes.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(names, [DEFAULT_DARK, DEFAULT_LIGHT]);
@@ -336,17 +346,23 @@ mod tests {
     }
 
     #[test]
-    fn converted_themes_parse_as_gpui_kit_themes_including_syntax() {
-        let family: Value = serde_json::from_str(BUNDLED).expect("bundled theme parses");
-        for theme in family["themes"].as_array().expect("themes") {
-            let converted = convert(theme, true);
-            let parsed: Result<gpui_kit::component::ThemeSet, _> =
-                serde_json::from_value(converted);
-            let set = parsed.expect("GPUI Kit accepts the converted theme");
-            assert!(
-                set.themes[0].highlight.is_some(),
-                "syntax colors carried over"
-            );
+    fn every_bundled_theme_converts_with_syntax_colors() {
+        let mut count = 0;
+        for file in BUNDLED {
+            let family: Value = serde_json::from_str(file).expect("bundled theme parses");
+            for theme in family["themes"].as_array().expect("themes") {
+                let name = theme["name"].as_str().unwrap_or("?").to_string();
+                let parsed: Result<gpui_kit::component::ThemeSet, _> =
+                    serde_json::from_value(convert(theme, true));
+                let set = parsed.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(set.themes[0].highlight.is_some(), "{name}: syntax colors");
+                assert!(
+                    set.themes[0].colors.background.is_some(),
+                    "{name}: background"
+                );
+                count += 1;
+            }
         }
+        assert_eq!(count, 25);
     }
 }

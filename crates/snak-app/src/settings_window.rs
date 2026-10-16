@@ -239,24 +239,24 @@ impl SettingsWindow {
                 ])),
             SettingPage::new("About")
                 .icon(Icon::new(IconName::Info))
-                .group(SettingGroup::new().title("Snak").items(vec![
-                        SettingItem::new(
-                            "Version",
-                            SettingField::render(|_, _, _| {
-                                div().text_sm().child(env!("CARGO_PKG_VERSION"))
-                            }),
-                        ),
-                        SettingItem::new(
-                            "License",
-                            SettingField::render(|_, _, _| {
-                                div().text_sm().child("GPL-3.0-or-later")
-                            }),
-                        )
-                        .description(
-                            "The Teams backend is MPL-2.0, derived from Squads. The One themes are \
-                         MIT, from Atom via Zed.",
-                        ),
-                    ])),
+                .group(
+                SettingGroup::new().title("Snak").items(vec![
+                    SettingItem::new(
+                        "Version",
+                        SettingField::render(|_, _, _| {
+                            div().text_sm().child(env!("CARGO_PKG_VERSION"))
+                        }),
+                    ),
+                    SettingItem::new(
+                        "License",
+                        SettingField::render(|_, _, _| div().text_sm().child("GPL-3.0-or-later")),
+                    )
+                    .description(
+                        "The Teams backend is MPL-2.0, derived from Squads. The bundled themes are \
+                         MIT: One, Ayu, Gruvbox, Catppuccin, Rosé Pine, Dracula and Tokyo Night.",
+                    ),
+                ]),
+            ),
         ]
     }
 }

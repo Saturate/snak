@@ -144,6 +144,9 @@ pub struct Snak {
 
     images: ImageCache,
     gif_toggles: GifToggles,
+    pending: Vec<Pending>,
+    next_pending: u64,
+    refetch_task: Option<Task<()>>,
     thread_root: Option<MessageId>,
     thread_rows: Rc<Vec<Message>>,
     thread_scroller: Entity<MessageScrollerState>,
@@ -220,6 +223,9 @@ impl Snak {
             composer,
             images: ImageCache::default(),
             gif_toggles: GifToggles::default(),
+            pending: Vec::new(),
+            next_pending: 0,
+            refetch_task: None,
             thread_root: None,
             thread_rows: Rc::default(),
             thread_scroller,
@@ -346,7 +352,7 @@ impl Snak {
         match event {
             Event::MessagesChanged(id) => {
                 if self.selected.as_ref() == Some(&id) && !self.showing_unreads {
-                    self.load_conversation(cx);
+                    self.refetch_soon(cx);
                 }
             }
             Event::ConversationsChanged => self.load_conversations(cx),
@@ -631,7 +637,36 @@ impl Snak {
         cx.notify();
     }
 
-    fn set_rows(&mut self, rows: Vec<Message>, cx: &mut Context<Self>) {
+    fn set_rows(&mut self, mut rows: Vec<Message>, cx: &mut Context<Self>) {
+        // Drop local copies once the service has them; give up after a while
+        // so a message lost in transit doesn't sit there as sending forever.
+        const PENDING_TIMEOUT_SECS: i64 = 120;
+        let now = chrono::Utc::now();
+        self.pending.retain(|p| {
+            let fresh = p
+                .message
+                .sent_at
+                .is_some_and(|t| (now - t).num_seconds() < PENDING_TIMEOUT_SECS);
+            fresh && !arrived(&rows, p)
+        });
+        rows.retain(|m| !m.pending);
+        for row in &mut rows {
+            row.replies.retain(|m| !m.pending);
+        }
+        for p in self
+            .pending
+            .iter()
+            .filter(|p| Some(&p.conversation) == self.selected.as_ref())
+        {
+            match &p.reply_to {
+                None => rows.push(p.message.clone()),
+                Some(root) => {
+                    if let Some(post) = rows.iter_mut().find(|m| &m.id == root) {
+                        post.replies.push(p.message.clone());
+                    }
+                }
+            }
+        }
         sync_scroller(&self.scroller, &self.rows, &rows, cx);
         self.rows = Rc::new(rows);
         self.load_images(cx);
@@ -754,15 +789,85 @@ impl Snak {
         } else {
             None
         };
-        cx.spawn(async move |this, cx| {
-            let result = io(async move { backend.send(&id, reply_to.as_ref(), &text).await }).await;
-            this.update(cx, |this, cx| match result {
-                Ok(()) => this.load_conversation(cx),
-                Err(e) => this.show_error(e, cx),
+
+        // Shown at once; the service's own copy replaces it when it shows up.
+        self.next_pending += 1;
+        let me = backend.me().clone();
+        let local = Message {
+            id: MessageId(format!("pending-{}", self.next_pending)),
+            author: me.display_name.clone(),
+            author_id: Some(me.id.clone()),
+            sent_at: Some(chrono::Utc::now()),
+            body: Body::Text(text.clone()),
+            edited: false,
+            reactions: Vec::new(),
+            images: Vec::new(),
+            replies: Vec::new(),
+            pending: true,
+        };
+        let local_id = local.id.clone();
+        self.pending.push(Pending {
+            conversation: id.clone(),
+            reply_to: reply_to.clone(),
+            message: local,
+        });
+        let rows = (*self.rows).clone();
+        self.set_rows(rows, cx);
+
+        let started = std::time::Instant::now();
+        cx.spawn_in(window, async move |this, cx| {
+            let sent = text.clone();
+            let result = io(async move { backend.send(&id, reply_to.as_ref(), &sent).await }).await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    tracing::debug!(elapsed_ms = started.elapsed().as_millis() as u64, "sent");
+                    this.refetch_soon(cx);
+                }
+                Err(e) => {
+                    this.pending.retain(|p| p.message.id != local_id);
+                    let rows = (*this.rows).clone();
+                    this.set_rows(rows, cx);
+                    // Nothing typed is lost when a send fails.
+                    let input = if in_thread {
+                        this.thread_composer.clone()
+                    } else {
+                        this.composer.clone()
+                    };
+                    input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+                    this.show_error(e, cx);
+                }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Teams' read endpoints lag a few seconds behind writes, so one refetch
+    /// right after sending often misses the new message.
+    fn refetch_soon(&mut self, cx: &mut Context<Self>) {
+        const DELAYS_MS: [u64; 4] = [0, 1500, 4000, 10000];
+        let conversation = self.selected.clone();
+        self.refetch_task = Some(cx.spawn(async move |this, cx| {
+            let mut waited = 0;
+            for delay in DELAYS_MS {
+                cx.background_executor()
+                    .timer(Duration::from_millis(delay - waited))
+                    .await;
+                waited = delay;
+                let still_here = this
+                    .update(cx, |this, cx| {
+                        let same = this.selected == conversation;
+                        if same {
+                            this.load_conversation(cx);
+                        }
+                        same
+                    })
+                    .unwrap_or(false);
+                if !still_here {
+                    return;
+                }
+            }
+        }));
     }
 
     fn start_call(&self, cx: &mut Context<Self>) {
@@ -773,6 +878,62 @@ impl Snak {
             cx.open_url(&url);
         }
     }
+}
+
+struct Pending {
+    conversation: ConversationId,
+    reply_to: Option<MessageId>,
+    message: Message,
+}
+
+/// Whether the service's copy of a locally sent message is in `rows`:
+/// same author, same text, sent within a couple of minutes.
+fn arrived(rows: &[Message], pending: &Pending) -> bool {
+    let Body::Text(text) = &pending.message.body else {
+        return false;
+    };
+    let candidates: Vec<&Message> = match &pending.reply_to {
+        None => rows.iter().collect(),
+        Some(root) => rows
+            .iter()
+            .filter(|m| &m.id == root)
+            .flat_map(|m| m.replies.iter())
+            .collect(),
+    };
+    let want = normalise(text);
+    candidates.into_iter().filter(|m| !m.pending).any(|m| {
+        m.author_id == pending.message.author_id
+            && match (m.sent_at, pending.message.sent_at) {
+                (Some(a), Some(b)) => (a - b).num_seconds().abs() < 180,
+                _ => false,
+            }
+            && match &m.body {
+                Body::Html(html) => normalise(&strip_tags(html)) == want,
+                Body::Text(t) => normalise(t) == want,
+                _ => false,
+            }
+    })
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    html_escape::decode_html_entities(&out).into_owned()
+}
+
+fn normalise(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn thread_rows(root: &Message) -> Vec<Message> {
@@ -1047,6 +1208,7 @@ fn render_row(
         .flex_1()
         .min_w_0()
         .gap_0p5()
+        .when(row.pending, |el| el.opacity(0.55))
         .child(body)
         .children(render_images(row, images, gif_toggles, cx))
         .child(footer);
@@ -2172,7 +2334,45 @@ impl Render for Snak {
 #[cfg(test)]
 mod tests {
     // Not a glob: gpui's `test` attribute macro would shadow the built-in one.
-    use super::{ImageFormat, ImageRef, first_frame_png, image_format, image_size};
+    use super::{
+        Body, ConversationId, ImageFormat, ImageRef, Message, MessageId, Pending, arrived,
+        first_frame_png, image_format, image_size,
+    };
+
+    fn message(id: &str, author: &str, body: Body, pending: bool) -> Message {
+        Message {
+            id: MessageId(id.into()),
+            author: author.into(),
+            author_id: Some(author.into()),
+            sent_at: Some(chrono::Utc::now()),
+            body,
+            edited: false,
+            reactions: Vec::new(),
+            images: Vec::new(),
+            replies: Vec::new(),
+            pending,
+        }
+    }
+
+    #[test]
+    fn sent_message_is_matched_to_the_services_copy() {
+        let local = Pending {
+            conversation: ConversationId("c".into()),
+            reply_to: Some(MessageId("root".into())),
+            message: message("pending-1", "me", Body::Text("a & b\nnext".into()), true),
+        };
+        let mut root = message("root", "other", Body::Text("post".into()), false);
+        assert!(!arrived(std::slice::from_ref(&root), &local));
+        root.replies.push(message(
+            "42",
+            "me",
+            Body::Html("<p>a &amp; b<br>next</p>".into()),
+            false,
+        ));
+        assert!(arrived(&[root.clone()], &local));
+        root.replies[0].author_id = Some("someone else".into());
+        assert!(!arrived(&[root], &local));
+    }
 
     fn gif(frames: usize) -> Vec<u8> {
         let mut out = Vec::new();

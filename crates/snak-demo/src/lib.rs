@@ -316,6 +316,7 @@ fn message(id: MessageId, author: &str, at: DateTime<Utc>, html: &str) -> Messag
         reactions: Vec::new(),
         images: Vec::new(),
         replies: Vec::new(),
+        pending: false,
     }
 }
 

@@ -491,6 +491,7 @@ fn to_message(message: &models::Message) -> Option<Message> {
             Vec::new()
         },
         replies: Vec::new(),
+        pending: false,
     })
 }
 

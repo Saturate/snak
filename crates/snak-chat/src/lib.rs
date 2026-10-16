@@ -108,6 +108,8 @@ pub struct Message {
     pub images: Vec<ImageRef>,
     /// Replies, oldest first. Only channel posts have them.
     pub replies: Vec<Message>,
+    /// Sent from this client but not yet seen back from the service.
+    pub pending: bool,
 }
 
 impl Message {
@@ -241,6 +243,7 @@ mod tests {
             reactions: Vec::new(),
             images: Vec::new(),
             replies: Vec::new(),
+            pending: false,
         }
     }
 

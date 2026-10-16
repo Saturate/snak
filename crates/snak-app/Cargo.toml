@@ -9,6 +9,7 @@ name = "snak"
 path = "src/main.rs"
 
 [dependencies]
+chrono = "0.4"
 gpui-kit.workspace = true
 html-escape = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }

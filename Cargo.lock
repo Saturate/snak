@@ -6252,6 +6252,7 @@ dependencies = [
 name = "snak-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gpui-kit",
  "html-escape",
  "image",

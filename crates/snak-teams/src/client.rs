@@ -165,6 +165,31 @@ impl TeamsClient {
         self.get_json(scope::CHAT_AGGREGATOR, &url).await
     }
 
+    /// Raw JSON for diagnosing schema drift in the undocumented endpoints.
+    #[doc(hidden)]
+    pub async fn raw_teams_and_chats(&self) -> Result<serde_json::Value> {
+        let url = format!(
+            "{TEAMS}/api/csa/{}/api/v2/teams/users/me?isPrefetch=false&enableMembershipSummary=true&enableRC2Fetch=false",
+            self.region
+        );
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
+    }
+
+    #[doc(hidden)]
+    pub async fn raw_channel_posts(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "{TEAMS}/api/csa/{}/api/v2/teams/{}/channels/{}",
+            self.region,
+            urlencode(team_id),
+            urlencode(channel_id)
+        );
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
+    }
+
     /// Newest-first page of a chat's messages.
     pub async fn chat_messages(&self, conversation_id: &str) -> Result<MessagePage> {
         let url = format!(

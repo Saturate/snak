@@ -43,6 +43,8 @@ pub struct Conversation {
     pub kind: ConversationKind,
     pub title: String,
     pub unread: bool,
+    /// Muted in the service itself (e.g. in Teams).
+    pub muted: bool,
     pub last_activity: Option<DateTime<Utc>>,
     /// Latest message as "Author: text".
     pub preview: Option<String>,

@@ -305,12 +305,6 @@ fn channel_conversations(
                     channel_id: channel.id.clone(),
                 },
             );
-            let last = channel.last_message.as_ref().and_then(|m| m.sent_at());
-            let read_up_to = channel
-                .consumption_horizon
-                .as_ref()
-                .and_then(|h| h.original_arrival_time)
-                .unwrap_or(i64::MAX);
             list.push(Conversation {
                 id,
                 kind: ConversationKind::Channel {
@@ -321,8 +315,9 @@ fn channel_conversations(
                 } else {
                     channel.display_name.clone()
                 },
-                unread: last.is_some_and(|t| t.timestamp_millis() > read_up_to),
-                last_activity: last,
+                unread: channel.is_unread(),
+                muted: channel.is_muted == Some(true),
+                last_activity: channel.last_activity(),
                 preview: preview(channel.last_message.as_ref()),
             });
         }
@@ -370,6 +365,7 @@ fn chat_conversations(
                 },
                 title,
                 unread: chat.is_read == Some(false),
+                muted: false,
                 last_activity: chat.last_message.as_ref().and_then(|m| m.sent_at()),
                 preview: preview(chat.last_message.as_ref()),
             }
@@ -591,6 +587,30 @@ mod tests {
     fn images_are_replaced_and_emoji_keep_alt_text() {
         let html = r#"<p>hi <img itemtype="http://schema.skype.com/Emoji" alt="😀" src="x"> <img src="https://asm/x"></p>"#;
         assert_eq!(display_html(html), "<p>hi 😀 <i>[image]</i></p>");
+    }
+
+    #[test]
+    fn channel_list_uses_read_flag_and_message_id_time() {
+        // Mirrors the live shape: lastMessage present but all-null.
+        let team: Team = serde_json::from_value(serde_json::json!({
+            "id": "t", "displayName": "Team",
+            "channels": [
+                { "id": "c1", "displayName": "a", "isMessageRead": false, "isMuted": true,
+                  "lastL2MessageIdNFS": 1_760_000_000_000_i64,
+                  "lastMessage": { "id": null, "content": null, "originalArrivalTime": null } },
+                { "id": "c2", "displayName": "b", "isMessageRead": true, "lastL2MessageIdNFS": 42 },
+            ]
+        }))
+        .expect("valid team");
+        let list = channel_conversations(&[team], &mut HashMap::new());
+        assert!(list[0].unread && list[0].muted);
+        assert!(list[0].last_activity.is_some());
+        assert!(list[0].preview.is_none());
+        assert!(!list[1].unread);
+        assert!(
+            list[1].last_activity.is_none(),
+            "small IDs are not timestamps"
+        );
     }
 
     #[test]

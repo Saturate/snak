@@ -318,6 +318,7 @@ fn seed(now: DateTime<Utc>) -> State {
         },
         title: title.into(),
         unread: false,
+        muted: false,
         last_activity: None,
         preview: None,
     };
@@ -326,6 +327,7 @@ fn seed(now: DateTime<Utc>) -> State {
         kind,
         title: title.into(),
         unread: false,
+        muted: false,
         last_activity: None,
         preview: None,
     };

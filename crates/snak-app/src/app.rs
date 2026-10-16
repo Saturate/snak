@@ -371,6 +371,12 @@ impl Snak {
             .update(cx, |state, cx| state.focus(window, cx));
     }
 
+    /// The local mute flag flips the service's own mute, so "Unmute" also
+    /// works on something muted in Teams.
+    fn is_muted(&self, conversation: &Conversation) -> bool {
+        conversation.muted != self.prefs.muted.contains(&conversation.id.0)
+    }
+
     fn selected_conversation(&self) -> Option<&Conversation> {
         let id = self.selected.as_ref()?;
         self.conversations.iter().find(|c| &c.id == id)
@@ -789,7 +795,7 @@ impl Snak {
         let theme = cx.theme();
         let key = entry.id.0.clone();
         let active = !self.showing_unreads && self.selected.as_ref() == Some(&entry.id);
-        let muted = self.prefs.muted.contains(&key);
+        let muted = self.is_muted(entry);
         let hidden = self.prefs.hidden.contains(&key);
         // Muted entries never shout; that is the point of muting.
         let unread = entry.unread && !muted;
@@ -933,7 +939,7 @@ impl Snak {
                 // Search reaches everything, including what you hid.
                 && (searching || self.show_hidden || !prefs.hidden.contains(key))
                 && (searching || !prefs.unreads_only || is_selected
-                    || (e.unread && !prefs.muted.contains(key)))
+                    || (e.unread && !self.is_muted(e)))
         };
 
         let mut all: Vec<&Conversation> = self.conversations.iter().filter(visible).collect();
@@ -1175,7 +1181,7 @@ impl Snak {
             .iter()
             .filter(|e| {
                 let key = e.id.0.as_str();
-                e.unread && !self.prefs.muted.contains(key) && !self.prefs.hidden.contains(key)
+                e.unread && !self.is_muted(e) && !self.prefs.hidden.contains(key)
             })
             .cloned()
             .collect();

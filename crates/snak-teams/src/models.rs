@@ -37,6 +37,41 @@ pub struct Channel {
     pub is_member: Option<bool>,
     pub last_message: Option<Message>,
     pub consumption_horizon: Option<ConsumptionHorizon>,
+    pub is_message_read: Option<bool>,
+    pub is_muted: Option<bool>,
+    #[serde(rename = "lastL2MessageIdNFS")]
+    pub last_l2_message_id: Option<i64>,
+}
+
+impl Channel {
+    /// The channel list sends `lastMessage` with every field null, so the
+    /// newest message ID stands in for its time. Teams message IDs are
+    /// arrival times in epoch milliseconds; anything outside a sane range is
+    /// treated as not a timestamp.
+    pub fn last_activity(&self) -> Option<DateTime<Utc>> {
+        const EARLIEST_MS: i64 = 1_420_070_400_000; // 2015-01-01, before Teams existed
+        if let Some(t) = self.last_message.as_ref().and_then(Message::sent_at) {
+            return Some(t);
+        }
+        let ms = self.last_l2_message_id?;
+        let latest_ms = Utc::now().timestamp_millis() + 86_400_000;
+        (EARLIEST_MS..latest_ms)
+            .contains(&ms)
+            .then(|| DateTime::from_timestamp_millis(ms))
+            .flatten()
+    }
+
+    pub fn is_unread(&self) -> bool {
+        if let Some(read) = self.is_message_read {
+            return !read;
+        }
+        let last = self.last_activity().map(|t| t.timestamp_millis());
+        let read_up_to = self
+            .consumption_horizon
+            .as_ref()
+            .and_then(|h| h.original_arrival_time);
+        matches!((last, read_up_to), (Some(last), Some(read)) if last > read)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

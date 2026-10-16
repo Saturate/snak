@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use crate::auth::{self, AccessToken, scope};
 use crate::error::{CoreError, Result};
 use crate::models::{ChannelPage, Me, MessagePage, Person, ReplyChain, UserDetails};
+use crate::store::StoredLogin;
 
 const TEAMS: &str = "https://teams.microsoft.com";
 const GRAPH_BATCH_LIMIT: usize = 20;
@@ -32,13 +33,13 @@ pub struct TeamsClient {
 
 impl TeamsClient {
     /// Builds a client from a stored refresh token: finds the tenant's region and the signed-in user.
-    pub async fn connect(http: reqwest::Client, refresh_token: String) -> Result<Self> {
+    pub async fn connect(http: reqwest::Client, login: StoredLogin) -> Result<Self> {
         let mut client = Self {
             http,
-            refresh_token: Mutex::new(refresh_token),
+            refresh_token: Mutex::new(login.token),
             tokens: Mutex::new(HashMap::new()),
             region: String::new(),
-            store_epoch: crate::store::epoch(),
+            store_epoch: login.epoch,
             me: Me {
                 id: String::new(),
                 display_name: None,
@@ -83,8 +84,7 @@ impl TeamsClient {
             // The new access token is good either way; a failed save (say, a
             // denied Keychain prompt) only means the next launch uses an older,
             // still valid refresh token.
-            if let Err(e) = crate::store::save(rotated.clone(), false, Some(self.store_epoch)).await
-            {
+            if let Err(e) = crate::store::save(rotated.clone(), false, self.store_epoch).await {
                 tracing::warn!(error = %e, "could not save the rotated refresh token");
             }
             *refresh = rotated;

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Deserializer};
 
 use crate::error::{CoreError, Result, is_expired_session};
+use crate::store::StoredLogin;
 
 // The Teams first-party client ID. Using it means no app registration or admin
 // consent, at the cost of relying on Teams' own permissions and internal APIs.
@@ -99,7 +100,13 @@ pub async fn start_device_login(http: &reqwest::Client) -> Result<DeviceCode> {
 }
 
 /// Polls until the user finishes the browser step, then stores the refresh token.
-pub async fn complete_device_login(http: &reqwest::Client, code: &DeviceCode) -> Result<String> {
+pub async fn complete_device_login(
+    http: &reqwest::Client,
+    code: &DeviceCode,
+) -> Result<StoredLogin> {
+    // Taken before polling: a sign-out while the user is still in the browser
+    // ends this login too, even if it completes afterwards.
+    let epoch = crate::store::epoch();
     let url = format!("https://login.microsoftonline.com/{TENANT}/oauth2/token");
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
     let mut interval = Duration::from_secs(code.interval.max(1));
@@ -127,9 +134,11 @@ pub async fn complete_device_login(http: &reqwest::Client, code: &DeviceCode) ->
             let refresh = token
                 .refresh_token
                 .ok_or_else(|| CoreError::SessionExpired("no refresh token in response".into()))?;
-            // A brand-new login: always stored, whatever happened before it.
-            crate::store::save(refresh.clone(), true, None).await?;
-            return Ok(refresh);
+            crate::store::save(refresh.clone(), true, epoch).await?;
+            return Ok(StoredLogin {
+                token: refresh,
+                epoch,
+            });
         }
 
         let error = serde_json::from_str::<TokenError>(&body)

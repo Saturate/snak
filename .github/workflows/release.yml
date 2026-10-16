@@ -4,12 +4,6 @@ on:
   push:
     branches: [main]
 
-# Never cancel: a merge to main during the (slow) GPUI release builds would
-# otherwise cancel them for good and leave the release without downloads.
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 permissions:
   contents: write
   pull-requests: write
@@ -18,6 +12,14 @@ jobs:
   # Opens or updates the "Next Release" PR from pending changesets; merging it
   # bumps the version, writes CHANGELOG.md and tags the release.
   release:
+    # Only this short job is serialised, and every push gets a turn: by default
+    # a later push replaces the pending job, and if that was the version-PR
+    # merge the release is never cut, since changesetter only cuts when HEAD is
+    # the merge commit.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     outputs:
       released: ${{ steps.changesetter.outputs.released }}
@@ -55,6 +57,10 @@ jobs:
   build:
     needs: release
     if: needs.release.outputs.released == 'true'
+    # One build per version, never cancelled by later pushes.
+    concurrency:
+      group: build-${{ needs.release.outputs.version }}-${{ matrix.target }}
+      cancel-in-progress: false
     strategy:
       matrix:
         include:

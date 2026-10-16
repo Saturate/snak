@@ -377,12 +377,9 @@ impl Snak {
         // Composers need a window to change, so they're emptied on the next render.
         self.reset_composer = true;
         self.reset_thread_composer = true;
-        // Clearing a 1Password item shells out to `op`, which can wait on
-        // Touch ID; keep that off the UI thread.
-        let connector = self.connector.clone();
-        cx.background_executor()
-            .spawn(async move { connector.sign_out() })
-            .detach();
+        // Returns at once; any slow cleanup (1Password, Touch ID) happens in
+        // the background, and the sign-out already counts from here.
+        self.connector.sign_out();
         self.backend = None;
         self.events_task = None;
         self.poll_task = None;

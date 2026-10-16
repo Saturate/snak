@@ -214,6 +214,8 @@ pub trait Connector: Send + Sync {
     /// Waits for the user to finish the browser step.
     fn finish_login<'a>(&'a self, prompt: &'a LoginPrompt) -> BoxFuture<'a, Arc<dyn ChatBackend>>;
 
+    /// Forgets saved credentials. Must return quickly: it runs on the UI
+    /// thread, so slow cleanup belongs in the background.
     fn sign_out(&self);
 
     /// Where saved credentials live; an existing login moves across.

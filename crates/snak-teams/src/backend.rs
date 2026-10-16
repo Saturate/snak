@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::auth::{self, DeviceCode};
 use crate::models::{self, Chat, ReplyChain, Team};
+use crate::store::StoredLogin;
 use crate::{CoreError, PushEvent, TeamsClient, html};
 
 impl From<CoreError> for ChatError {
@@ -247,8 +248,8 @@ impl TeamsConnector {
         }
     }
 
-    async fn connect(&self, refresh_token: String) -> Result<Arc<dyn ChatBackend>, ChatError> {
-        let client = TeamsClient::connect(self.http.clone(), refresh_token)
+    async fn connect(&self, login: StoredLogin) -> Result<Arc<dyn ChatBackend>, ChatError> {
+        let client = TeamsClient::connect(self.http.clone(), login)
             .await
             .inspect_err(|e| tracing::error!(error = %e, "Teams connect failed"))?;
         tracing::info!(region = client.region(), "connected to Teams");
@@ -271,7 +272,7 @@ impl Connector for TeamsConnector {
     fn restore(&self) -> BoxFuture<'_, Option<Arc<dyn ChatBackend>>> {
         Box::pin(async move {
             match crate::store::load().await {
-                Some(token) => self.connect(token).await.map(Some),
+                Some(login) => self.connect(login).await.map(Some),
                 None => Ok(None),
             }
         })
@@ -300,13 +301,13 @@ impl Connector for TeamsConnector {
                 interval: prompt.poll_interval_secs,
                 message: String::new(),
             };
-            let token = auth::complete_device_login(&self.http, &code).await?;
-            self.connect(token).await
+            let login = auth::complete_device_login(&self.http, &code).await?;
+            self.connect(login).await
         })
     }
 
     fn sign_out(&self) {
-        crate::store::clear();
+        crate::store::sign_out();
     }
 
     fn set_credential_storage(&self, storage: CredentialStorage) -> BoxFuture<'_, ()> {

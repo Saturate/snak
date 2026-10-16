@@ -16,10 +16,10 @@ async fn main() {
     if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
         store::use_storage_without_moving(store::Storage::File);
     }
-    let Some(token) = store::load().await else {
+    let Some(login) = store::load().await else {
         return println!("no stored login");
     };
-    let client = match TeamsClient::connect(reqwest::Client::new(), token).await {
+    let client = match TeamsClient::connect(reqwest::Client::new(), login).await {
         Ok(c) => c,
         Err(e) => return println!("connect failed: {e}"),
     };

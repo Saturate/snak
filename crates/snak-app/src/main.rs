@@ -1,5 +1,7 @@
 mod app;
 mod prefs;
+mod settings;
+mod settings_window;
 mod sidebar;
 mod theme;
 
@@ -11,7 +13,14 @@ use snak_chat::{ChatError, Connector};
 
 actions!(
     snak,
-    [JumpTo, NextConversation, PreviousConversation, CloseThread]
+    [
+        JumpTo,
+        NextConversation,
+        PreviousConversation,
+        CloseThread,
+        OpenSettings,
+        Quit
+    ]
 );
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -51,8 +60,22 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             theme::install(cx);
+            cx.set_global(settings::Settings::load());
+            settings::Settings::apply(cx);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.set_menus(vec![Menu {
+                name: "Snak".into(),
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Snak", Quit),
+                ],
+                disabled: false,
+            }]);
             cx.bind_keys([
                 KeyBinding::new("cmd-k", JumpTo, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("alt-down", NextConversation, None),
                 KeyBinding::new("alt-up", PreviousConversation, None),
                 KeyBinding::new("escape", CloseThread, Some("Snak")),

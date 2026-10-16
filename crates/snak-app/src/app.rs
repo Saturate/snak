@@ -14,7 +14,7 @@ use gpui_kit::component::{
     status_bar::StatusBar,
     text::{TextView, TextViewStyle},
     tooltip::Tooltip,
-    v_flex, {Theme, ThemeMode},
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -23,14 +23,15 @@ use snak_chat::{
     LoginPrompt, Message, MessageId,
 };
 
-use crate::prefs::{Appearance, Placement, Prefs, group_key, team_key};
+use crate::prefs::{Placement, Prefs, group_key, team_key};
+use crate::settings::{Appearance, Settings};
+use crate::settings_window::SettingsWindow;
 use crate::sidebar;
-use crate::{CloseThread, JumpTo, NextConversation, PreviousConversation, io};
+use crate::{CloseThread, JumpTo, NextConversation, OpenSettings, PreviousConversation, io};
 
 // Push is the main update path; polling is the fallback when push is down
 // or a backend doesn't have it.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
-const DM_LIMIT: usize = 40;
 const SIDEBAR_WIDTH: f32 = 272.;
 const THREAD_WIDTH: f32 = 400.;
 
@@ -183,7 +184,6 @@ impl Snak {
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);
-        this.apply_appearance(window, cx);
         this.restore(cx);
         this
     }
@@ -347,18 +347,36 @@ impl Snak {
         }));
     }
 
-    fn apply_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.prefs.appearance {
-            Appearance::System => Theme::sync_system_appearance(Some(window), cx),
-            Appearance::Light => Theme::change(ThemeMode::Light, Some(window), cx),
-            Appearance::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+    fn apply_appearance(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if Settings::get(cx).appearance == Appearance::System {
+            Settings::apply(cx);
         }
-        window.refresh();
     }
 
-    fn cycle_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.update_prefs(cx, |p| p.appearance = p.appearance.next());
-        self.apply_appearance(window, cx);
+    fn cycle_appearance(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        Settings::update(cx, |s| s.appearance = s.appearance.next());
+    }
+
+    pub fn signed_in_as(&self) -> Option<String> {
+        self.backend
+            .as_ref()
+            .map(|b| b.me().display_name.clone())
+            .filter(|n| !n.is_empty())
+    }
+
+    pub fn service_name(&self) -> String {
+        self.connector.service_name().to_string()
+    }
+
+    pub fn sign_out(&mut self, cx: &mut Context<Self>) {
+        self.connector.sign_out();
+        self.backend = None;
+        self.events_task = None;
+        self.poll_task = None;
+        self.conversations.clear();
+        self.selected = None;
+        self.set_rows(Vec::new(), cx);
+        self.begin_login(cx);
     }
 
     fn update_prefs(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Prefs)) {
@@ -1004,7 +1022,10 @@ impl Snak {
     }
 
     /// The sidebar as display rows, shared by rendering and Option+arrow navigation.
-    fn sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
+    fn sidebar_rows(&self, query: &str, cx: &App) -> Vec<SidebarRow> {
+        let settings = Settings::get(cx);
+        let dm_limit = settings.dm_limit.max(1.) as usize;
+        let team_names = settings.show_team_names;
         let searching = !query.is_empty();
         let prefs = &self.prefs;
         let is_selected = |c: &Conversation| self.selected.as_ref() == Some(&c.id);
@@ -1057,7 +1078,7 @@ impl Snak {
                 .map(|c| SidebarRow::Item {
                     conversation: c.clone(),
                     depth,
-                    show_group,
+                    show_group: show_group && team_names,
                 })
                 .collect();
             if items.is_empty() && !always_show_header && !is_collapsed {
@@ -1098,7 +1119,7 @@ impl Snak {
                             .map(|c| SidebarRow::Item {
                                 conversation: c.clone(),
                                 depth: 1,
-                                show_group: true,
+                                show_group: team_names,
                             }),
                     );
                     continue;
@@ -1122,7 +1143,7 @@ impl Snak {
             .filter(|c| !c.is_channel())
             .collect();
         dms.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
-        dms.truncate(if searching { usize::MAX } else { DM_LIMIT });
+        dms.truncate(if searching { usize::MAX } else { dm_limit });
         push_group(
             &mut rows,
             Header::new("dms", "Direct messages", 0),
@@ -1136,7 +1157,7 @@ impl Snak {
     fn step_conversation(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.query(cx);
         let order: Vec<ConversationId> = self
-            .sidebar_rows(&query)
+            .sidebar_rows(&query, cx)
             .into_iter()
             .filter_map(|row| match row {
                 SidebarRow::Item { conversation, .. } => Some(conversation.id),
@@ -1250,7 +1271,7 @@ impl Snak {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.query(cx);
-        let rows = self.sidebar_rows(&query);
+        let rows = self.sidebar_rows(&query, cx);
         let hidden_count = self.prefs.hidden.len();
 
         let me = self
@@ -1674,7 +1695,7 @@ impl Snak {
             Button::new("appearance")
                 .xsmall()
                 .ghost()
-                .label(format!("Theme: {}", self.prefs.appearance.label()))
+                .label(format!("Theme: {}", Settings::get(cx).appearance.label()))
                 .on_click(cx.listener(|this, _, window, cx| this.cycle_appearance(window, cx))),
         )
     }
@@ -1688,6 +1709,9 @@ impl Render for Snak {
             .track_focus(&self.focus)
             .key_context("Snak")
             .on_action(cx.listener(Self::jump_to))
+            .on_action(cx.listener(|_, _: &OpenSettings, _, cx| {
+                SettingsWindow::open(cx.entity().downgrade(), cx)
+            }))
             .on_action(cx.listener(|this, _: &NextConversation, window, cx| {
                 this.step_conversation(1, window, cx)
             }))

@@ -5,16 +5,27 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::App;
 use gpui_kit::component::{Theme, ThemeRegistry};
+use gpui_kit::{App, Global};
 use serde_json::{Map, Value, json};
 
 const BUNDLED: &str = include_str!("../assets/one.json");
 const DEFAULT_DARK: &str = "One Dark";
 const DEFAULT_LIGHT: &str = "One Light";
 
-/// Theme names available to pick from, sorted.
-pub fn install(cx: &mut App) -> Vec<String> {
+/// Themes found at startup, for the settings window.
+#[derive(Default)]
+pub struct InstalledThemes {
+    /// (name, is dark), sorted by name.
+    pub themes: Vec<(String, bool)>,
+    /// What Zed's own settings pick, used when Snak has no choice saved.
+    pub zed_dark: String,
+    pub zed_light: String,
+}
+
+impl Global for InstalledThemes {}
+
+pub fn install(cx: &mut App) {
     let mut families = vec![BUNDLED.to_string()];
     for dir in user_theme_dirs() {
         families.extend(read_json_files(&dir));
@@ -29,23 +40,22 @@ pub fn install(cx: &mut App) -> Vec<String> {
             let Some(name) = theme["name"].as_str() else {
                 continue;
             };
-            if names.iter().any(|n| n == name) {
+            if names.iter().any(|(n, _)| n == name) {
                 continue;
             }
             if load(&convert(theme, true), cx) || load(&convert(theme, false), cx) {
-                names.push(name.to_string());
+                names.push((name.to_string(), theme["appearance"] != "light"));
             }
         }
     }
     names.sort();
 
     let (dark, light) = zed_selection();
-    select(
-        dark.as_deref().unwrap_or(DEFAULT_DARK),
-        light.as_deref().unwrap_or(DEFAULT_LIGHT),
-        cx,
-    );
-    names
+    cx.set_global(InstalledThemes {
+        themes: names,
+        zed_dark: dark.unwrap_or_else(|| DEFAULT_DARK.to_string()),
+        zed_light: light.unwrap_or_else(|| DEFAULT_LIGHT.to_string()),
+    });
 }
 
 /// Makes these the themes used for dark and light mode; unknown names are ignored.

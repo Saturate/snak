@@ -16,33 +16,6 @@ pub struct Prefs {
     pub unreads_only: bool,
     /// Keys of collapsed sidebar groups (see [`group_key`]).
     pub collapsed: HashSet<String>,
-    pub appearance: Appearance,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Appearance {
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-impl Appearance {
-    pub fn next(self) -> Self {
-        match self {
-            Appearance::System => Appearance::Light,
-            Appearance::Light => Appearance::Dark,
-            Appearance::Dark => Appearance::System,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Appearance::System => "Auto",
-            Appearance::Light => "Light",
-            Appearance::Dark => "Dark",
-        }
-    }
 }
 
 /// Sidebar groups and whole teams share one key space with conversations,

@@ -48,7 +48,7 @@ fn shape(value: &Value, indent: usize, out: &mut String) {
 
 #[tokio::main]
 async fn main() {
-    let Some(login) = snak_teams::store::load().await else {
+    let Some(login) = snak_teams::store::load().await.ok().flatten() else {
         return println!("no stored login");
     };
     let client = match TeamsClient::connect(reqwest::Client::new(), login).await {

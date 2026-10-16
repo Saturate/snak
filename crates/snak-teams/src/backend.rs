@@ -271,7 +271,7 @@ impl Connector for TeamsConnector {
 
     fn restore(&self) -> BoxFuture<'_, Option<Arc<dyn ChatBackend>>> {
         Box::pin(async move {
-            match crate::store::load().await {
+            match crate::store::load().await? {
                 Some(login) => self.connect(login).await.map(Some),
                 None => Ok(None),
             }
@@ -319,7 +319,7 @@ impl Connector for TeamsConnector {
             }
         };
         Box::pin(async move {
-            crate::store::set_storage(storage).await;
+            crate::store::set_storage(storage).await?;
             Ok(())
         })
     }

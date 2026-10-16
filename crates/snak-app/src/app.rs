@@ -570,14 +570,30 @@ impl Snak {
             .filter(|n| !n.is_empty())
     }
 
-    /// Moves the saved login to wherever the settings now say.
-    pub fn apply_credential_storage(&mut self, cx: &mut Context<Self>) {
+    /// Moves the saved login to wherever the settings now say. `previous`
+    /// is the settings from before the change, restored if the move fails so
+    /// the setting keeps pointing where the login still is.
+    pub fn apply_credential_storage(&mut self, previous: Settings, cx: &mut Context<Self>) {
         let connector = self.connector.clone();
         let storage = Settings::get(cx).credential_storage();
         cx.spawn(async move |this, cx| {
-            let result = io(async move { connector.set_credential_storage(storage).await }).await;
+            let result = io({
+                let storage = storage.clone();
+                async move { connector.set_credential_storage(storage).await }
+            })
+            .await;
             if let Err(e) = result {
-                this.update(cx, |this, cx| this.show_error(e, cx)).ok();
+                this.update(cx, |this, cx| {
+                    // Unless a later change has moved on already.
+                    if Settings::get(cx).credential_storage() == storage {
+                        Settings::update(cx, |s| {
+                            s.login_storage = previous.login_storage;
+                            s.onepassword_account = previous.onepassword_account;
+                        });
+                    }
+                    this.show_error(e, cx)
+                })
+                .ok();
             }
         })
         .detach();

@@ -218,7 +218,8 @@ pub trait Connector: Send + Sync {
     /// thread, so slow cleanup belongs in the background.
     fn sign_out(&self);
 
-    /// Where saved credentials live; an existing login moves across.
+    /// Where saved credentials live; an existing login moves across. On an
+    /// error the old place stays in use.
     fn set_credential_storage(&self, storage: CredentialStorage) -> BoxFuture<'_, ()>;
 }
 

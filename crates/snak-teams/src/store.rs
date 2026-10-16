@@ -35,8 +35,18 @@ pub enum Storage {
 }
 
 struct State {
-    storage: Storage,
+    /// Unset until the first `set_storage` of the run adopts the setting.
+    storage: Option<Storage>,
     last_op_write: Option<Instant>,
+    /// Places a sign-out couldn't clear (1Password locked, a prompt
+    /// dismissed). What they hold is signed out until a write replaces it.
+    left_behind: Vec<Storage>,
+}
+
+impl State {
+    fn current(&self) -> Storage {
+        self.storage.clone().unwrap_or_default()
+    }
 }
 
 /// Held for every read, write, move and clear. Sign-out clears on a
@@ -50,30 +60,39 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 
 // Process-wide because token rotation saves from deep inside the client.
 static STATE: Mutex<State> = Mutex::new(State {
-    storage: Storage::Keychain,
+    storage: None,
     last_op_write: None,
+    left_behind: Vec::new(),
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Switches storage, moving an existing login across. Call before restoring a session.
-/// The switch only takes effect once the login is safely in the new place,
-/// so a failed write leaves it readable where it was.
-pub async fn set_storage(storage: Storage) {
-    let switched = tokio::task::spawn_blocking(move || {
+/// Switches storage, moving an existing login across. The first call of a
+/// run only adopts the setting: the login is wherever the setting already
+/// said, and the default it would move from may hold nothing of ours.
+///
+/// On an error the old storage stays in use: a sign-out only looks in
+/// 1Password while the setting points there, so switching away from a copy
+/// that couldn't be read or removed would strand it.
+pub async fn set_storage(storage: Storage) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
         let _ops = exclusive();
+        // Bound first: a temporary in the `let ... else` would keep STATE
+        // locked into the else block.
         let previous = state().storage.clone();
+        let Some(previous) = previous else {
+            state().storage = Some(storage);
+            return Ok(());
+        };
         if previous == storage {
             return Ok(());
         }
-        // Any failure below keeps the old setting: a sign-out only looks in
-        // 1Password while the setting points there, so switching away from a
-        // copy that couldn't be read or removed would strand it.
-        if stored_login_signed_out() {
+        if signed_out(&previous) {
             // Its delete may only look in the new place, so remove it here.
             delete(&previous)?;
+            state().left_behind.retain(|place| *place != previous);
         } else if let Some(token) = read(&previous)? {
             write(&storage, &token)?;
             if let Err(e) = delete(&previous) {
@@ -83,22 +102,20 @@ pub async fn set_storage(storage: Storage) {
                 }
                 return Err(e);
             }
-            state().last_op_write = Some(Instant::now());
+            let mut state = state();
+            state.last_op_write = Some(Instant::now());
+            state.left_behind.retain(|place| *place != storage);
         }
-        state().storage = storage;
-        Ok::<(), CoreError>(())
+        state().storage = Some(storage);
+        Ok(())
     })
-    .await;
-    match switched {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "login not moved; keeping the old storage"),
-        Err(e) => tracing::warn!(error = %e, "login move task failed"),
-    }
+    .await
+    .map_err(|e| CoreError::TaskFailed(e.to_string()))?
 }
 
 /// Points at a storage without moving anything, for tools that only read.
 pub fn use_storage_without_moving(storage: Storage) {
-    state().storage = storage;
+    state().storage = Some(storage);
 }
 
 /// A refresh token and the sign-out epoch it was read or obtained under.
@@ -108,32 +125,35 @@ pub struct StoredLogin {
     pub(crate) epoch: u64,
 }
 
-pub async fn load() -> Option<StoredLogin> {
-    // A sign-out whose delete hasn't run yet: the stored login is on its way
-    // out and must not be read back in by a quick "Try again".
-    if stored_login_signed_out() {
-        return None;
+/// `Ok(None)` when nothing usable is stored.
+pub async fn load() -> Result<Option<StoredLogin>> {
+    // Checked before waiting on the lock too, which a pending delete may hold
+    // through a Touch ID prompt.
+    let storage = state().current();
+    if signed_out(&storage) {
+        return Ok(None);
     }
     tokio::task::spawn_blocking(move || {
         let _ops = exclusive();
         let epoch = epoch();
-        if stored_login_signed_out() {
-            return None;
+        let storage = state().current();
+        // A sign-out whose delete hasn't run (or failed): the stored login is
+        // on its way out and must not be read back in by a quick "Try again".
+        if signed_out(&storage) {
+            return Ok(None);
         }
-        let storage = state().storage.clone();
-        let token = read(&storage)
-            .inspect_err(|e| tracing::warn!(error = %e, "could not read the saved login"))
-            .ok()??;
+        let token = read(&storage)?;
         // Sign-out doesn't wait for the lock, so it may have happened while
         // the read sat on a prompt.
-        (self::epoch() == epoch).then_some(StoredLogin { token, epoch })
+        Ok(token
+            .filter(|_| self::epoch() == epoch)
+            .map(|token| StoredLogin { token, epoch }))
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(|e| CoreError::TaskFailed(e.to_string()))?
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 /// Bumped the moment a sign-out happens. Every save carries the epoch its
 /// session started under and is dropped once that no longer matches: an old
@@ -145,10 +165,6 @@ static CLEARED: AtomicU64 = AtomicU64::new(0);
 /// The epoch of the last token written, so a delayed delete can tell that a
 /// login begun after its sign-out has already been saved.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
-/// Set when a sign-out couldn't delete everywhere (1Password locked, a
-/// prompt dismissed): the login left behind is signed out, and stays that
-/// way until a new one overwrites it.
-static LEFT_BEHIND: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn epoch() -> u64 {
     EPOCH.load(SeqCst)
@@ -158,10 +174,11 @@ fn clear_pending() -> bool {
     CLEARED.load(SeqCst) != EPOCH.load(SeqCst)
 }
 
-/// Whatever is stored belongs to a signed-out session: a sign-out's delete
-/// hasn't run yet and nothing was saved since, or a delete failed.
-fn stored_login_signed_out() -> bool {
-    LEFT_BEHIND.load(SeqCst) || (clear_pending() && WRITTEN.load(SeqCst) < EPOCH.load(SeqCst))
+/// What `storage` holds belongs to a signed-out session: a sign-out's delete
+/// hasn't run yet and nothing was saved since, or it couldn't clear there.
+fn signed_out(storage: &Storage) -> bool {
+    state().left_behind.contains(storage)
+        || (clear_pending() && WRITTEN.load(SeqCst) < EPOCH.load(SeqCst))
 }
 
 /// `fresh` marks a new login, which skips the 1Password write throttle.
@@ -177,7 +194,7 @@ pub(crate) async fn save(token: String, fresh: bool, epoch: u64) -> Result<()> {
         // Also under the lock: a move may have finished while this waited.
         let storage = {
             let state = state();
-            let throttled = matches!(state.storage, Storage::OnePassword { .. })
+            let throttled = matches!(state.storage, Some(Storage::OnePassword { .. }))
                 && !fresh
                 && state
                     .last_op_write
@@ -185,11 +202,11 @@ pub(crate) async fn save(token: String, fresh: bool, epoch: u64) -> Result<()> {
             if throttled {
                 return Ok(false);
             }
-            state.storage.clone()
+            state.current()
         };
         write(&storage, &token)?;
         WRITTEN.fetch_max(epoch, SeqCst);
-        LEFT_BEHIND.store(false, SeqCst);
+        state().left_behind.retain(|place| *place != storage);
         Ok(true)
     })
     .await
@@ -228,7 +245,7 @@ fn clear(issued: u64) {
     let _cleared = MarkCleared(issued);
     // Bound first: a temporary would keep STATE locked through the `op`
     // calls, which can sit on a Touch ID prompt.
-    let current = state().storage.clone();
+    let current = state().current();
     // A login saved since this sign-out went to the current storage (saves
     // and moves both happen under the lock), so only that place keeps it.
     let keep = (WRITTEN.load(SeqCst) >= issued).then_some(&current);
@@ -242,7 +259,10 @@ fn clear(issued: u64) {
     for place in places.iter().filter(|place| Some(*place) != keep) {
         if let Err(e) = delete(place) {
             tracing::warn!(error = %e, "sign-out left a login behind");
-            LEFT_BEHIND.store(true, SeqCst);
+            let mut state = state();
+            if !state.left_behind.contains(place) {
+                state.left_behind.push(place.clone());
+            }
         }
     }
 }
@@ -485,12 +505,25 @@ mod tests {
     // The store is process-wide, so these run one at a time.
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// Also undoes whatever a failed test left behind, so one failure
+    /// doesn't cascade into the rest.
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         wait_cleared();
-        use_storage_without_moving(Storage::File);
-        let _ = std::fs::remove_file(token_file().unwrap());
+        CLEARED.store(EPOCH.load(SeqCst), SeqCst);
+        {
+            let mut state = state();
+            state.storage = Some(Storage::File);
+            state.left_behind.clear();
+        }
+        let file = token_file().unwrap();
+        let _ = std::fs::remove_dir(&file);
+        let _ = std::fs::remove_file(&file);
         serial
+    }
+
+    async fn loaded() -> Option<String> {
+        load().await.unwrap().map(|login| login.token)
     }
 
     fn wait_cleared() {
@@ -508,7 +541,7 @@ mod tests {
     }
 
     fn current() -> Storage {
-        state().storage.clone()
+        state().current()
     }
 
     /// A directory where the token file goes makes reading and deleting it
@@ -538,7 +571,8 @@ mod tests {
         save("OLD".into(), true, epoch()).await.unwrap();
         let held = exclusive();
         sign_out();
-        assert!(load().await.is_none());
+        // Answers without waiting for the delete.
+        assert_eq!(loaded().await, None);
         drop(held);
         wait_cleared();
         assert_eq!(stored(), None);
@@ -561,7 +595,7 @@ mod tests {
         let _serial = setup();
         save("OLD".into(), true, epoch()).await.unwrap();
         let issued = EPOCH.fetch_add(1, SeqCst) + 1;
-        set_storage(Storage::Keychain).await;
+        set_storage(Storage::Keychain).await.unwrap();
         assert_eq!(current(), Storage::Keychain);
         assert_eq!(stored(), None);
         clear(issued);
@@ -572,7 +606,7 @@ mod tests {
         let _serial = setup();
         save("OLD".into(), true, epoch()).await.unwrap();
         // The test Keychain refuses writes.
-        set_storage(Storage::Keychain).await;
+        assert!(set_storage(Storage::Keychain).await.is_err());
         assert_eq!(current(), Storage::File);
         assert_eq!(stored().as_deref(), Some("OLD"));
     }
@@ -581,7 +615,7 @@ mod tests {
     async fn a_move_that_cannot_read_keeps_the_setting() {
         let _serial = setup();
         let file = break_token_file();
-        set_storage(Storage::Keychain).await;
+        assert!(set_storage(Storage::Keychain).await.is_err());
         assert_eq!(current(), Storage::File);
         std::fs::remove_dir(file).unwrap();
     }
@@ -595,12 +629,9 @@ mod tests {
         std::fs::remove_dir(&file).unwrap();
         // What the failed delete left behind, now readable again.
         std::fs::write(&file, "OLD").unwrap();
-        assert!(load().await.is_none());
+        assert_eq!(loaded().await, None);
         save("NEW".into(), true, epoch()).await.unwrap();
-        assert_eq!(
-            load().await.map(|login| login.token).as_deref(),
-            Some("NEW")
-        );
+        assert_eq!(loaded().await.as_deref(), Some("NEW"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -635,8 +666,30 @@ mod tests {
         sign_out();
         writer.write_all(b"OLD").unwrap();
         drop(writer);
-        assert!(loading.await.unwrap().is_none());
+        assert!(loading.await.unwrap().unwrap().is_none());
         wait_cleared();
         assert_eq!(stored(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_switch_of_a_run_only_adopts_the_setting() {
+        let _serial = setup();
+        write(&Storage::File, "MINE").unwrap();
+        state().storage = None;
+        // Nothing to move from the default; the login stays where it is.
+        set_storage(Storage::Keychain).await.unwrap();
+        assert_eq!(current(), Storage::Keychain);
+        assert_eq!(stored().as_deref(), Some("MINE"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leftover_elsewhere_does_not_hide_the_current_login() {
+        let _serial = setup();
+        // A sign-out couldn't clear the Keychain.
+        state().left_behind.push(Storage::Keychain);
+        save("NEW".into(), true, epoch()).await.unwrap();
+        assert_eq!(loaded().await.as_deref(), Some("NEW"));
+        // Writing the File says nothing about what the Keychain holds.
+        assert!(state().left_behind.contains(&Storage::Keychain));
     }
 }

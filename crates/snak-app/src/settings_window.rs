@@ -241,11 +241,14 @@ impl SettingsWindow {
                             {
                                 let main = main_for_storage.clone();
                                 move |value: SharedString, cx: &mut App| {
+                                    let previous = Settings::get(cx).clone();
                                     Settings::update(cx, |s| {
                                         s.login_storage = LoginStorage::from_label(&value)
                                     });
-                                    main.update(cx, |snak, cx| snak.apply_credential_storage(cx))
-                                        .ok();
+                                    main.update(cx, |snak, cx| {
+                                        snak.apply_credential_storage(previous, cx)
+                                    })
+                                    .ok();
                                 }
                             },
                         )
@@ -276,11 +279,14 @@ impl SettingsWindow {
                             {
                                 let main = main_for_storage.clone();
                                 move |value: SharedString, cx: &mut App| {
+                                    let previous = Settings::get(cx).clone();
                                     Settings::update(cx, |s| {
                                         s.onepassword_account = Some(value.to_string())
                                     });
-                                    main.update(cx, |snak, cx| snak.apply_credential_storage(cx))
-                                        .ok();
+                                    main.update(cx, |snak, cx| {
+                                        snak.apply_credential_storage(previous, cx)
+                                    })
+                                    .ok();
                                 }
                             },
                         ),

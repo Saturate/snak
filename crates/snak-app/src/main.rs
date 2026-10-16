@@ -1,4 +1,5 @@
 mod app;
+mod palette;
 mod prefs;
 mod settings;
 mod settings_window;
@@ -19,7 +20,17 @@ actions!(
         PreviousConversation,
         CloseThread,
         OpenSettings,
-        Quit
+        Quit,
+        CommandPalette,
+        ShowUnreads,
+        ToggleUnreadsOnly,
+        ToggleStar,
+        ToggleMute,
+        ToggleHide,
+        CollapseAll,
+        ExpandAll,
+        CycleTheme,
+        SignOut,
     ]
 );
 
@@ -66,6 +77,7 @@ fn main() {
             cx.set_menus(vec![Menu {
                 name: "Snak".into(),
                 items: vec![
+                    MenuItem::action("Command Palette…", CommandPalette),
                     MenuItem::action("Settings…", OpenSettings),
                     MenuItem::separator(),
                     MenuItem::action("Quit Snak", Quit),
@@ -75,6 +87,9 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("cmd-k", JumpTo, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-shift-p", CommandPalette, None),
+                KeyBinding::new("cmd-shift-a", ShowUnreads, None),
+                KeyBinding::new("cmd-shift-u", ToggleUnreadsOnly, None),
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("alt-down", NextConversation, None),
                 KeyBinding::new("alt-up", PreviousConversation, None),

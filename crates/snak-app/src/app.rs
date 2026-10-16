@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _,
+    avatar::Avatar,
     button::{Button, ButtonVariants as _},
+    command::CommandState,
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     highlighter::HighlightTheme,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
-    menu::{ContextMenuExt as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
     status_bar::StatusBar,
     text::{TextView, TextViewStyle},
@@ -27,7 +29,7 @@ use crate::prefs::{Placement, Prefs, group_key, team_key};
 use crate::settings::{Appearance, Settings};
 use crate::settings_window::SettingsWindow;
 use crate::sidebar;
-use crate::{CloseThread, JumpTo, NextConversation, OpenSettings, PreviousConversation, io};
+use crate::*;
 
 // Push is the main update path; polling is the fallback when push is down
 // or a backend doesn't have it.
@@ -89,6 +91,7 @@ pub struct Snak {
 
     conversations: Vec<Conversation>,
     jump: Entity<InputState>,
+    pub(crate) palette: Entity<CommandState>,
     prefs: Prefs,
     show_hidden: bool,
     section_name: Entity<InputState>,
@@ -164,6 +167,7 @@ impl Snak {
             live: false,
             conversations: Vec::new(),
             jump,
+            palette: cx.new(|cx| CommandState::new(window, cx)),
             prefs: Prefs::load(connector_name),
             show_hidden: false,
             section_name: cx.new(|cx| InputState::new(window, cx).placeholder("Section name")),
@@ -363,6 +367,41 @@ impl Snak {
         Settings::update(cx, |s| s.appearance = s.appearance.next());
     }
 
+    pub fn conversations(&self) -> &[Conversation] {
+        &self.conversations
+    }
+
+    pub fn focus_main(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+    }
+
+    fn toggle_pref_for_selected(&mut self, cx: &mut Context<Self>, change: fn(&mut Prefs, &str)) {
+        if let Some(id) = self.selected.clone().filter(|_| !self.showing_unreads) {
+            self.update_prefs(cx, |p| change(p, &id.0));
+        }
+    }
+
+    fn set_all_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        let query = String::new();
+        let keys: Vec<String> = self
+            .sidebar_rows(&query, cx)
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Header(header) => Some(header.key),
+                SidebarRow::Item { .. } => None,
+            })
+            .collect();
+        self.update_prefs(cx, |p| {
+            for key in keys {
+                if collapsed {
+                    p.collapsed.insert(key);
+                } else {
+                    p.collapsed.remove(&key);
+                }
+            }
+        });
+    }
+
     pub fn signed_in_as(&self) -> Option<String> {
         self.backend
             .as_ref()
@@ -480,7 +519,12 @@ impl Snak {
 
     // Conversations
 
-    fn select(&mut self, id: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select(
+        &mut self,
+        id: ConversationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.showing_unreads = false;
         if self.selected.as_ref() != Some(&id) {
             self.selected = Some(id);
@@ -1293,13 +1337,6 @@ impl Snak {
         let rows = self.sidebar_rows(&query, cx);
         let hidden_count = self.prefs.hidden.len();
 
-        let me = self
-            .backend
-            .as_ref()
-            .map(|b| b.me().display_name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Snak".into());
-
         let unread_count = self.unread_entries().len();
         let theme = cx.theme();
         let mut list = v_flex().px_2().pb_4().child(
@@ -1370,9 +1407,10 @@ impl Snak {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.sidebar_foreground)
-                            .child(me),
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child("Conversations"),
                     )
                     .child(
                         Button::new("unreads-only")
@@ -1665,16 +1703,57 @@ impl Snak {
             h_flex()
                 .w_full()
                 .gap_2()
+                .pr_2()
                 .text_sm()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Snak"))
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .truncate()
                         .text_color(theme.muted_foreground)
                         .child(title),
-                ),
+                )
+                .child(self.render_account_menu(cx)),
         )
+    }
+
+    /// Top right, where Zed (and Teams) keep the signed-in user.
+    fn render_account_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = self
+            .signed_in_as()
+            .unwrap_or_else(|| "Not signed in".into());
+        let service = self.service_name();
+        let view = cx.entity();
+        Button::new("account")
+            .ghost()
+            .xsmall()
+            .tooltip(name.clone())
+            .child(Avatar::new().name(name.clone()).xsmall())
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
+                let item = |label: &str, run: fn(&mut Snak, &mut Window, &mut Context<Snak>)| {
+                    PopupMenuItem::new(label.to_string()).on_click(
+                        window
+                            .listener_for(&view, move |this, _, window, cx| run(this, window, cx)),
+                    )
+                };
+                menu.min_w(220.)
+                    .label(name.clone())
+                    .label(service.clone())
+                    .separator()
+                    .item(item("Command palette…", |this, window, cx| {
+                        this.open_palette(window, cx)
+                    }))
+                    .item(item("Settings…", |_, _, cx| {
+                        let main = cx.entity().downgrade();
+                        cx.defer(move |cx| SettingsWindow::open(main, cx));
+                    }))
+                    .item(item("Cycle theme mode", |this, window, cx| {
+                        this.cycle_appearance(window, cx)
+                    }))
+                    .separator()
+                    .item(item("Sign out", |this, _, cx| this.sign_out(cx)))
+            })
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1741,6 +1820,32 @@ impl Render for Snak {
                 this.step_conversation(-1, window, cx)
             }))
             .on_action(cx.listener(|this, _: &CloseThread, _, cx| this.close_thread(cx)))
+            .on_action(
+                cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ShowUnreads, _, cx| {
+                this.showing_unreads = true;
+                this.thread_root = None;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleUnreadsOnly, _, cx| {
+                this.update_prefs(cx, |p| p.unreads_only = !p.unreads_only)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleStar, _, cx| {
+                this.toggle_pref_for_selected(cx, Prefs::toggle_star)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMute, _, cx| {
+                this.toggle_pref_for_selected(cx, Prefs::toggle_muted)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHide, _, cx| {
+                this.toggle_pref_for_selected(cx, Prefs::toggle_hidden)
+            }))
+            .on_action(cx.listener(|this, _: &CollapseAll, _, cx| this.set_all_collapsed(true, cx)))
+            .on_action(cx.listener(|this, _: &ExpandAll, _, cx| this.set_all_collapsed(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &CycleTheme, window, cx| this.cycle_appearance(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SignOut, _, cx| this.sign_out(cx)))
             .bg(theme.background)
             .text_color(theme.foreground);
 

@@ -11,6 +11,15 @@ cargo run -p snak-app             # Microsoft Teams
 cargo run -p snak-app -- --demo   # fake workspace, no account needed
 ```
 
+To get a proper app with the Dock icon, build the bundle:
+
+```sh
+./scripts/bundle.sh --open            # target/Snak.app, debug build
+./scripts/bundle.sh --release --open  # optimised
+```
+
+The icon is `assets/icon.svg`; the bundle script renders it with `tools/make-icon`.
+
 Sign in with the device code shown in the window. Where the login is kept is a setting (⌘, → Account): the macOS Keychain (default), 1Password via the `op` CLI, or a plain 0600 file.
 
 ### Keychain prompts during development

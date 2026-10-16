@@ -1,0 +1,10 @@
+[package]
+name = "make-icon"
+description = "Renders assets/icon.svg into a macOS .iconset. Dev tool, not shipped."
+edition.workspace = true
+version.workspace = true
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+resvg = "0.45"

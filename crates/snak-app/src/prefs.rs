@@ -137,8 +137,14 @@ impl Prefs {
 
     pub fn add_section(&mut self, name: &str, first_member: Option<&str>) {
         let name = name.trim();
-        // Names double as collapse keys, so two sections can't share one.
-        if name.is_empty() || self.sections.iter().any(|s| s.name == name) {
+        if name.is_empty() {
+            return;
+        }
+        // Names double as collapse keys, so an existing name means that section.
+        if let Some(existing) = self.sections.iter().position(|s| s.name == name) {
+            if let Some(key) = first_member {
+                self.move_to_section(key, existing);
+            }
             return;
         }
         self.sections.push(Section {

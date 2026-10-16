@@ -128,6 +128,9 @@ pub struct Message {
 impl<'de> Deserialize<'de> for Message {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            return Err(serde::de::Error::custom("a message must be a JSON object"));
+        }
         let text = |keys: &[&str]| {
             keys.iter().find_map(|key| match value.get(*key)? {
                 Value::String(s) => Some(s.clone()),

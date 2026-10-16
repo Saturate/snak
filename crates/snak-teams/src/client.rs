@@ -90,10 +90,6 @@ impl TeamsClient {
         Ok(value)
     }
 
-    pub(crate) fn http(&self) -> &reqwest::Client {
-        &self.http
-    }
-
     /// Skype token for services that predate Entra auth (Trouter, the registrar).
     /// Derived from Squads (src/api.rs, `gen_skype_token`).
     pub(crate) async fn skype_token(&self) -> Result<String> {
@@ -119,16 +115,14 @@ impl TeamsClient {
     // The same authz response carries both the region and a Skype token, so
     // one call at connect time fills both.
     async fn authz(&self) -> Result<(Value, String)> {
-        let token = self.token(scope::SKYPE).await?;
         let url = format!("{TEAMS}/api/authsvc/v1.0/authz");
-        let res = self
-            .http
-            .post(&url)
-            .bearer_auth(token)
-            .header("Content-Length", "0")
-            .send()
+        let body = self
+            .call(scope::SKYPE, &url, |http, token| {
+                http.post(&url)
+                    .bearer_auth(token)
+                    .header("Content-Length", "0")
+            })
             .await?;
-        let body = decode(res, &url).await?;
         Ok((body, url))
     }
 
@@ -172,19 +166,26 @@ impl TeamsClient {
     /// Sends with a token for `scope`. A 401 means the token was revoked or
     /// its claims changed (we advertise CP1, so Entra may issue long-lived
     /// tokens and revoke them mid-life): drop it and retry once with a new one.
-    async fn call<T: DeserializeOwned>(
+    pub(crate) async fn call<T: DeserializeOwned>(
         &self,
         scope: &'static str,
         url: &str,
         build: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder,
     ) -> Result<T> {
         let token = self.token(scope).await?;
-        let res = build(&self.http, token).send().await?;
+        let res = build(&self.http, token.clone()).send().await?;
         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
             return decode(res, url).await;
         }
         tracing::info!(scope, "access token rejected; getting a new one");
-        self.tokens.lock().await.remove(scope);
+        {
+            // Only drop the token that was rejected: if a parallel request
+            // already replaced it, removing that one would refresh again.
+            let mut tokens = self.tokens.lock().await;
+            if tokens.get(scope).is_some_and(|t| t.value == token) {
+                tokens.remove(scope);
+            }
+        }
         let token = self.token(scope).await?;
         let res = build(&self.http, token).send().await?;
         decode(res, url).await
@@ -250,22 +251,28 @@ impl TeamsClient {
     /// hosts get the Skype token: message HTML is written by other people.
     pub async fn image(&self, url: &str) -> Result<Vec<u8>> {
         const MAX_BYTES: usize = 25 * 1024 * 1024;
-        let Some((url, host)) = crate::backend::classify_media_url(url) else {
+        let Some((url, host)) = crate::backend::classify_parsed_url(url) else {
             return Err(CoreError::Push(
                 "refusing to fetch an image from that host".into(),
             ));
         };
-        let request = match host {
-            crate::backend::MediaHost::Teams => {
-                let token = self.skype_token().await?;
-                self.http
-                    .get(url.clone())
-                    .header("Authorization", format!("skype_token {token}"))
-            }
+        let request = |token: Option<String>| match token {
+            Some(token) => self
+                .http
+                .get(url.clone())
+                .header("Authorization", format!("skype_token {token}")),
             // Public CDN: deliberately no credentials.
-            crate::backend::MediaHost::Giphy => self.http.get(url.clone()),
+            None => self.http.get(url.clone()),
         };
-        let mut res = request.send().await?;
+        let token = match host {
+            crate::backend::MediaHost::Teams => Some(self.skype_token().await?),
+            crate::backend::MediaHost::Giphy => None,
+        };
+        let mut res = request(token.clone()).send().await?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_some() {
+            self.forget_skype_token().await;
+            res = request(Some(self.skype_token().await?)).send().await?;
+        }
         let status = res.status();
         if !status.is_success() {
             return Err(CoreError::Http {
@@ -429,7 +436,7 @@ pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &st
         &body
     };
     serde_json::from_str(body).map_err(|source| CoreError::Decode {
-        url: url.to_string(),
+        url: path.to_string(),
         source,
     })
 }

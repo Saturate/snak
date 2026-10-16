@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds target/Snak.app: the binary, the icon from assets/icon.svg and an
+# Builds Snak.app in the cargo target dir: the binary, the icon from assets/icon.svg and an
 # Info.plist, signed with the dev identity when it exists (scripts/dev-cert.sh).
 # Usage: scripts/bundle.sh [--release] [--open]
 set -euo pipefail

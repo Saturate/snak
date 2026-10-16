@@ -68,7 +68,7 @@ pub fn install(cx: &mut App) {
     });
 }
 
-/// Makes these the themes used for dark and light mode; unknown names are ignored.
+/// Makes these the themes used for dark and light mode.
 /// Unknown names (a theme that was uninstalled) fall back to Zed's choice,
 /// then to the bundled One themes, never to GPUI Kit's own default.
 pub fn select(dark: &str, light: &str, cx: &mut App) {

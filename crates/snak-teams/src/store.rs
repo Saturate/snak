@@ -123,7 +123,9 @@ pub fn clear() {
     delete(&Storage::Keychain);
     delete(&Storage::File);
     if let Storage::OnePassword { account } = state().storage.clone() {
-        let _ = op(&account, &["item", "delete", OP_ITEM, "--archive"], None);
+        for id in op_item_ids(&account) {
+            let _ = op(&account, &["item", "delete", &id, "--archive"], None);
+        }
     }
 }
 
@@ -136,12 +138,13 @@ fn read(storage: &Storage) -> Option<String> {
             (!token.is_empty()).then(|| token.to_string())
         }
         Storage::OnePassword { account } => {
+            let id = op_item_ids(account).into_iter().next()?;
             let out = op(
                 account,
                 &[
                     "item",
                     "get",
-                    OP_ITEM,
+                    &id,
                     "--fields",
                     "label=credential",
                     "--reveal",
@@ -176,22 +179,50 @@ fn write(storage: &Storage, token: &str) -> Result<()> {
                 }],
             })
             .to_string();
-            // `credential` is the field our template creates; `title` is not a
-            // field, so asking for it always failed and created duplicates.
-            let exists = op(
-                account,
-                &["item", "get", OP_ITEM, "--fields", "label=credential"],
-                None,
-            )
-            .is_ok();
-            let args: &[&str] = if exists {
-                &["item", "edit", OP_ITEM, "--template", "/dev/stdin"]
-            } else {
-                &["item", "create", "--template", "/dev/stdin"]
-            };
-            op(account, args, Some(&template)).map(|_| ())
+            // By id: a title lookup fails outright once two items share the
+            // title, which an earlier version of this code could leave behind.
+            match op_item_ids(account).into_iter().next() {
+                Some(id) => op(
+                    account,
+                    &["item", "edit", &id, "--template", "/dev/stdin"],
+                    Some(&template),
+                ),
+                None => op(
+                    account,
+                    &["item", "create", "--template", "/dev/stdin"],
+                    Some(&template),
+                ),
+            }
+            .map(|_| ())
         }
     }
+}
+
+/// Ids of our items, most recently updated first.
+fn op_item_ids(account: &str) -> Vec<String> {
+    let Ok(out) = op(
+        account,
+        &["item", "list", "--tags", "snak", "--format", "json"],
+        None,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
+        return Vec::new();
+    };
+    let mut ours: Vec<(&str, &str)> = items
+        .iter()
+        .filter(|item| item["title"] == OP_ITEM)
+        .filter_map(|item| {
+            Some((
+                item["id"].as_str()?,
+                item["updated_at"].as_str().unwrap_or(""),
+            ))
+        })
+        .collect();
+    // RFC 3339 timestamps sort correctly as strings.
+    ours.sort_by(|a, b| b.1.cmp(a.1));
+    ours.into_iter().map(|(id, _)| id.to_string()).collect()
 }
 
 fn delete(storage: &Storage) {

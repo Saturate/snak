@@ -151,18 +151,16 @@ impl TeamsClient {
             "subscriptionsToAdd": subscriptions,
             "subscriptionsToRemove": [],
         });
-        let token = self.token(scope::PRESENCE).await?;
-        let res = self
-            .http()
-            .post(&url)
-            .bearer_auth(token)
-            .header("x-ms-client-user-agent", "Teams-V2-Web")
-            .header("x-ms-client-version", "1415/25040319109")
-            .header("x-ms-endpoint-id", &session.endpoint_id)
-            .json(&body)
-            .send()
+        let _: Value = self
+            .call(scope::PRESENCE, &url, |http, token| {
+                http.post(&url)
+                    .bearer_auth(token)
+                    .header("x-ms-client-user-agent", "Teams-V2-Web")
+                    .header("x-ms-client-version", "1415/25040319109")
+                    .header("x-ms-endpoint-id", &session.endpoint_id)
+                    .json(&body)
+            })
             .await?;
-        let _: Value = decode(res, &url).await?;
         Ok(())
     }
 }

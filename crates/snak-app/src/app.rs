@@ -147,7 +147,13 @@ pub struct Snak {
     pending: Vec<Pending>,
     next_pending: u64,
     refetch_task: Option<Task<()>>,
-    refetch_started: Option<std::time::Instant>,
+    refetch_started: Option<(Option<ConversationId>, std::time::Instant)>,
+    login_in_flight: bool,
+    reset_composer: bool,
+    reset_thread_composer: bool,
+    refocus_main: bool,
+    /// Unsent thread replies, per conversation and thread root.
+    thread_drafts: HashMap<(ConversationId, MessageId), String>,
     sidebar_loading: bool,
     sidebar_dirty: bool,
     /// Unsent composer text per conversation.
@@ -232,6 +238,11 @@ impl Snak {
             next_pending: 0,
             refetch_task: None,
             refetch_started: None,
+            login_in_flight: false,
+            reset_composer: false,
+            reset_thread_composer: false,
+            refocus_main: false,
+            thread_drafts: HashMap::new(),
             sidebar_loading: false,
             sidebar_dirty: false,
             drafts: HashMap::new(),
@@ -276,6 +287,7 @@ impl Snak {
 
     fn begin_login(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Login { prompt: None };
+        self.login_in_flight = true;
         let connector = self.connector.clone();
         self.auth_task = Some(cx.spawn(async move |this, cx| {
             let prompt = match io({
@@ -286,7 +298,11 @@ impl Snak {
             {
                 Ok(prompt) => prompt,
                 Err(e) => {
-                    this.update(cx, |this, cx| this.show_error(e, cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.login_in_flight = false;
+                        this.show_error(e, cx)
+                    })
+                    .ok();
                     return;
                 }
             };
@@ -299,9 +315,12 @@ impl Snak {
             .ok();
 
             let result = io(async move { connector.finish_login(&prompt).await }).await;
-            this.update(cx, |this, cx| match result {
-                Ok(backend) => this.signed_in(backend, cx),
-                Err(e) => this.show_error(e, cx),
+            this.update(cx, |this, cx| {
+                this.login_in_flight = false;
+                match result {
+                    Ok(backend) => this.signed_in(backend, cx),
+                    Err(e) => this.show_error(e, cx),
+                }
             })
             .ok();
         }));
@@ -332,19 +351,30 @@ impl Snak {
 
     fn session_expired(&mut self, cx: &mut Context<Self>) {
         // Several in-flight requests can each report the expiry; the first
-        // one starts the sign-in, the rest must not replace its code.
-        if self.backend.is_none() {
+        // one starts the sign-in, and later ones must not replace its code.
+        // A stale saved login at startup lands here too, with no backend yet.
+        if self.login_in_flight {
             return;
         }
         tracing::warn!("session expired; asking to sign in again");
-        self.end_session(cx);
+        // Expiry isn't the user's choice, so unsent text survives it.
+        self.end_session(false, cx);
         self.error = Some("Your session expired. Sign in again.".into());
         self.begin_login(cx);
     }
 
     /// Drops everything tied to the signed-in account, including requests in
     /// flight, so nothing from it lands after the next sign-in.
-    fn end_session(&mut self, cx: &mut Context<Self>) {
+    fn end_session(&mut self, clear_drafts: bool, cx: &mut Context<Self>) {
+        if clear_drafts {
+            self.drafts.clear();
+            self.thread_drafts.clear();
+        } else {
+            self.stash_drafts(cx);
+        }
+        // Composers need a window to change, so they're emptied on the next render.
+        self.reset_composer = true;
+        self.reset_thread_composer = true;
         self.connector.sign_out();
         self.backend = None;
         self.events_task = None;
@@ -360,9 +390,31 @@ impl Snak {
         self.showing_unreads = true;
         self.thread_root = None;
         self.pending.clear();
-        self.drafts.clear();
         self.error = None;
         self.set_rows(Vec::new(), cx);
+    }
+
+    /// Keeps what's typed in both composers as drafts of where it was typed.
+    fn stash_drafts(&mut self, cx: &mut Context<Self>) {
+        if let Some(conversation) = self.selected.clone() {
+            let typed = self.composer.read(cx).value().to_string();
+            put_draft(&mut self.drafts, conversation.clone(), typed);
+            if let Some(root) = self.thread_root.clone() {
+                let typed = self.thread_composer.read(cx).value().to_string();
+                put_draft(&mut self.thread_drafts, (conversation, root), typed);
+            }
+        }
+    }
+
+    /// Saves the thread composer as the open thread's draft and empties it.
+    fn put_away_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(conversation), Some(root)) = (self.selected.clone(), self.thread_root.clone())
+        {
+            let typed = self.thread_composer.read(cx).value().to_string();
+            put_draft(&mut self.thread_drafts, (conversation, root), typed);
+        }
+        self.thread_composer
+            .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
     // Updates
@@ -532,7 +584,7 @@ impl Snak {
     }
 
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
-        self.end_session(cx);
+        self.end_session(true, cx);
         self.begin_login(cx);
     }
 
@@ -632,12 +684,15 @@ impl Snak {
             // Each conversation keeps its own unsent text, so switching never
             // carries a half-written message into the wrong place.
             let typed = self.composer.read(cx).value().to_string();
+            let previous_for_thread = self.selected.clone();
             if let Some(previous) = self.selected.take() {
-                if typed.trim().is_empty() {
-                    self.drafts.remove(&previous);
-                } else {
-                    self.drafts.insert(previous, typed);
-                }
+                put_draft(&mut self.drafts, previous, typed);
+            }
+            if self.thread_root.is_some() {
+                // `selected` is already taken above, so restore it briefly.
+                self.selected = previous_for_thread.clone();
+                self.put_away_thread_draft(window, cx);
+                self.selected = None;
             }
             let draft = self.drafts.remove(&id).unwrap_or_default();
             self.composer
@@ -665,6 +720,7 @@ impl Snak {
                 }
                 match result {
                     Ok(rows) => {
+                        let rows = keep_older_rows(&this.rows, rows);
                         this.set_rows(rows, cx);
                         this.mark_read(&requested, cx);
                     }
@@ -745,8 +801,11 @@ impl Snak {
                 // An empty page is a load in progress; a loaded page without
                 // the root means the post is gone, so the panel goes too.
                 None if !self.rows.is_empty() => {
+                    self.stash_drafts(cx);
                     self.thread_root = None;
                     self.thread_rows = Rc::default();
+                    self.reset_thread_composer = true;
+                    self.refocus_main = true;
                 }
                 None => {}
             }
@@ -828,6 +887,15 @@ impl Snak {
     }
 
     fn open_thread(&mut self, root_id: MessageId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread_root.as_ref() != Some(&root_id) {
+            self.put_away_thread_draft(window, cx);
+            if let Some(conversation) = self.selected.clone()
+                && let Some(draft) = self.thread_drafts.remove(&(conversation, root_id.clone()))
+            {
+                self.thread_composer
+                    .update(cx, |state, cx| state.set_value(draft, window, cx));
+            }
+        }
         let thread = self
             .rows
             .iter()
@@ -846,6 +914,12 @@ impl Snak {
     // Removing the focused composer would leave key presses with no target
     // under this view, which silently disables every shortcut.
     fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape reaches here from the main composer too; with no thread
+        // open there's nothing to close and focus must stay put.
+        if self.thread_root.is_none() {
+            return;
+        }
+        self.put_away_thread_draft(window, cx);
         self.thread_root = None;
         window.focus(&self.focus, cx);
         cx.notify();
@@ -921,15 +995,26 @@ impl Snak {
                     // that's still on screen and empty, otherwise into its draft.
                     let same_place = this.selected.as_ref() == Some(&sent_to)
                         && (!in_thread || this.thread_root == sent_in_thread);
-                    let input = if in_thread {
-                        this.thread_composer.clone()
+                    if same_place {
+                        let input = if in_thread {
+                            this.thread_composer.clone()
+                        } else {
+                            this.composer.clone()
+                        };
+                        let current = input.read(cx).value().to_string();
+                        let restored = join_drafts(&text, &current);
+                        input.update(cx, |state, cx| state.set_value(restored, window, cx));
+                    } else if in_thread {
+                        if let Some(root) = sent_in_thread.clone() {
+                            let key = (sent_to.clone(), root);
+                            let existing = this.thread_drafts.remove(&key).unwrap_or_default();
+                            this.thread_drafts
+                                .insert(key, join_drafts(&text, &existing));
+                        }
                     } else {
-                        this.composer.clone()
-                    };
-                    if same_place && input.read(cx).value().trim().is_empty() {
-                        input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
-                    } else if !in_thread {
-                        this.drafts.entry(sent_to.clone()).or_insert(text.clone());
+                        let existing = this.drafts.remove(&sent_to).unwrap_or_default();
+                        this.drafts
+                            .insert(sent_to.clone(), join_drafts(&text, &existing));
                     }
                     this.show_error(e, cx);
                 }
@@ -945,14 +1030,14 @@ impl Snak {
         const DELAYS_MS: [u64; 4] = [0, 1500, 4000, 10000];
         // A burst of push events would otherwise keep cancelling the fetch at
         // delay 0 before it finishes; within a second, the running schedule covers it.
-        if self
-            .refetch_started
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        let conversation = self.selected.clone();
+        if let Some((started_for, at)) = &self.refetch_started
+            && *started_for == conversation
+            && at.elapsed() < Duration::from_secs(1)
         {
             return;
         }
-        self.refetch_started = Some(std::time::Instant::now());
-        let conversation = self.selected.clone();
+        self.refetch_started = Some((conversation.clone(), std::time::Instant::now()));
         self.refetch_task = Some(cx.spawn(async move |this, cx| {
             let mut waited = 0;
             for delay in DELAYS_MS {
@@ -1009,8 +1094,10 @@ fn arrived(rows: &[Message], pending: &Pending) -> bool {
     let want = normalise(text);
     candidates.into_iter().filter(|m| !m.pending).any(|m| {
         m.author_id == pending.message.author_id
+            // An older copy of the same text is an earlier message, not this
+            // one; a little slack covers clock skew against the server.
             && match (m.sent_at, pending.message.sent_at) {
-                (Some(a), Some(b)) => (a - b).num_seconds().abs() < 180,
+                (Some(server), Some(local)) => (-30..180).contains(&(server - local).num_seconds()),
                 _ => false,
             }
             && match &m.body {
@@ -1019,6 +1106,48 @@ fn arrived(rows: &[Message], pending: &Pending) -> bool {
                 _ => false,
             }
     })
+}
+
+/// A refetch returns the newest page only. When a new message pushes the
+/// oldest off, keep the rows already shown so the list grows at the end
+/// instead of shifting, which would jump the reader to the bottom.
+fn keep_older_rows(old: &[Message], new: Vec<Message>) -> Vec<Message> {
+    const MAX_ROWS: usize = 2000;
+    let Some(first) = new.first() else {
+        return new;
+    };
+    let ids: std::collections::HashSet<&MessageId> = new.iter().map(|m| &m.id).collect();
+    let mut merged: Vec<Message> = old
+        .iter()
+        .filter(|m| !m.pending && !ids.contains(&m.id))
+        .filter(|m| match (m.sent_at, first.sent_at) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    merged.extend(new);
+    if merged.len() > MAX_ROWS {
+        merged.drain(..merged.len() - MAX_ROWS);
+    }
+    merged
+}
+
+fn put_draft<K: std::hash::Hash + Eq>(drafts: &mut HashMap<K, String>, key: K, text: String) {
+    if text.trim().is_empty() {
+        drafts.remove(&key);
+    } else {
+        drafts.insert(key, text);
+    }
+}
+
+/// Puts failed text back without dropping what's been typed since.
+fn join_drafts(failed: &str, current: &str) -> String {
+    match (failed.trim().is_empty(), current.trim().is_empty()) {
+        (_, true) => failed.to_string(),
+        (true, false) => current.to_string(),
+        (false, false) => format!("{current}\n\n{failed}"),
+    }
 }
 
 fn strip_tags(html: &str) -> String {
@@ -1068,7 +1197,7 @@ fn sync_scroller(
             state.append(new.len() - old.len(), cx);
             // Rows already shown may have changed too, e.g. an edit or a reaction.
             state.remeasure(cx);
-        } else if same_prefix {
+        } else if same_prefix && new.len() == old.len() {
             state.remeasure(cx);
         } else {
             state.reset(new.len(), cx);
@@ -2385,7 +2514,24 @@ impl Snak {
 }
 
 impl Render for Snak {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Changes queued by code that had no window at hand.
+        if std::mem::take(&mut self.reset_composer) {
+            let composer = self.composer.clone();
+            window.defer(cx, move |window, cx| {
+                composer.update(cx, |state, cx| state.set_value("", window, cx))
+            });
+        }
+        if std::mem::take(&mut self.reset_thread_composer) {
+            let composer = self.thread_composer.clone();
+            window.defer(cx, move |window, cx| {
+                composer.update(cx, |state, cx| state.set_value("", window, cx))
+            });
+        }
+        if std::mem::take(&mut self.refocus_main) {
+            let focus = self.focus.clone();
+            window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        }
         let theme = cx.theme();
         let root = div()
             .size_full()
@@ -2480,8 +2626,61 @@ mod tests {
     // Not a glob: gpui's `test` attribute macro would shadow the built-in one.
     use super::{
         Body, ConversationId, ImageFormat, ImageRef, Message, MessageId, Pending, arrived,
-        first_frame_png, image_format, image_size,
+        first_frame_png, image_format, image_size, join_drafts, keep_older_rows,
     };
+
+    fn at(mut m: Message, seconds_ago: i64) -> Message {
+        m.sent_at = Some(chrono::Utc::now() - chrono::Duration::seconds(seconds_ago));
+        m
+    }
+
+    #[test]
+    fn an_older_copy_of_the_same_text_is_not_the_new_message() {
+        let local = Pending {
+            conversation: ConversationId("c".into()),
+            reply_to: None,
+            message: message("pending-2", "me", Body::Text("ok".into()), true),
+        };
+        let earlier = at(
+            message("1", "me", Body::Html("<p>ok</p>".into()), false),
+            60,
+        );
+        assert!(!arrived(&[earlier], &local));
+        let just_now = at(message("2", "me", Body::Html("<p>ok</p>".into()), false), 0);
+        assert!(arrived(&[just_now], &local));
+    }
+
+    #[test]
+    fn a_page_shift_keeps_rows_already_shown() {
+        let old: Vec<Message> = (1..=3)
+            .map(|i| {
+                at(
+                    message(&i.to_string(), "a", Body::Text("x".into()), false),
+                    100 - i,
+                )
+            })
+            .collect();
+        let new: Vec<Message> = (2..=4)
+            .map(|i| {
+                at(
+                    message(&i.to_string(), "a", Body::Text("x".into()), false),
+                    100 - i,
+                )
+            })
+            .collect();
+        let ids: Vec<String> = keep_older_rows(&old, new)
+            .into_iter()
+            .map(|m| m.id.0)
+            .collect();
+        assert_eq!(ids, ["1", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn failed_text_joins_what_was_typed_since() {
+        assert_eq!(join_drafts("failed", ""), "failed");
+        assert_eq!(join_drafts("failed", "new"), "new\n\nfailed");
+        assert_eq!(join_drafts("", "new"), "new");
+    }
 
     fn message(id: &str, author: &str, body: Body, pending: bool) -> Message {
         Message {

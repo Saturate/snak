@@ -519,8 +519,13 @@ pub(crate) enum MediaHost {
 /// one representation and fetching another is how `\` or `&sol;` tricks would
 /// steer the token to another host.
 pub(crate) fn classify_media_url(raw: &str) -> Option<(url::Url, MediaHost)> {
-    let decoded = html_escape::decode_html_entities(raw);
-    let url = url::Url::parse(decoded.trim()).ok()?;
+    classify_parsed_url(html_escape::decode_html_entities(raw).trim())
+}
+
+/// The same check for a URL that is already plain text, such as one taken from
+/// an `ImageRef`; decoding it again would turn a literal `&amp;` into `&`.
+pub(crate) fn classify_parsed_url(text: &str) -> Option<(url::Url, MediaHost)> {
+    let url = url::Url::parse(text).ok()?;
     if url.scheme() != "https"
         || url.port().is_some()
         || !url.username().is_empty()
@@ -593,7 +598,12 @@ fn display_html(html: &str) -> String {
         out.push_str(&html[copied..start]);
         let tag = &html[start..end];
         if tag.to_ascii_lowercase().contains("schema.skype.com/emoji") {
-            out.push_str(&attribute(tag, "alt").unwrap_or_default());
+            // The alt text is attacker-written and never re-scanned, so it goes
+            // back in as text, not markup.
+            let alt = attribute(tag, "alt").unwrap_or_default();
+            out.push_str(&html_escape::encode_text(
+                &html_escape::decode_html_entities(&alt),
+            ));
         } else if attribute(tag, "src")
             .and_then(|u| classify_media_url(&u))
             .is_none()
@@ -789,6 +799,23 @@ mod tests {
         assert!(!giphy("https://evilgiphy.com/x.gif"));
         assert!(!giphy("https://media.attacker.example\\.giphy.com/x"));
         assert!(!giphy("https://media.evil.giphy.com/x"));
+    }
+
+    #[test]
+    fn emoji_alt_text_cannot_carry_markup() {
+        let html = r#"<p><img itemtype="http://schema.skype.com/Emoji" alt="<img src=https://tracker.example/p.gif x="></p>"#;
+        let out = display_html(html);
+        assert!(!out.to_ascii_lowercase().contains("<img"), "{out}");
+    }
+
+    #[test]
+    fn stored_image_urls_are_not_decoded_twice() {
+        let (url, _) =
+            classify_media_url("https://eu-api.asm.skype.com/v1/objects/a?q=1&amp;amp;b=2")
+                .expect("allowed");
+        let stored = url.to_string();
+        let (again, _) = classify_parsed_url(&stored).expect("still allowed");
+        assert_eq!(again.as_str(), stored);
     }
 
     #[test]

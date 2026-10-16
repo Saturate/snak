@@ -68,14 +68,21 @@ pub async fn set_storage(storage: Storage) {
         if previous == storage {
             return Ok(());
         }
+        // Any failure below keeps the old setting: a sign-out only looks in
+        // 1Password while the setting points there, so switching away from a
+        // copy that couldn't be read or removed would strand it.
         if stored_login_signed_out() {
             // Its delete may only look in the new place, so remove it here.
-            delete(&previous);
-        } else if let Some(token) = read(&previous) {
+            delete(&previous)?;
+        } else if let Some(token) = read(&previous)? {
             write(&storage, &token)?;
-            // A copy left behind would survive a later sign-out, which only
-            // looks where the setting points.
-            delete(&previous);
+            if let Err(e) = delete(&previous) {
+                // Back to one copy, where the setting still points.
+                if let Err(undo) = delete(&storage) {
+                    tracing::warn!(error = %undo, "login left in both storages");
+                }
+                return Err(e);
+            }
             state().last_op_write = Some(Instant::now());
         }
         state().storage = storage;
@@ -114,7 +121,9 @@ pub async fn load() -> Option<StoredLogin> {
             return None;
         }
         let storage = state().storage.clone();
-        let token = read(&storage)?;
+        let token = read(&storage)
+            .inspect_err(|e| tracing::warn!(error = %e, "could not read the saved login"))
+            .ok()??;
         // Sign-out doesn't wait for the lock, so it may have happened while
         // the read sat on a prompt.
         (self::epoch() == epoch).then_some(StoredLogin { token, epoch })
@@ -124,7 +133,7 @@ pub async fn load() -> Option<StoredLogin> {
     .flatten()
 }
 
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 
 /// Bumped the moment a sign-out happens. Every save carries the epoch its
 /// session started under and is dropped once that no longer matches: an old
@@ -136,6 +145,10 @@ static CLEARED: AtomicU64 = AtomicU64::new(0);
 /// The epoch of the last token written, so a delayed delete can tell that a
 /// login begun after its sign-out has already been saved.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Set when a sign-out couldn't delete everywhere (1Password locked, a
+/// prompt dismissed): the login left behind is signed out, and stays that
+/// way until a new one overwrites it.
+static LEFT_BEHIND: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn epoch() -> u64 {
     EPOCH.load(SeqCst)
@@ -145,10 +158,10 @@ fn clear_pending() -> bool {
     CLEARED.load(SeqCst) != EPOCH.load(SeqCst)
 }
 
-/// A sign-out's delete hasn't run yet, and no login has been saved since the
-/// latest sign-out: whatever is stored belongs to a signed-out session.
+/// Whatever is stored belongs to a signed-out session: a sign-out's delete
+/// hasn't run yet and nothing was saved since, or a delete failed.
 fn stored_login_signed_out() -> bool {
-    clear_pending() && WRITTEN.load(SeqCst) < EPOCH.load(SeqCst)
+    LEFT_BEHIND.load(SeqCst) || (clear_pending() && WRITTEN.load(SeqCst) < EPOCH.load(SeqCst))
 }
 
 /// `fresh` marks a new login, which skips the 1Password write throttle.
@@ -176,6 +189,7 @@ pub(crate) async fn save(token: String, fresh: bool, epoch: u64) -> Result<()> {
         };
         write(&storage, &token)?;
         WRITTEN.fetch_max(epoch, SeqCst);
+        LEFT_BEHIND.store(false, SeqCst);
         Ok(true)
     })
     .await
@@ -226,21 +240,28 @@ fn clear(issued: u64) {
         places.push(current.clone());
     }
     for place in places.iter().filter(|place| Some(*place) != keep) {
-        delete(place);
+        if let Err(e) = delete(place) {
+            tracing::warn!(error = %e, "sign-out left a login behind");
+            LEFT_BEHIND.store(true, SeqCst);
+        }
     }
 }
 
-fn read(storage: &Storage) -> Option<String> {
-    match storage {
-        Storage::Keychain => keychain_entry().ok()?.get_password().ok(),
-        Storage::File => {
-            let token = std::fs::read_to_string(token_file()?).ok()?;
-            let token = token.trim();
-            (!token.is_empty()).then(|| token.to_string())
-        }
+/// `Ok(None)` only when nothing is stored. An error means the store couldn't
+/// be asked, say 1Password locked or a prompt dismissed.
+fn read(storage: &Storage) -> Result<Option<String>> {
+    let token = match storage {
+        Storage::Keychain => keychain_get()?,
+        Storage::File => match std::fs::read_to_string(token_path()?) {
+            Ok(token) => Some(token),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(CoreError::Keychain(format!("token file: {e}"))),
+        },
         Storage::OnePassword { account } => {
-            let id = op_item_ids(account).into_iter().next()?;
-            let out = op(
+            let Some(id) = op_item_ids(account)?.into_iter().next() else {
+                return Ok(None);
+            };
+            Some(op(
                 account,
                 &[
                     "item",
@@ -251,19 +272,17 @@ fn read(storage: &Storage) -> Option<String> {
                     "--reveal",
                 ],
                 None,
-            )
-            .ok()?;
-            let token = out.trim();
-            (!token.is_empty()).then(|| token.to_string())
+            )?)
         }
-    }
+    };
+    Ok(token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty()))
 }
 
 fn write(storage: &Storage, token: &str) -> Result<()> {
     match storage {
-        Storage::Keychain => keychain_entry()?
-            .set_password(token)
-            .map_err(|e| CoreError::Keychain(e.to_string())),
+        Storage::Keychain => keychain_set(token),
         Storage::File => write_file(token),
         Storage::OnePassword { account } => {
             // Piped as a template so the token never appears in argv, where
@@ -282,7 +301,7 @@ fn write(storage: &Storage, token: &str) -> Result<()> {
             .to_string();
             // By id: a title lookup fails outright once two items share the
             // title, which an earlier version of this code could leave behind.
-            match op_item_ids(account).into_iter().next() {
+            match op_item_ids(account)?.into_iter().next() {
                 Some(id) => op(
                     account,
                     &["item", "edit", &id, "--template", "/dev/stdin"],
@@ -300,24 +319,14 @@ fn write(storage: &Storage, token: &str) -> Result<()> {
 }
 
 /// Ids of our items, most recently updated first.
-fn op_item_ids(account: &str) -> Vec<String> {
-    let out = match op(
+fn op_item_ids(account: &str) -> Result<Vec<String>> {
+    let out = op(
         account,
         &["item", "list", "--tags", "snak", "--format", "json"],
         None,
-    ) {
-        Ok(out) => out,
-        Err(e) => {
-            // Usually 1Password locked or the prompt dismissed. On sign-out
-            // this means the item stays, so say so rather than fail silently.
-            tracing::warn!(error = %e, "could not list Snak's 1Password items");
-            return Vec::new();
-        }
-    };
-    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
-        tracing::warn!("unexpected output from op item list");
-        return Vec::new();
-    };
+    )?;
+    let items = serde_json::from_str::<Vec<serde_json::Value>>(&out)
+        .map_err(|e| CoreError::Keychain(format!("1Password CLI: unexpected item list: {e}")))?;
     let mut ours: Vec<(&str, &str)> = items
         .iter()
         .filter(|item| item["title"] == OP_ITEM)
@@ -330,27 +339,25 @@ fn op_item_ids(account: &str) -> Vec<String> {
         .collect();
     // RFC 3339 timestamps sort correctly as strings.
     ours.sort_by(|a, b| b.1.cmp(a.1));
-    ours.into_iter().map(|(id, _)| id.to_string()).collect()
+    Ok(ours.into_iter().map(|(id, _)| id.to_string()).collect())
 }
 
-fn delete(storage: &Storage) {
+fn delete(storage: &Storage) -> Result<()> {
     match storage {
-        Storage::Keychain => {
-            if let Ok(entry) = keychain_entry() {
-                let _ = entry.delete_credential();
+        Storage::Keychain => keychain_delete(),
+        Storage::File => match std::fs::remove_file(token_path()?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(CoreError::Keychain(format!("token file: {e}")))
             }
-        }
-        Storage::File => {
-            if let Some(path) = token_file() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+            _ => Ok(()),
+        },
         // Archived rather than deleted, so it can still be recovered from
         // 1Password's archive.
         Storage::OnePassword { account } => {
-            for id in op_item_ids(account) {
-                let _ = op(account, &["item", "delete", &id, "--archive"], None);
+            for id in op_item_ids(account)? {
+                op(account, &["item", "delete", &id, "--archive"], None)?;
             }
+            Ok(())
         }
     }
 }
@@ -361,10 +368,49 @@ fn keychain_entry() -> Result<keyring::Entry> {
         .map_err(|e| CoreError::Keychain(e.to_string()))
 }
 
-// Tests sign out, which deletes everywhere; they must never reach the real login.
+#[cfg(not(test))]
+fn keychain_get() -> Result<Option<String>> {
+    match keychain_entry()?.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(CoreError::Keychain(e.to_string())),
+    }
+}
+
+#[cfg(not(test))]
+fn keychain_set(token: &str) -> Result<()> {
+    keychain_entry()?
+        .set_password(token)
+        .map_err(|e| CoreError::Keychain(e.to_string()))
+}
+
+#[cfg(not(test))]
+fn keychain_delete() -> Result<()> {
+    match keychain_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(CoreError::Keychain(e.to_string())),
+    }
+}
+
+// Tests sign out, which deletes everywhere; they must never reach the real
+// login. The test Keychain is always empty and refuses writes.
 #[cfg(test)]
-fn keychain_entry() -> Result<keyring::Entry> {
+fn keychain_get() -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(test)]
+fn keychain_set(_token: &str) -> Result<()> {
     Err(CoreError::Keychain("no Keychain in tests".into()))
+}
+
+#[cfg(test)]
+fn keychain_delete() -> Result<()> {
+    Ok(())
+}
+
+fn token_path() -> Result<PathBuf> {
+    token_file().ok_or_else(|| CoreError::Keychain("no home directory".into()))
 }
 
 #[cfg(not(test))]
@@ -380,7 +426,7 @@ fn token_file() -> Option<PathBuf> {
 fn write_file(token: &str) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let io_error = |e: std::io::Error| CoreError::Keychain(format!("token file: {e}"));
-    let path = token_file().ok_or_else(|| CoreError::Keychain("no home directory".into()))?;
+    let path = token_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io_error)?;
     }
@@ -458,7 +504,20 @@ mod tests {
     }
 
     fn stored() -> Option<String> {
-        read(&Storage::File)
+        read(&Storage::File).unwrap()
+    }
+
+    fn current() -> Storage {
+        state().storage.clone()
+    }
+
+    /// A directory where the token file goes makes reading and deleting it
+    /// fail, standing in for a locked 1Password.
+    fn break_token_file() -> PathBuf {
+        let file = token_file().unwrap();
+        let _ = std::fs::remove_file(&file);
+        std::fs::create_dir(&file).unwrap();
+        file
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -489,15 +548,59 @@ mod tests {
     async fn a_login_after_sign_out_survives_the_delayed_delete() {
         let _serial = setup();
         save("OLD".into(), true, epoch()).await.unwrap();
-        // The delete is held up, say behind a Touch ID prompt.
-        let held = exclusive();
-        sign_out();
-        let saving = tokio::spawn(save("NEW".into(), true, epoch()));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(held);
-        saving.await.unwrap().unwrap();
-        wait_cleared();
+        // The sign-out's delete is held up, say behind a Touch ID prompt, and
+        // a new login is saved before it runs.
+        let issued = EPOCH.fetch_add(1, SeqCst) + 1;
+        save("NEW".into(), true, epoch()).await.unwrap();
+        clear(issued);
         assert_eq!(stored().as_deref(), Some("NEW"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_while_signed_out_deletes_the_old_copy() {
+        let _serial = setup();
+        save("OLD".into(), true, epoch()).await.unwrap();
+        let issued = EPOCH.fetch_add(1, SeqCst) + 1;
+        set_storage(Storage::Keychain).await;
+        assert_eq!(current(), Storage::Keychain);
+        assert_eq!(stored(), None);
+        clear(issued);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_move_keeps_the_setting() {
+        let _serial = setup();
+        save("OLD".into(), true, epoch()).await.unwrap();
+        // The test Keychain refuses writes.
+        set_storage(Storage::Keychain).await;
+        assert_eq!(current(), Storage::File);
+        assert_eq!(stored().as_deref(), Some("OLD"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_that_cannot_read_keeps_the_setting() {
+        let _serial = setup();
+        let file = break_token_file();
+        set_storage(Storage::Keychain).await;
+        assert_eq!(current(), Storage::File);
+        std::fs::remove_dir(file).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_login_a_sign_out_could_not_delete_stays_signed_out() {
+        let _serial = setup();
+        let file = break_token_file();
+        sign_out();
+        wait_cleared();
+        std::fs::remove_dir(&file).unwrap();
+        // What the failed delete left behind, now readable again.
+        std::fs::write(&file, "OLD").unwrap();
+        assert!(load().await.is_none());
+        save("NEW".into(), true, epoch()).await.unwrap();
+        assert_eq!(
+            load().await.map(|login| login.token).as_deref(),
+            Some("NEW")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

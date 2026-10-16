@@ -13,7 +13,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use crate::app::Snak;
-use crate::settings::{Appearance, Settings};
+use crate::settings::{Appearance, LoginStorage, Settings, onepassword_accounts};
 use crate::theme::InstalledThemes;
 
 /// The open settings window, so a second ⌘, focuses it instead of opening another.
@@ -24,6 +24,8 @@ impl Global for OpenSettings {}
 pub struct SettingsWindow {
     focus: FocusHandle,
     main: WeakEntity<Snak>,
+    /// Looked up once per window; `op account list` takes a moment.
+    onepassword_accounts: Vec<(String, String)>,
 }
 
 impl SettingsWindow {
@@ -49,6 +51,7 @@ impl SettingsWindow {
             cx.new(|cx| SettingsWindow {
                 focus: cx.focus_handle(),
                 main,
+                onepassword_accounts: onepassword_accounts(),
             })
         }) {
             cx.set_global(OpenSettings(Some(handle)));
@@ -70,6 +73,7 @@ impl SettingsWindow {
         let (zed_dark, zed_light) = (installed.zed_dark.clone(), installed.zed_light.clone());
         let main = self.main.clone();
         let main_for_storage = self.main.clone();
+        let onepassword_accounts = self.onepassword_accounts.clone();
         let signed_in = main
             .upgrade()
             .and_then(|m| m.read(cx).signed_in_as())
@@ -211,36 +215,71 @@ impl SettingsWindow {
                     )
                     .description("Removes the saved login."),
                     SettingItem::new(
-                        "Store login in a file",
-                        SettingField::switch(
-                            |cx: &App| Settings::get(cx).insecure_credentials,
+                        "Keep login in",
+                        SettingField::dropdown(
+                            LoginStorage::ALL
+                                .iter()
+                                .map(|s| (s.label().into(), s.label().into()))
+                                .collect(),
+                            |cx: &App| Settings::get(cx).login_storage.label().into(),
                             {
                                 let main = main_for_storage.clone();
-                                move |value: bool, cx: &mut App| {
-                                    Settings::update(cx, |s| s.insecure_credentials = value);
-                                    let storage = if value {
-                                        snak_chat::CredentialStorage::Insecure
-                                    } else {
-                                        snak_chat::CredentialStorage::Keychain
-                                    };
-                                    if let Some(main) = main.upgrade() {
-                                        main.read(cx).set_credential_storage(storage);
-                                    }
+                                move |value: SharedString, cx: &mut App| {
+                                    Settings::update(cx, |s| {
+                                        s.login_storage = LoginStorage::from_label(&value)
+                                    });
+                                    main.update(cx, |snak, cx| snak.apply_credential_storage(cx))
+                                        .ok();
                                 }
                             },
                         )
-                        .default_value(false),
+                        .default_value(LoginStorage::Keychain.label().to_string()),
                     )
                     .description(
-                        "Less secure. Stops the Keychain prompts that unsigned development \
-                         builds trigger after every rebuild, but any program running as you can \
-                         read the file and use your session.",
+                        "Keychain prompts after every rebuild of an unsigned dev build; \
+                         scripts/dev-cert.sh fixes that. 1Password asks for Touch ID when \
+                         locked. A file never prompts, but any program running as you can \
+                         read it and use your session.",
                     ),
+                    SettingItem::new(
+                        "1Password account",
+                        SettingField::dropdown(
+                            onepassword_accounts
+                                .iter()
+                                .map(|(url, email)| {
+                                    (url.clone().into(), format!("{email} ({url})").into())
+                                })
+                                .collect(),
+                            |cx: &App| {
+                                Settings::get(cx)
+                                    .onepassword_account
+                                    .clone()
+                                    .unwrap_or_default()
+                                    .into()
+                            },
+                            {
+                                let main = main_for_storage.clone();
+                                move |value: SharedString, cx: &mut App| {
+                                    Settings::update(cx, |s| {
+                                        s.onepassword_account = Some(value.to_string())
+                                    });
+                                    main.update(cx, |snak, cx| snak.apply_credential_storage(cx))
+                                        .ok();
+                                }
+                            },
+                        ),
+                    )
+                    .description(if onepassword_accounts.is_empty() {
+                        "Install the 1Password CLI (op) and turn on its desktop app \
+                         integration to use 1Password."
+                    } else {
+                        "Which account holds the \"Snak Teams login\" item. Used when \
+                         \"Keep login in\" is 1Password."
+                    }),
                 ])),
             SettingPage::new("About")
                 .icon(Icon::new(IconName::Info))
-                .group(
-                SettingGroup::new().title("Snak").items(vec![
+                .group(SettingGroup::new().title("Snak").items(vec![
                     SettingItem::new(
                         "Version",
                         SettingField::render(|_, _, _| {
@@ -255,8 +294,7 @@ impl SettingsWindow {
                         "The Teams backend is MPL-2.0, derived from Squads. The bundled themes are \
                          MIT: One, Ayu, Gruvbox, Catppuccin, Rosé Pine, Dracula and Tokyo Night.",
                     ),
-                ]),
-            ),
+                ])),
         ]
     }
 }

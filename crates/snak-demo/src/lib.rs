@@ -267,7 +267,9 @@ impl Connector for DemoConnector {
 
     fn sign_out(&self) {}
 
-    fn set_credential_storage(&self, _: snak_chat::CredentialStorage) {}
+    fn set_credential_storage(&self, _: snak_chat::CredentialStorage) -> BoxFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn escape(text: &str) -> String {

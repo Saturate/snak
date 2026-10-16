@@ -247,7 +247,7 @@ impl Connector for TeamsConnector {
 
     fn restore(&self) -> BoxFuture<'_, Option<Arc<dyn ChatBackend>>> {
         Box::pin(async move {
-            match auth::load_refresh_token() {
+            match crate::store::load().await {
                 Some(token) => self.connect(token).await.map(Some),
                 None => Ok(None),
             }
@@ -283,11 +283,21 @@ impl Connector for TeamsConnector {
     }
 
     fn sign_out(&self) {
-        auth::clear_refresh_token();
+        crate::store::clear();
     }
 
-    fn set_credential_storage(&self, storage: CredentialStorage) {
-        auth::use_file_storage(storage == CredentialStorage::Insecure);
+    fn set_credential_storage(&self, storage: CredentialStorage) -> BoxFuture<'_, ()> {
+        let storage = match storage {
+            CredentialStorage::Keychain => crate::store::Storage::Keychain,
+            CredentialStorage::File => crate::store::Storage::File,
+            CredentialStorage::OnePassword { account } => {
+                crate::store::Storage::OnePassword { account }
+            }
+        };
+        Box::pin(async move {
+            crate::store::set_storage(storage).await;
+            Ok(())
+        })
     }
 }
 

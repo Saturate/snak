@@ -8,6 +8,32 @@ use gpui_kit::{App, Global, px};
 use serde::{Deserialize, Serialize};
 
 use crate::theme::{self, InstalledThemes};
+use snak_chat::CredentialStorage;
+
+/// 1Password accounts the `op` CLI knows, as (sign-in address, email).
+/// Empty when the CLI isn't installed.
+pub fn onepassword_accounts() -> Vec<(String, String)> {
+    let Ok(out) = std::process::Command::new("op")
+        .args(["account", "list", "--format", "json"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(accounts) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Vec::new();
+    };
+    accounts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            Some((
+                a["url"].as_str()?.to_string(),
+                a["email"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Appearance {
@@ -54,8 +80,43 @@ pub struct Settings {
     pub ui_font_size: f64,
     pub dm_limit: f64,
     pub show_team_names: bool,
-    /// Keep the login in a plain file instead of the Keychain.
-    pub insecure_credentials: bool,
+    pub login_storage: LoginStorage,
+    /// Sign-in address of the 1Password account to use, e.g. my.1password.eu.
+    pub onepassword_account: Option<String>,
+    /// Replaced by `login_storage`; read once so an earlier choice carries over.
+    #[serde(skip_serializing)]
+    insecure_credentials: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoginStorage {
+    #[default]
+    Keychain,
+    File,
+    OnePassword,
+}
+
+impl LoginStorage {
+    pub const ALL: [LoginStorage; 3] = [
+        LoginStorage::Keychain,
+        LoginStorage::OnePassword,
+        LoginStorage::File,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LoginStorage::Keychain => "macOS Keychain",
+            LoginStorage::OnePassword => "1Password",
+            LoginStorage::File => "File (less secure)",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.label() == label)
+            .unwrap_or_default()
+    }
 }
 
 impl Default for Settings {
@@ -67,6 +128,8 @@ impl Default for Settings {
             ui_font_size: 14.,
             dm_limit: 40.,
             show_team_names: true,
+            login_storage: LoginStorage::Keychain,
+            onepassword_account: None,
             insecure_credentials: false,
         }
     }
@@ -84,10 +147,25 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        Self::path()
+        let mut settings: Settings = Self::path()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if settings.insecure_credentials {
+            settings.login_storage = LoginStorage::File;
+        }
+        settings
+    }
+
+    /// The backend-neutral form; 1Password without an account falls back to the Keychain.
+    pub fn credential_storage(&self) -> CredentialStorage {
+        match (self.login_storage, &self.onepassword_account) {
+            (LoginStorage::File, _) => CredentialStorage::File,
+            (LoginStorage::OnePassword, Some(account)) => CredentialStorage::OnePassword {
+                account: account.clone(),
+            },
+            _ => CredentialStorage::Keychain,
+        }
     }
 
     fn save(&self) {
@@ -155,6 +233,34 @@ mod tests {
         assert_eq!(settings.appearance, Appearance::Dark);
         assert_eq!(settings.dm_limit, 40.);
         assert!(settings.dark_theme.is_none());
+    }
+
+    #[test]
+    fn earlier_file_storage_choice_carries_over() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"insecure_credentials":true}"#).expect("loads");
+        if settings.insecure_credentials {
+            settings.login_storage = LoginStorage::File;
+        }
+        assert_eq!(settings.credential_storage(), CredentialStorage::File);
+        let saved = serde_json::to_string(&settings).expect("saves");
+        assert!(!saved.contains("insecure_credentials"));
+    }
+
+    #[test]
+    fn onepassword_needs_an_account() {
+        let mut settings = Settings {
+            login_storage: LoginStorage::OnePassword,
+            ..Settings::default()
+        };
+        assert_eq!(settings.credential_storage(), CredentialStorage::Keychain);
+        settings.onepassword_account = Some("my.1password.eu".into());
+        assert_eq!(
+            settings.credential_storage(),
+            CredentialStorage::OnePassword {
+                account: "my.1password.eu".into()
+            }
+        );
     }
 
     #[test]

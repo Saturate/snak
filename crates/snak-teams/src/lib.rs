@@ -10,6 +10,7 @@ mod client;
 mod error;
 pub mod html;
 pub mod models;
+pub mod store;
 mod trouter;
 
 pub use backend::{TeamsBackend, TeamsConnector};

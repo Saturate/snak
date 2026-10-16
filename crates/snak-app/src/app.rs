@@ -193,8 +193,14 @@ impl Snak {
     fn restore(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Starting;
         let connector = self.connector.clone();
+        // Storage first, so the saved login is read from wherever the user keeps it.
+        let storage = Settings::get(cx).credential_storage();
         self.auth_task = Some(cx.spawn(async move |this, cx| {
-            let result = io(async move { connector.restore().await }).await;
+            let result = io(async move {
+                connector.set_credential_storage(storage).await?;
+                connector.restore().await
+            })
+            .await;
             this.update(cx, |this, cx| match result {
                 Ok(Some(backend)) => this.signed_in(backend, cx),
                 Ok(None) => this.begin_login(cx),
@@ -364,8 +370,17 @@ impl Snak {
             .filter(|n| !n.is_empty())
     }
 
-    pub fn set_credential_storage(&self, storage: snak_chat::CredentialStorage) {
-        self.connector.set_credential_storage(storage);
+    /// Moves the saved login to wherever the settings now say.
+    pub fn apply_credential_storage(&mut self, cx: &mut Context<Self>) {
+        let connector = self.connector.clone();
+        let storage = Settings::get(cx).credential_storage();
+        cx.spawn(async move |this, cx| {
+            let result = io(async move { connector.set_credential_storage(storage).await }).await;
+            if let Err(e) = result {
+                this.update(cx, |this, cx| this.show_error(e, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     pub fn service_name(&self) -> String {

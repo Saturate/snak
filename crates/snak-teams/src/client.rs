@@ -68,7 +68,7 @@ impl TeamsClient {
         let mut refresh = self.refresh_token.lock().await;
         let (token, rotated) = auth::access_token(&self.http, &refresh, scope).await?;
         if let Some(rotated) = rotated {
-            auth::save_refresh_token(&rotated)?;
+            crate::store::save(rotated.clone(), false).await?;
             *refresh = rotated;
         }
         let value = token.value.clone();

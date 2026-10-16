@@ -199,16 +199,18 @@ pub trait Connector: Send + Sync {
 
     fn sign_out(&self);
 
-    /// Where saved credentials live. `Insecure` trades the OS keychain for a
-    /// plain file the user's own processes can read.
-    fn set_credential_storage(&self, storage: CredentialStorage);
+    /// Where saved credentials live; an existing login moves across.
+    fn set_credential_storage(&self, storage: CredentialStorage) -> BoxFuture<'_, ()>;
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum CredentialStorage {
     #[default]
     Keychain,
-    Insecure,
+    /// A plain file only the user can open, but any of their processes can read.
+    File,
+    /// A 1Password item, through the `op` CLI, in this account (sign-in address).
+    OnePassword { account: String },
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! cargo run -p snak-teams --example shape
 
 use serde_json::Value;
-use snak_teams::{TeamsClient, auth};
+use snak_teams::TeamsClient;
 
 fn shape(value: &Value, indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
@@ -44,7 +44,7 @@ fn shape(value: &Value, indent: usize, out: &mut String) {
 
 #[tokio::main]
 async fn main() {
-    let Some(token) = auth::load_refresh_token() else {
+    let Some(token) = snak_teams::store::load().await else {
         return println!("no stored login");
     };
     let client = match TeamsClient::connect(reqwest::Client::new(), token).await {

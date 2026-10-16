@@ -454,9 +454,9 @@ fn unnamed_members(chats: &[Chat], me_id: &str, names: &HashMap<String, String>)
 
 fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
     // Mentions name people by MRI (8:orgid:<object id>); ours is the object id.
-    let my_mentions: Vec<String> = message
-        .mentions()
-        .into_iter()
+    let mentions = message.mentions();
+    let my_mentions: Vec<String> = mentions
+        .iter()
         .filter(|(_, mri)| {
             !me_id.is_empty()
                 && mri
@@ -464,7 +464,7 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
                     .next()
                     .is_some_and(|id| id.eq_ignore_ascii_case(me_id))
         })
-        .map(|(item, _)| item)
+        .map(|(item, _)| item.clone())
         .collect();
     let message_type = message.message_type.as_deref().unwrap_or("");
     if message_type.starts_with("Control/") || message_type.starts_with("ThreadActivity/") {
@@ -473,14 +473,19 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
     let body = if message.is_deleted() {
         Body::Deleted
     } else if message_type.starts_with("Event/Call") {
-        Body::Event("📞 Call".into())
+        Body::Event("Call".into())
     } else {
         let content = message.content.as_deref().unwrap_or("");
         let subject = message.subject();
         if message_type.starts_with("RichText/Html") {
-            let content = display_html(content, &my_mentions);
+            let content = display_html(content, &mentions, &my_mentions);
             Body::Html(match subject {
-                Some(s) => format!("<p><b>{}</b></p>{content}", html_escape::encode_text(&s)),
+                // In its own block: GPUI Kit glues bare text that follows a
+                // block onto that block's last line.
+                Some(s) => format!(
+                    "<p><b>{}</b></p><div>{content}</div>",
+                    html_escape::encode_text(&s)
+                ),
                 None => content,
             })
         } else {
@@ -516,7 +521,7 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
             .reactions()
             .into_iter()
             .map(|r| Reaction {
-                emoji: reaction_glyph(&r.key).to_string(),
+                emoji: reaction_glyph(&r.key),
                 count: r.count,
             })
             .collect(),
@@ -620,8 +625,8 @@ fn message_images(html: &str) -> Vec<ImageRef> {
 /// Images in Teams messages sit behind Teams auth, so the renderer can't fetch
 /// them. Emoji become their alt text, media we fetch is drawn under the text,
 /// and every other image becomes a placeholder: no `<img>` reaches the renderer.
-fn display_html(html: &str, my_mentions: &[String]) -> String {
-    let html = &render_mentions(html, my_mentions);
+fn display_html(html: &str, mentions: &[(String, String)], my_mentions: &[String]) -> String {
+    let html = &render_mentions(html, mentions, my_mentions);
     let mut out = String::with_capacity(html.len());
     let mut copied = 0;
     for (start, end) in img_tags(html) {
@@ -646,25 +651,140 @@ fn display_html(html: &str, my_mentions: &[String]) -> String {
     collapse_blank_paragraphs(&out)
 }
 
-/// Teams writes a blank line as `<p>&nbsp;</p>`; keep one, drop the rest.
+/// Teams writes a blank line as an empty `<p>` or `<div>`, in several shapes
+/// (`&nbsp;`, `<br>`, empty spans, attributes). Runs collapse to one blank line,
+/// blank lines at either end go, and spaces before a line end are trimmed.
 fn collapse_blank_paragraphs(html: &str) -> String {
-    const BLANKS: [&str; 3] = ["<p>&nbsp;</p>", "<p></p>", "<p><br></p>"];
-    let mut out = html.to_string();
-    for blank in BLANKS {
-        out = out.replace(blank, "<p>&nbsp;</p>");
+    const BLANK: &str = "<p>&nbsp;</p>";
+    let mut blocks: Vec<String> = Vec::new();
+    let mut rest = html;
+    while !rest.is_empty() {
+        match blank_block(rest) {
+            Some(len) => {
+                if blocks.last().is_none_or(|b| b != BLANK) {
+                    blocks.push(BLANK.to_string());
+                }
+                rest = rest[len..].trim_start();
+            }
+            None => {
+                // Copy up to the next block opening, so text between blocks stays.
+                let next = rest
+                    .char_indices()
+                    .skip(1)
+                    .find(|&(i, c)| {
+                        c == '<' && {
+                            let head = rest.as_bytes().get(i + 1..(i + 4).min(rest.len()));
+                            head.is_some_and(|h| {
+                                h.first().is_some_and(|b| b.eq_ignore_ascii_case(&b'p'))
+                                    || h.eq_ignore_ascii_case(b"div")
+                            })
+                        }
+                    })
+                    .map_or(rest.len(), |(i, _)| i);
+                blocks.push(trim_line_ends(&rest[..next]));
+                rest = &rest[next..];
+            }
+        }
     }
-    let doubled = "<p>&nbsp;</p><p>&nbsp;</p>";
-    while out.contains(doubled) {
-        out = out.replace(doubled, "<p>&nbsp;</p>");
+    while blocks
+        .first()
+        .is_some_and(|b| b == BLANK || b.trim().is_empty())
+    {
+        blocks.remove(0);
     }
-    out.trim_end_matches("<p>&nbsp;</p>").to_string()
+    while blocks
+        .last()
+        .is_some_and(|b| b == BLANK || b.trim().is_empty())
+    {
+        blocks.pop();
+    }
+    blocks.concat()
+}
+
+/// Length of a blank `<p>`/`<div>` at the start of `html`, if there is one.
+fn blank_block(html: &str) -> Option<usize> {
+    // Blank lines are short; a bounded prefix keeps this linear overall.
+    let cut = html.char_indices().nth(512).map_or(html.len(), |(i, _)| i);
+    let lower = html[..cut].to_ascii_lowercase();
+    let name = ["p", "div"].into_iter().find(|name| {
+        lower
+            .strip_prefix(&format!("<{name}"))
+            .is_some_and(|after| after.starts_with('>') || after.starts_with(' '))
+    })?;
+    let open_end = lower.find('>')? + 1;
+    let close = format!("</{name}>");
+    let close_at = lower[open_end..].find(&close)? + open_end;
+    let inner = &lower[open_end..close_at];
+    // A nested block isn't blank in this simple sense; leave it alone.
+    if inner.contains("<p") || inner.contains("<div") {
+        return None;
+    }
+    let mut text = String::new();
+    let mut in_tag = false;
+    for c in inner.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let empty = text
+        .replace("&nbsp;", " ")
+        .replace('\u{a0}', " ")
+        .trim()
+        .is_empty();
+    // Only blank if the tags were line breaks or empty spans, not an image.
+    let only_breaks = !inner.contains("<img");
+    (empty && only_breaks).then_some(close_at + close.len())
+}
+
+/// Drops spaces and `&nbsp;` right before `</p>`, `</div>` and `<br>`.
+fn trim_line_ends(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find('<') {
+        let ends_line = ["</p>", "</div>", "<br>", "<br/>", "<br />"]
+            .iter()
+            .any(|t| {
+                rest.as_bytes()
+                    .get(at..at + t.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(t.as_bytes()))
+            });
+        let mut text = &rest[..at];
+        if ends_line {
+            loop {
+                let trimmed = text.trim_end_matches([' ', '\u{a0}']);
+                let trimmed = trimmed.strip_suffix("&nbsp;").unwrap_or(trimmed);
+                if trimmed.len() == text.len() {
+                    break;
+                }
+                text = trimmed;
+            }
+        }
+        out.push_str(text);
+        let tag_end = rest[at..].find('>').map_or(rest.len(), |i| at + i + 1);
+        out.push_str(&rest[at..tag_end]);
+        rest = &rest[tag_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Teams marks a mention as `<span itemtype="http://schema.skype.com/Mention"
-/// itemid="N">Name</span>`, and splits a full name into one span per word that
-/// share the itemid. Each run becomes one `@Full Name` link to `snak-mention:N`,
-/// bold when it's the signed-in user. The link scheme is never opened.
-fn render_mentions(html: &str, my_mentions: &[String]) -> String {
+/// itemid="N">Name</span>`, and splits a full name into one span per word.
+/// The words may share an itemid or get one each; `mentions` (itemid, mri)
+/// ties them to one person either way. Each run becomes one `@Full Name` link
+/// to `snak-mention:N`, bold when it's the signed-in user. The link scheme is
+/// never opened.
+fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[String]) -> String {
+    // The person behind an itemid: their MRI when listed, else the itemid.
+    let person = |item: &str| -> String {
+        mentions.iter().find(|(id, _)| id == item).map_or_else(
+            || format!("item:{item}"),
+            |(_, mri)| mri.to_ascii_lowercase(),
+        )
+    };
     const MARKER: &str = "schema.skype.com/mention";
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -714,7 +834,8 @@ fn render_mentions(html: &str, my_mentions: &[String]) -> String {
                 && lower[next..].find('>').is_some_and(|next_len| {
                     let next_tag = &html[next..next + next_len + 1];
                     next_tag.to_ascii_lowercase().contains(MARKER)
-                        && attribute(next_tag, "itemid").as_deref() == Some(item.as_str())
+                        && attribute(next_tag, "itemid")
+                            .is_some_and(|next_item| person(&next_item) == person(&item))
                 });
             if !same_person {
                 break;
@@ -775,17 +896,75 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-// Teams sends reaction names, not emoji.
-fn reaction_glyph(key: &str) -> &str {
-    match key {
-        "like" => "👍",
+/// Teams sends reaction ids, not emoji, in three shapes: code points before an
+/// underscore (`1f389_partypopper`), a name (`like`, `clappinghands`), and
+/// either one with a skin tone (`yes-tone1`). An unknown name shows as
+/// `:name:` so it still reads as a reaction.
+fn reaction_glyph(key: &str) -> String {
+    let (base, tone) = match key.rsplit_once("-tone") {
+        Some((base, n)) => (base, n.parse::<u32>().ok().filter(|n| (1..=5).contains(n))),
+        None => (key, None),
+    };
+    let Some(mut glyph) = code_point_glyph(base).or_else(|| named_glyph(base).map(String::from))
+    else {
+        return format!(":{key}:");
+    };
+    if let Some(tone) = tone {
+        // Fitzpatrick modifiers U+1F3FB..U+1F3FF; the variation selector some
+        // bases carry has to go first or the modifier shows as a swatch.
+        glyph.retain(|c| c != '\u{fe0f}');
+        glyph.extend(char::from_u32(0x1F3FA + tone));
+    }
+    glyph
+}
+
+/// `1f389_partypopper` → 🎉; multi-code-point ids join with `-`.
+fn code_point_glyph(base: &str) -> Option<String> {
+    let (points, _) = base.split_once('_')?;
+    points
+        .split('-')
+        .map(|p| u32::from_str_radix(p, 16).ok().and_then(char::from_u32))
+        .collect()
+}
+
+fn named_glyph(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "like" | "yes" | "thumbsup" => "👍",
+        "no" | "thumbsdown" => "👎",
         "heart" => "❤️",
         "laugh" => "😆",
         "surprised" => "😮",
-        "sad" => "😢",
+        "sad" | "cry" => "😢",
         "angry" => "😠",
-        other => other,
-    }
+        "clappinghands" | "clap" => "👏",
+        "handsinair" => "🙌",
+        "fire" => "🔥",
+        "muscle" => "💪",
+        "fistbump" => "👊",
+        "cool" => "😎",
+        "launch" | "rocket" => "🚀",
+        "salute" => "🫡",
+        "penguin" => "🐧",
+        "eyes" => "👀",
+        "party" | "partypopper" => "🎉",
+        "pray" | "prayinghands" => "🙏",
+        "ok" | "okhand" => "👌",
+        "victory" => "✌️",
+        "wave" | "hi" => "👋",
+        "smile" => "🙂",
+        "wink" => "😉",
+        "hug" => "🤗",
+        "rofl" => "🤣",
+        "thinking" => "🤔",
+        "facepalm" => "🤦",
+        "shrug" => "🤷",
+        "100" => "💯",
+        "star" => "⭐",
+        "coffee" => "☕",
+        "cake" => "🍰",
+        "check" | "checkmark" => "✅",
+        _ => return None,
+    })
 }
 
 /// Chat pages arrive newest first; the timeline wants oldest first.
@@ -883,7 +1062,7 @@ mod tests {
     #[test]
     fn images_are_replaced_and_emoji_keep_alt_text() {
         let html = r#"<p>hi <img itemtype="http://schema.skype.com/Emoji" alt="😀" src="x"> <img src="https://asm/x"></p>"#;
-        assert_eq!(display_html(html, &[]), "<p>hi 😀 <i>[image]</i></p>");
+        assert_eq!(display_html(html, &[], &[]), "<p>hi 😀 <i>[image]</i></p>");
     }
 
     #[test]
@@ -942,8 +1121,51 @@ mod tests {
             r#"<span itemtype="http://schema.skype.com/Mention" itemid="1">Maja</span></p>"#,
         );
         assert_eq!(
-            display_html(html, &["0".to_string()]),
+            display_html(html, &[], &["0".to_string()]),
             r#"<p>hi <a href="snak-mention:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:1">@Maja</a></p>"#
+        );
+    }
+
+    #[test]
+    fn reaction_ids_become_emoji() {
+        assert_eq!(reaction_glyph("like"), "👍");
+        assert_eq!(reaction_glyph("1f389_partypopper"), "🎉");
+        assert_eq!(reaction_glyph("2705_whiteheavycheckmark"), "✅");
+        assert_eq!(reaction_glyph("yes-tone1"), "👍🏻");
+        assert_eq!(reaction_glyph("muscle-tone5"), "💪🏿");
+        assert_eq!(reaction_glyph("heart-tone2"), "❤🏼");
+        assert_eq!(reaction_glyph("somethingnew"), ":somethingnew:");
+        assert_eq!(reaction_glyph("zz_bad"), ":zz_bad:");
+    }
+
+    #[test]
+    fn mention_words_with_their_own_itemids_become_one_mention() {
+        let span = |id: &str, word: &str| {
+            format!(
+                r#"<span itemtype="http://schema.skype.com/Mention" itemid="{id}">{word}</span>"#
+            )
+        };
+        let html = format!(
+            "<p>{} {} {} and {}</p>",
+            span("0", "Allan"),
+            span("1", "Kimmer"),
+            span("2", "Jensen"),
+            span("3", "Maja"),
+        );
+        let mri = |id: &str, who: &str| (id.to_string(), format!("8:orgid:{who}"));
+        let mentions = [
+            mri("0", "me"),
+            mri("1", "me"),
+            mri("2", "me"),
+            mri("3", "maja"),
+        ];
+        assert_eq!(
+            display_html(
+                &html,
+                &mentions,
+                &["0".to_string(), "1".to_string(), "2".to_string()]
+            ),
+            r#"<p><a href="snak-mention:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:3">@Maja</a></p>"#
         );
     }
 
@@ -952,14 +1174,14 @@ mod tests {
         let span = r#"<span itemtype="http://schema.skype.com/Mention" itemid="0">x"#;
         let html = span.repeat(20_000);
         let started = std::time::Instant::now();
-        let _ = display_html(&html, &[]);
+        let _ = display_html(&html, &[], &[]);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
     fn mention_names_are_escaped() {
         let html = r#"<span itemtype="http://schema.skype.com/Mention" itemid="0">&lt;img src=x&gt;</span>"#;
-        assert!(!display_html(html, &[]).contains("<img"));
+        assert!(!display_html(html, &[], &[]).contains("<img"));
     }
 
     #[test]
@@ -982,7 +1204,7 @@ mod tests {
     #[test]
     fn emoji_alt_text_cannot_carry_markup() {
         let html = r#"<p><img itemtype="http://schema.skype.com/Emoji" alt="<img src=https://tracker.example/p.gif x="></p>"#;
-        let out = display_html(html, &[]);
+        let out = display_html(html, &[], &[]);
         assert!(!out.to_ascii_lowercase().contains("<img"), "{out}");
     }
 
@@ -1000,7 +1222,7 @@ mod tests {
     fn uppercase_and_data_src_images_never_reach_the_renderer() {
         let html = r#"<p><IMG SRC="https://tracker.example/p.gif"><img data-src="https://eu-api.asm.skype.com/x" src="https://tracker.example/q.gif"></p>"#;
         assert_eq!(
-            display_html(html, &[]),
+            display_html(html, &[], &[]),
             "<p><i>[image]</i><i>[image]</i></p>"
         );
         assert!(message_images(html).is_empty());
@@ -1012,13 +1234,38 @@ mod tests {
         let images = message_images(html);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].width, Some(250.));
-        assert_eq!(display_html(html, &[]), "<p>look <i>[image]</i></p>");
+        assert_eq!(display_html(html, &[], &[]), "<p>look <i>[image]</i></p>");
+    }
+
+    #[test]
+    fn blank_lines_in_any_shape_are_trimmed_and_collapsed() {
+        let html = concat!(
+            "<p>&nbsp;</p>",
+            "<p>Efterårsferie:&nbsp; </p>",
+            r#"<p style="margin:0"><br></p> <div><span></span>&nbsp;</div>"#,
+            "<p>Sms - Henrik</p>",
+            "<p><br></p>",
+            r#"<div class="x"> </div>"#,
+        );
+        assert_eq!(
+            display_html(html, &[], &[]),
+            "<p>Efterårsferie:</p><p>&nbsp;</p><p>Sms - Henrik</p>"
+        );
+    }
+
+    #[test]
+    fn blocks_with_images_are_not_blank() {
+        let html = r#"<p>a</p><p><img itemtype="http://schema.skype.com/Emoji" alt="🙂"></p>"#;
+        assert_eq!(display_html(html, &[], &[]), "<p>a</p><p>🙂</p>");
     }
 
     #[test]
     fn runs_of_blank_paragraphs_collapse_to_one() {
         let html = "<p>a</p><p>&nbsp;</p><p></p><p>&nbsp;</p><p>b</p><p>&nbsp;</p>";
-        assert_eq!(display_html(html, &[]), "<p>a</p><p>&nbsp;</p><p>b</p>");
+        assert_eq!(
+            display_html(html, &[], &[]),
+            "<p>a</p><p>&nbsp;</p><p>b</p>"
+        );
     }
 
     #[test]

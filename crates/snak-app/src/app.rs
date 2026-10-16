@@ -273,6 +273,7 @@ impl Snak {
     }
 
     fn show_error(&mut self, error: ChatError, cx: &mut Context<Self>) {
+        tracing::error!(error = %error, "shown to user");
         if let ChatError::SessionExpired(_) = error {
             self.session_expired(cx);
             return;
@@ -285,6 +286,7 @@ impl Snak {
     }
 
     fn session_expired(&mut self, cx: &mut Context<Self>) {
+        tracing::warn!("session expired; asking to sign in again");
         self.connector.sign_out();
         self.backend = None;
         self.events_task = None;
@@ -325,6 +327,7 @@ impl Snak {
                 self.load_conversation(cx);
             }
             Event::Reconnecting => {
+                tracing::info!("push down, falling back to polling");
                 self.live = false;
                 cx.notify();
             }
@@ -643,9 +646,19 @@ impl Snak {
                         Some(format) => {
                             ImageState::Ready(Arc::new(Image::from_bytes(format, bytes)))
                         }
-                        None => ImageState::Failed,
+                        None => {
+                            tracing::warn!(
+                                url = crate::log::redact_url(&url),
+                                magic = ?&bytes[..bytes.len().min(8)],
+                                "image in an unknown format"
+                            );
+                            ImageState::Failed
+                        }
                     },
-                    Err(_) => ImageState::Failed,
+                    Err(e) => {
+                        tracing::warn!(url = crate::log::redact_url(&url), error = %e, "image failed");
+                        ImageState::Failed
+                    }
                 };
                 this.update(cx, |this, cx| {
                     this.images.borrow_mut().insert(url, state);
@@ -1896,6 +1909,11 @@ impl Snak {
                     }))
                     .item(item("Cycle theme mode", |this, window, cx| {
                         this.cycle_appearance(window, cx)
+                    }))
+                    .item(item("Open log file", |_, _, cx| {
+                        if let Some(path) = crate::log::path() {
+                            cx.open_with_system(&path);
+                        }
                     }))
                     .separator()
                     .item(item("Sign out", |this, _, cx| this.sign_out(cx)))

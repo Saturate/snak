@@ -66,7 +66,10 @@ impl TeamsClient {
         }
 
         let mut refresh = self.refresh_token.lock().await;
-        let (token, rotated) = auth::access_token(&self.http, &refresh, scope).await?;
+        let (token, rotated) = auth::access_token(&self.http, &refresh, scope)
+            .await
+            .inspect_err(|e| tracing::warn!(scope, error = %e, "token refresh failed"))?;
+        tracing::debug!(scope, "access token refreshed");
         if let Some(rotated) = rotated {
             crate::store::save(rotated.clone(), false).await?;
             *refresh = rotated;
@@ -216,16 +219,18 @@ impl TeamsClient {
     /// hosts get the Skype token: message HTML is written by other people.
     pub async fn image(&self, url: &str) -> Result<Vec<u8>> {
         const MAX_BYTES: usize = 25 * 1024 * 1024;
-        if !crate::backend::is_teams_media_url(url) {
+        let request = if crate::backend::is_teams_media_url(url) {
+            let token = self.skype_token().await?;
+            self.http
+                .get(url)
+                .header("Authorization", format!("skype_token {token}"))
+        } else if crate::backend::is_giphy_url(url) {
+            // Public CDN: deliberately no credentials.
+            self.http.get(url)
+        } else {
             return Err(CoreError::Push(format!("refusing to fetch {url}")));
-        }
-        let token = self.skype_token().await?;
-        let res = self
-            .http
-            .get(url)
-            .header("Authorization", format!("skype_token {token}"))
-            .send()
-            .await?;
+        };
+        let res = request.send().await?;
         let status = res.status();
         if !status.is_success() {
             return Err(CoreError::Http {
@@ -376,7 +381,11 @@ impl TeamsClient {
 pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &str) -> Result<T> {
     let status = res.status();
     let body = res.text().await?;
+    let path = url.split(['?', '#']).next().unwrap_or(url);
     if !status.is_success() {
+        // Error bodies are Microsoft's error JSON, never message content.
+        let snippet: String = body.chars().take(300).collect();
+        tracing::warn!(status = status.as_u16(), url = path, body = %snippet, "request failed");
         return Err(CoreError::Http {
             status: status.as_u16(),
             url: url.to_string(),

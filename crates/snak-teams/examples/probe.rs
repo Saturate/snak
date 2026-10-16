@@ -93,8 +93,13 @@ async fn main() {
     let mut by_recent: Vec<_> = list.iter().collect();
     by_recent.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
     'search: for conversation in by_recent.iter().take(15) {
-        let Ok(messages) = backend.messages(&conversation.id).await else { continue };
-        for message in messages.iter().flat_map(|m| std::iter::once(m).chain(m.replies.iter())) {
+        let Ok(messages) = backend.messages(&conversation.id).await else {
+            continue;
+        };
+        for message in messages
+            .iter()
+            .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
+        {
             if let Some(image) = message.images.first() {
                 match backend.image(&image.url).await {
                     Ok(bytes) => println!(

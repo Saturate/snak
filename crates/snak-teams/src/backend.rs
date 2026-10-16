@@ -232,7 +232,10 @@ impl TeamsConnector {
     }
 
     async fn connect(&self, refresh_token: String) -> Result<Arc<dyn ChatBackend>, ChatError> {
-        let client = TeamsClient::connect(self.http.clone(), refresh_token).await?;
+        let client = TeamsClient::connect(self.http.clone(), refresh_token)
+            .await
+            .inspect_err(|e| tracing::error!(error = %e, "Teams connect failed"))?;
+        tracing::info!(region = client.region(), "connected to Teams");
         let backend: Arc<dyn ChatBackend> = Arc::new(TeamsBackend::new(client));
         Ok(backend)
     }
@@ -491,17 +494,32 @@ fn to_message(message: &models::Message) -> Option<Message> {
     })
 }
 
+/// Giphy serves Teams' GIF picker results publicly; they need no token.
+pub(crate) fn is_giphy_url(url: &str) -> bool {
+    https_host(url).is_some_and(|host| {
+        host == "giphy.com"
+            || host
+                .strip_suffix(".giphy.com")
+                .is_some_and(|sub| sub.starts_with("media") || sub == "i")
+    })
+}
+
+/// The lowercased host of an https URL, or None for anything that could
+/// disguise its real host (userinfo, ports, other schemes).
+fn https_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains(':') {
+        return None;
+    }
+    Some(authority.to_ascii_lowercase())
+}
+
 /// Hosts that serve Teams message media and accept the Skype token.
 pub(crate) fn is_teams_media_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    let Some(host) = https_host(url) else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Userinfo or a port would let a crafted URL look like a Microsoft host.
-    if authority.contains('@') || authority.contains(':') {
-        return false;
-    }
-    let host = authority.to_ascii_lowercase();
     host.ends_with(".asm.skype.com")
         || host.ends_with(".asyncgw.teams.microsoft.com")
         || host == "teams.microsoft.com"
@@ -515,7 +533,8 @@ fn message_images(html: &str) -> Vec<ImageRef> {
             break;
         };
         let tag = &rest[start..start + len + 1];
-        if let Some(url) = attribute(tag, "src").filter(|u| is_teams_media_url(u))
+        if let Some(url) =
+            attribute(tag, "src").filter(|u| is_teams_media_url(u) || is_giphy_url(u))
             && !tag.to_ascii_lowercase().contains("schema.skype.com/emoji")
         {
             let size = |name| attribute(tag, name).and_then(|v| v.parse::<f32>().ok());
@@ -544,7 +563,8 @@ fn display_html(html: &str) -> String {
         let tag = &rest[start..start + len + 1];
         if tag.to_ascii_lowercase().contains("schema.skype.com/emoji") {
             out.push_str(&attribute(tag, "alt").unwrap_or_default());
-        } else if !attribute(tag, "src").is_some_and(|u| is_teams_media_url(&u)) {
+        } else if !attribute(tag, "src").is_some_and(|u| is_teams_media_url(&u) || is_giphy_url(&u))
+        {
             // Teams media renders under the text; anything else is never fetched.
             out.push_str("<i>[image]</i>");
         }
@@ -701,6 +721,17 @@ mod tests {
             "https://eu-api.asm.skype.com@evil.example/x"
         ));
         assert!(!is_teams_media_url("https://eu-api.asm.skype.com:8443/x"));
+    }
+
+    #[test]
+    fn giphy_is_allowed_without_the_token() {
+        assert!(is_giphy_url("https://media2.giphy.com/media/abc/giphy.gif"));
+        assert!(is_giphy_url("https://i.giphy.com/abc.gif"));
+        assert!(!is_giphy_url("https://media2.giphy.com.evil.example/x.gif"));
+        assert!(!is_giphy_url("https://evilgiphy.com/x.gif"));
+        assert!(!is_teams_media_url(
+            "https://media2.giphy.com/media/abc/giphy.gif"
+        ));
     }
 
     #[test]

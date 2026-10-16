@@ -207,6 +207,7 @@ async fn run(client: Arc<TeamsClient>, link: Link, tx: mpsc::Sender<PushEvent>) 
         }
         let retry_in = backoff(attempt);
         attempt = attempt.saturating_add(1);
+        tracing::warn!(attempt, retry_in_s = retry_in.as_secs(), %reason, "push disconnected");
         let notice = PushEvent::Reconnecting {
             attempt,
             retry_in,
@@ -341,6 +342,7 @@ impl Link {
             endpoint_id: self.endpoint_id.clone(),
             surl: alloc.surl,
         };
+        tracing::info!("push connected");
         if tx.send(PushEvent::Connected(session)).await.is_err() {
             let _ = ws.close(None).await;
             return Ok(SessionEnd::ReceiverGone);

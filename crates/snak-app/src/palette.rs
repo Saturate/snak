@@ -55,6 +55,7 @@ fn commands() -> Vec<(CommandItem, Entry)> {
             CycleTheme,
         ),
         command("Open settings", &["preferences", "config"], OpenSettings),
+        command("Open log file", &["debug", "errors", "console"], OpenLog),
         command("Sign out", &["logout"], SignOut),
         command("Quit Snak", &["exit"], Quit),
     ]

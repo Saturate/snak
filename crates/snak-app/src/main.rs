@@ -1,4 +1,5 @@
 mod app;
+mod log;
 mod palette;
 mod prefs;
 mod settings;
@@ -31,6 +32,7 @@ actions!(
         ExpandAll,
         CycleTheme,
         SignOut,
+        OpenLog,
     ]
 );
 
@@ -65,6 +67,7 @@ fn connector() -> Arc<dyn Connector> {
 }
 
 fn main() {
+    log::init();
     let connector = connector();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -74,11 +77,17 @@ fn main() {
             cx.set_global(settings::Settings::load());
             settings::Settings::apply(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &OpenLog, cx| {
+                if let Some(path) = log::path() {
+                    cx.open_with_system(&path);
+                }
+            });
             cx.set_menus(vec![Menu {
                 name: "Snak".into(),
                 items: vec![
                     MenuItem::action("Command Palette…", CommandPalette),
                     MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::action("Open Log File", OpenLog),
                     MenuItem::separator(),
                     MenuItem::action("Quit Snak", Quit),
                 ],

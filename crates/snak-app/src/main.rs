@@ -97,7 +97,12 @@ fn window_size() -> Size<Pixels> {
         .ok()
         .and_then(|v| {
             let (w, h) = v.split_once('x')?;
-            Some(size(px(w.parse().ok()?), px(h.parse().ok()?)))
+            let side = |s: &str| {
+                s.parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 320.)
+            };
+            Some(size(px(side(w)?), px(side(h)?)))
         })
         .unwrap_or(size(px(1280.), px(820.)))
 }

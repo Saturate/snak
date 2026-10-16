@@ -8,41 +8,83 @@ pub enum Segment {
     Code { lang: Option<String>, code: String },
 }
 
+/// Code blocks drawn per message; the rest of a message past this stays HTML.
+/// Each one is its own highlighted view, so a message can't ask for thousands.
+const MAX_CODE_BLOCKS: usize = 16;
+
 /// Splits `html` at `<pre>` blocks and Teams' `<codeblock>`. Returns one
-/// `Html` segment holding everything when there is no code.
+/// `Html` segment holding everything when there is no code. One forward pass,
+/// since it runs on every render of a message.
 pub fn split(html: &str) -> Vec<Segment> {
+    // ASCII lowercasing keeps byte offsets, so positions carry over to `html`.
+    let lower = html.to_ascii_lowercase();
     let mut segments = Vec::new();
-    let mut rest = html;
-    while let Some((start, tag)) = next_block(rest) {
-        let open_end = match rest[start..].find('>') {
-            Some(i) => start + i + 1,
-            None => break,
-        };
-        let close = format!("</{tag}");
-        let Some(close_start) = find_ci(&rest[open_end..], &close).map(|i| open_end + i) else {
+    let mut copied = 0;
+    let mut at = 0;
+    let mut blocks = 0;
+    while blocks < MAX_CODE_BLOCKS {
+        let Some(found) = lower[at..].find('<') else {
             break;
         };
-        let close_end = rest[close_start..]
+        let start = at + found;
+        at = start + 1;
+        let Some(tag) = ["pre", "codeblock"]
+            .into_iter()
+            .find(|tag| tag_at(&lower, start + 1, tag))
+        else {
+            continue;
+        };
+        let Some(open_end) = lower[start..].find('>').map(|i| start + i + 1) else {
+            break;
+        };
+        let Some(close_start) = closing_tag(&lower, open_end, tag) else {
+            break;
+        };
+        let close_end = lower[close_start..]
             .find('>')
-            .map_or(rest.len(), |i| close_start + i + 1);
+            .map_or(html.len(), |i| close_start + i + 1);
 
-        push_html(&mut segments, &rest[..start]);
-        let inner = &rest[open_end..close_start];
+        push_html(&mut segments, &html[copied..start]);
+        let inner = &html[open_end..close_start];
         let code = code_text(inner);
         // Teams sometimes leaves an empty `<pre></pre>` behind.
         if !code.trim().is_empty() {
             segments.push(Segment::Code {
-                lang: language(&rest[start..open_end]).or_else(|| language(inner)),
+                lang: language(&html[start..open_end]).or_else(|| language(inner)),
                 code,
             });
+            blocks += 1;
         }
-        rest = &rest[close_end..];
+        copied = close_end;
+        at = close_end;
     }
-    push_html(&mut segments, rest);
+    push_html(&mut segments, &html[copied..]);
     if segments.is_empty() {
         segments.push(Segment::Html(String::new()));
     }
     segments
+}
+
+/// `tag` starts at `at` in `lower` and isn't just a prefix: `<pre` must not
+/// match `<prefix>`.
+fn tag_at(lower: &str, at: usize, tag: &str) -> bool {
+    lower[at..].starts_with(tag)
+        && lower[at + tag.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+}
+
+/// Start of the `</tag>` that closes a block opened before `from`.
+fn closing_tag(lower: &str, from: usize, tag: &str) -> Option<usize> {
+    let mut at = from;
+    loop {
+        let start = at + lower[at..].find("</")?;
+        if tag_at(lower, start + 2, tag) {
+            return Some(start);
+        }
+        at = start + 2;
+    }
 }
 
 /// The source of a fenced Markdown block, with a fence longer than any run of
@@ -57,34 +99,6 @@ fn push_html(segments: &mut Vec<Segment>, html: &str) {
     if !html.trim().is_empty() {
         segments.push(Segment::Html(html.to_string()));
     }
-}
-
-fn next_block(html: &str) -> Option<(usize, &'static str)> {
-    ["pre", "codeblock"]
-        .into_iter()
-        .filter_map(|tag| open_tag(html, tag).map(|i| (i, tag)))
-        .min_by_key(|(i, _)| *i)
-}
-
-/// Position of `<tag` followed by `>` or whitespace, so `<pre` doesn't match `<prefix>`.
-fn open_tag(html: &str, tag: &str) -> Option<usize> {
-    let needle = format!("<{tag}");
-    let mut from = 0;
-    while let Some(i) = find_ci(&html[from..], &needle) {
-        let at = from + i;
-        let after = html[at + needle.len()..].chars().next();
-        if matches!(after, Some(c) if c == '>' || c.is_whitespace()) {
-            return Some(at);
-        }
-        from = at + needle.len();
-    }
-    None
-}
-
-fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .to_ascii_lowercase()
-        .find(&needle.to_ascii_lowercase())
 }
 
 /// The language from a `class` attribute: `language-rust`, `lang-rust`, or a
@@ -210,6 +224,37 @@ mod tests {
         assert_eq!(lang("language-c++"), Some("cpp".into()));
         assert_eq!(lang("plaintext"), None);
         assert_eq!(lang("hljs language-rust"), Some("rust".into()));
+    }
+
+    #[test]
+    fn a_close_tag_must_be_the_whole_name() {
+        assert_eq!(
+            split("<pre>a</prefix>b</pre>"),
+            vec![Segment::Code {
+                lang: None,
+                code: "ab".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn code_blocks_per_message_are_capped() {
+        let html = "<pre>x</pre>".repeat(MAX_CODE_BLOCKS + 5);
+        let segments = split(&html);
+        let code = segments
+            .iter()
+            .filter(|s| matches!(s, Segment::Code { .. }))
+            .count();
+        assert_eq!(code, MAX_CODE_BLOCKS);
+        assert!(matches!(segments.last(), Some(Segment::Html(_))));
+    }
+
+    #[test]
+    fn splitting_stays_linear() {
+        let html = "<pre>a</pre>".repeat(20_000) + &"<p>x</p>".repeat(20_000);
+        let started = std::time::Instant::now();
+        let _ = split(&html);
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
     }
 
     #[test]

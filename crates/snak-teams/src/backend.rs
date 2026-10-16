@@ -658,7 +658,22 @@ fn collapse_blank_paragraphs(html: &str) -> String {
     const BLANK: &str = "<p>&nbsp;</p>";
     let mut blocks: Vec<String> = Vec::new();
     let mut rest = html;
+    // A search for a close tag runs to the end of the message, so once one
+    // finds nothing, no later one will: remember that per tag, or a message
+    // full of unclosed tags would rescan itself at every one.
+    let mut unclosed = [false; 2];
     while !rest.is_empty() {
+        // Code keeps its whitespace: a diff's context line is a single space.
+        if let Some(tag) = code_tag(rest).filter(|&t| !unclosed[t]) {
+            match code_span(rest, CODE_TAGS[tag]) {
+                Some(len) => {
+                    blocks.push(rest[..len].to_string());
+                    rest = &rest[len..];
+                    continue;
+                }
+                None => unclosed[tag] = true,
+            }
+        }
         match blank_block(rest) {
             Some(len) => {
                 if blocks.last().is_none_or(|b| b != BLANK) {
@@ -677,7 +692,7 @@ fn collapse_blank_paragraphs(html: &str) -> String {
                             head.is_some_and(|h| {
                                 h.first().is_some_and(|b| b.eq_ignore_ascii_case(&b'p'))
                                     || h.eq_ignore_ascii_case(b"div")
-                            })
+                            }) || starts_with_ci(&rest[i + 1..], "codeblock")
                         }
                     })
                     .map_or(rest.len(), |(i, _)| i);
@@ -699,6 +714,43 @@ fn collapse_blank_paragraphs(html: &str) -> String {
         blocks.pop();
     }
     blocks.concat()
+}
+
+const CODE_TAGS: [&str; 2] = ["pre", "codeblock"];
+
+/// Which of [`CODE_TAGS`] opens at the start of `html`, if any.
+fn code_tag(html: &str) -> Option<usize> {
+    let after = html.strip_prefix('<')?;
+    CODE_TAGS
+        .iter()
+        .position(|tag| starts_with_ci(after, tag) && ends_tag_name(&after[tag.len()..]))
+}
+
+/// Length of the `tag` element opening at the start of `html`, up to and
+/// including its closing tag.
+fn code_span(html: &str, tag: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + html[at..].find("</")?;
+        let after = &html[close + 2..];
+        if starts_with_ci(after, tag) && ends_tag_name(&after[tag.len()..]) {
+            return Some(close + html[close..].find('>')? + 1);
+        }
+        at = close + 2;
+    }
+}
+
+/// The tag name is complete: `<pre` must not match `<prefix>`.
+fn ends_tag_name(rest: &str) -> bool {
+    rest.chars()
+        .next()
+        .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+}
+
+fn starts_with_ci(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// Length of a blank `<p>`/`<div>` at the start of `html`, if there is one.
@@ -907,7 +959,9 @@ fn reaction_glyph(key: &str) -> String {
     };
     let Some(mut glyph) = code_point_glyph(base).or_else(|| named_glyph(base).map(String::from))
     else {
-        return format!(":{key}:");
+        // Other people pick the key, so only plain characters, and not many.
+        let name: String = key.chars().filter(|&c| !invisible(c)).take(32).collect();
+        return format!(":{name}:");
     };
     if let Some(tone) = tone {
         // Fitzpatrick modifiers U+1F3FB..U+1F3FF; the variation selector some
@@ -918,13 +972,73 @@ fn reaction_glyph(key: &str) -> String {
     glyph
 }
 
-/// `1f389_partypopper` → 🎉; multi-code-point ids join with `-`.
+/// `1f389_partypopper` → 🎉; multi-code-point ids join with `-`. The key is
+/// someone else's input, so it must be hex digits that make an emoji-sized
+/// run of visible characters, not controls or a right-to-left override.
 fn code_point_glyph(base: &str) -> Option<String> {
+    const MAX_CODE_POINTS: usize = 10;
     let (points, _) = base.split_once('_')?;
-    points
-        .split('-')
-        .map(|p| u32::from_str_radix(p, 16).ok().and_then(char::from_u32))
-        .collect()
+    let parts: Vec<&str> = points.split('-').take(MAX_CODE_POINTS + 1).collect();
+    if parts.len() > MAX_CODE_POINTS {
+        return None;
+    }
+    let glyph: String = parts
+        .into_iter()
+        .map(|p| {
+            // from_str_radix would also take a leading `+`.
+            if p.is_empty() || p.len() > 6 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let c = char::from_u32(u32::from_str_radix(p, 16).ok()?)?;
+            // Joiners and variation selectors are part of real emoji.
+            let joins = matches!(c, '\u{200d}' | '\u{fe0f}' | '\u{fe0e}' | '\u{20e3}')
+                || ('\u{e0020}'..='\u{e007f}').contains(&c);
+            (joins || !invisible(c)).then_some(c)
+        })
+        .collect::<Option<_>>()?;
+    // Joiners, marks or blanks alone would make a reaction that draws nothing.
+    glyph.chars().any(draws_on_its_own).then_some(glyph)
+}
+
+/// A character that shows something by itself, not only by joining or
+/// marking another: needed at least once in a reaction.
+fn draws_on_its_own(c: char) -> bool {
+    !invisible(c)
+        && !matches!(c,
+            '\u{200d}'
+            | '\u{20e3}'
+            | '\u{300}'..='\u{36f}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+            | '\u{1f3fb}'..='\u{1f3ff}')
+}
+
+/// Characters that draw nothing or reorder text: controls, whitespace and
+/// blank fillers, bidi overrides and isolates, zero-width marks and
+/// noncharacters.
+fn invisible(c: char) -> bool {
+    c.is_control()
+        || c.is_whitespace()
+        || matches!(c,
+            '\u{ad}'
+            | '\u{34f}'
+            | '\u{61c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{ffa0}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{fdd0}'..='\u{fdef}'
+            | '\u{e0000}'..='\u{e007f}')
+        || (c as u32 & 0xfffe) == 0xfffe
 }
 
 fn named_glyph(name: &str) -> Option<&'static str> {
@@ -1133,9 +1247,44 @@ mod tests {
         assert_eq!(reaction_glyph("2705_whiteheavycheckmark"), "✅");
         assert_eq!(reaction_glyph("yes-tone1"), "👍🏻");
         assert_eq!(reaction_glyph("muscle-tone5"), "💪🏿");
-        assert_eq!(reaction_glyph("heart-tone2"), "❤🏼");
         assert_eq!(reaction_glyph("somethingnew"), ":somethingnew:");
         assert_eq!(reaction_glyph("zz_bad"), ":zz_bad:");
+        // Keys are other people's input.
+        assert_eq!(reaction_glyph("0_x"), ":0_x:");
+        assert_eq!(reaction_glyph("202e_x"), ":202e_x:");
+        assert_eq!(reaction_glyph("fffe_x-tone1"), ":fffe_x-tone1:");
+        assert_eq!(reaction_glyph("+1f44d_x"), ":+1f44d_x:");
+        assert_eq!(
+            reaction_glyph(&format!("{}_x", "1f44d-".repeat(11)))
+                .chars()
+                .count(),
+            34
+        );
+        assert_eq!(reaction_glyph("a\u{202e}b"), ":ab:");
+        assert_eq!(reaction_glyph("200d_x"), ":200d_x:");
+        assert_eq!(reaction_glyph("2028_x"), ":2028_x:");
+        for blank in [
+            "0020", "3000", "2800", "3164", "115f", "00a0", "2003", "0301", "1f3fb",
+        ] {
+            assert_eq!(
+                reaction_glyph(&format!("{blank}_x")),
+                format!(":{blank}_x:")
+            );
+        }
+        assert_eq!(reaction_glyph("a\u{61c}\u{2028}b"), ":ab:");
+        // Keycaps and subdivision flags keep their combining parts.
+        assert_eq!(reaction_glyph("0023-fe0f-20e3_keycap"), "#\u{fe0f}\u{20e3}");
+        assert_eq!(
+            reaction_glyph("1f3f4-e0067-e0062-e0065-e006e-e0067-e007f_england")
+                .chars()
+                .count(),
+            7
+        );
+        // Real multi-part emoji keep their joiners: 👩‍💻.
+        assert_eq!(
+            reaction_glyph("1f469-200d-1f4bb_womantechnologist"),
+            "👩\u{200d}💻"
+        );
     }
 
     #[test]
@@ -1251,6 +1400,29 @@ mod tests {
             display_html(html, &[], &[]),
             "<p>Efterårsferie:</p><p>&nbsp;</p><p>Sms - Henrik</p>"
         );
+    }
+
+    #[test]
+    fn code_keeps_its_whitespace() {
+        let html = "<p>diff:&nbsp; </p><pre><code>a  <br>&nbsp;<br>c</code></pre><p>&nbsp;</p>";
+        assert_eq!(
+            display_html(html, &[], &[]),
+            "<p>diff:</p><pre><code>a  <br>&nbsp;<br>c</code></pre>"
+        );
+    }
+
+    #[test]
+    fn unclosed_code_tags_stay_linear() {
+        for html in [
+            "<pre>x".repeat(10_000) + &"<pre></prex>".repeat(10_000),
+            "<codeblock>x".repeat(10_000) + "</pre>",
+            "<pre>x".repeat(10_000) + "</codeblock>",
+            "<pre>x".repeat(10_000) + "</pre ",
+        ] {
+            let started = std::time::Instant::now();
+            let _ = display_html(&html, &[], &[]);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
     }
 
     #[test]

@@ -13,6 +13,8 @@ window_size="${2:-1024x704}"
 out=docs/screenshot.png
 
 ./scripts/bundle.sh >/dev/null
+# Other demo instances may be running; only the one started here is ours.
+before=" $( (pgrep -f "Snak.app/Contents/MacOS/snak --demo" || true) | tr '\n' ' ')"
 # `open` launches through LaunchServices, which gives the new window focus;
 # a bare binary would stay behind the terminal and never finish drawing.
 open -n target/Snak.app \
@@ -23,7 +25,9 @@ open -n target/Snak.app \
 
 pid=""
 for _ in $(seq 50); do
-  pid=$(pgrep -n -f "Snak.app/Contents/MacOS/snak --demo" || true)
+  for candidate in $(pgrep -f "Snak.app/Contents/MacOS/snak --demo" || true); do
+    case "$before" in *" $candidate "*) ;; *) pid=$candidate ;; esac
+  done
   [ -n "$pid" ] && break
   sleep 0.2
 done

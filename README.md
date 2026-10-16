@@ -1,6 +1,20 @@
-# Snak
+<p align="center">
+  <img src="assets/icon.svg" alt="Snak" width="128" height="128">
+</p>
 
-A fast, minimal Microsoft Teams chat client with Slack's layout, built on [GPUI Kit](https://github.com/longbridge/gpui-kit). Teams stays installed for calls and meetings; Snak is where you read and write.
+<h1 align="center">Snak</h1>
+
+<p align="center">
+  <em>Teams chat, without the Teams.</em>
+</p>
+
+<p align="center">
+  A fast, minimal Microsoft Teams chat client, built on <a href="https://github.com/longbridge/gpui-kit">GPUI Kit</a>.
+</p>
+
+![Snak screenshot, showing the demo workspace](docs/screenshot.png)
+
+---
 
 Snak talks to Teams' internal APIs using Teams' own client ID, the same approach as [Squads](https://github.com/IanTerzo/Squads). Those APIs are undocumented, so Snak can break whenever Microsoft changes them. It's early and moves fast; expect rough edges.
 
@@ -17,8 +31,6 @@ To get a proper app with the Dock icon, build the bundle:
 ./scripts/bundle.sh --open            # target/Snak.app, debug build
 ./scripts/bundle.sh --release --open  # optimised
 ```
-
-The icon is `assets/icon.svg`; the bundle script renders it with `tools/make-icon`. Snak needs Rust 1.95 or newer and macOS 13 or newer.
 
 Sign in with the device code shown in the window. Where the login is kept is a setting (⌘, → Account): the macOS Keychain (default), 1Password via the `op` CLI, or a plain 0600 file. Logs go to `~/Library/Logs/Snak/snak.log`; set `SNAK_LOG=debug` for more.
 

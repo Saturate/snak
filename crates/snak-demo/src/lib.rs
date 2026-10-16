@@ -114,7 +114,8 @@ impl DemoBackend {
             ),
         ];
         let mut state = self.state();
-        let (conversation, author, html) = SCRIPT[state.script_step % SCRIPT.len()];
+        // Played once: looping posted the same lines again every few minutes.
+        let (conversation, author, html) = *SCRIPT.get(state.script_step)?;
         state.script_step += 1;
         let id = state.new_id();
         let id_conv = ConversationId(conversation.into());
@@ -216,6 +217,12 @@ impl ChatBackend for DemoBackend {
             if tx.send(Event::Connected).await.is_err() {
                 return;
             }
+            // A still workspace for screenshots: nothing arrives mid-capture.
+            // Waiting forever with `tx` in scope keeps the stream open, so the
+            // app still reads as live.
+            if std::env::var_os("SNAK_DEMO_STILL").is_some() {
+                std::future::pending::<()>().await;
+            }
             loop {
                 tokio::time::sleep(ACTIVITY_EVERY).await;
                 let Some(backend) = weak.upgrade() else {
@@ -284,13 +291,22 @@ fn escape(text: &str) -> String {
 
 fn preview(author: &str, html: &str) -> String {
     let mut text = String::new();
-    let mut in_tag = false;
+    let mut tag: Option<String> = None;
     for c in html.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if !in_tag => text.push(c),
-            _ => {}
+        match (c, tag.as_mut()) {
+            ('<', None) => tag = Some(String::new()),
+            ('>', Some(name)) => {
+                // Block ends separate words, or "<li>a</li><li>b</li>" reads "ab".
+                let closes_block = ["/p", "/li", "/div", "/pre", "br"]
+                    .iter()
+                    .any(|t| name.starts_with(t));
+                if closes_block && !text.ends_with(' ') {
+                    text.push(' ');
+                }
+                tag = None;
+            }
+            (c, Some(name)) => name.push(c),
+            (c, None) => text.push(c),
         }
     }
     let name = if author == ME_ID {
@@ -406,6 +422,41 @@ fn seed(now: DateTime<Utc>) -> State {
         ),
     ];
 
+    backend_post.reactions = vec![Reaction {
+        emoji: "🙏".into(),
+        count: 2,
+    }];
+    let mut deploy_post = message(
+        id(),
+        "ida",
+        ago(180),
+        "<p>Heads up: the new order queue goes to <b>staging</b> at 14:00. Shout if you have anything in flight.</p>",
+    );
+    deploy_post.reactions = vec![Reaction {
+        emoji: "👍".into(),
+        count: 3,
+    }];
+    // The markup Teams sends for a code block: the language on the <pre>,
+    // <br> between lines.
+    let repro_post = message(
+        id(),
+        "sara",
+        ago(40),
+        "<p>Repro for the pool exhaustion, in case it comes back:</p>\
+         <pre class=\"language-bash\"><code>for i in $(seq 50); do<br>\
+         &nbsp;&nbsp;curl -s -o /dev/null -w '%{time_total}\\n' \\<br>\
+         &nbsp;&nbsp;&nbsp;&nbsp;https://staging.example.com/orders &amp;<br>\
+         done<br>wait</code></pre>",
+    );
+    let mut review_post = message(
+        id(),
+        "omar",
+        ago(12),
+        "<p><a href=\"snak-mention:0\">@Demo User</a> could you look at the pool-size alert before we merge? \
+         It pages at 80% for five minutes.</p>",
+    );
+    review_post.mentions_me = true;
+
     let mut threads = vec![
         Thread {
             conversation: channel("eng-general", "Engineering", "general"),
@@ -418,7 +469,7 @@ fn seed(now: DateTime<Utc>) -> State {
         },
         Thread {
             conversation: channel("eng-backend", "Engineering", "backend"),
-            messages: vec![backend_post],
+            messages: vec![deploy_post, backend_post, repro_post, review_post],
         },
         Thread {
             conversation: channel("eng-releases", "Engineering", "releases"),
@@ -535,10 +586,11 @@ mod tests {
         let backend = DemoBackend::new();
         let id = ConversationId("eng-backend".into());
         let posts = block_on(backend.messages(&id)).expect("messages");
+        let count = posts.len();
         let root = posts[0].id.clone();
         block_on(backend.send(&id, Some(&root), "on it")).expect("send");
         let posts = block_on(backend.messages(&id)).expect("messages");
-        assert_eq!(posts.len(), 1);
+        assert_eq!(posts.len(), count);
         assert!(
             matches!(&posts[0].replies.last().expect("reply").body, Body::Html(h) if h == "<p>on it</p>")
         );
@@ -553,6 +605,26 @@ mod tests {
         assert!(
             matches!(&messages.last().expect("message").body, Body::Html(h) if h == "<p>&lt;b&gt;hi&lt;/b&gt;</p>")
         );
+    }
+
+    #[test]
+    fn previews_keep_list_items_apart() {
+        assert_eq!(
+            preview(
+                "maja",
+                "<ul><li>Scope agreed</li><li>Estimate due Friday</li></ul>"
+            ),
+            "Maja Holm: Scope agreed Estimate due Friday"
+        );
+    }
+
+    #[test]
+    fn activity_plays_once() {
+        let backend = DemoBackend::new();
+        let landed = std::iter::from_fn(|| backend.simulate_activity())
+            .take(10)
+            .count();
+        assert_eq!(landed, 4);
     }
 
     #[test]

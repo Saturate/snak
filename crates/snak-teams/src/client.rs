@@ -212,6 +212,38 @@ impl TeamsClient {
         Ok(page.reply_chains)
     }
 
+    /// Bytes of an image embedded in a message. Only Microsoft's own media
+    /// hosts get the Skype token: message HTML is written by other people.
+    pub async fn image(&self, url: &str) -> Result<Vec<u8>> {
+        const MAX_BYTES: usize = 25 * 1024 * 1024;
+        if !crate::backend::is_teams_media_url(url) {
+            return Err(CoreError::Push(format!("refusing to fetch {url}")));
+        }
+        let token = self.skype_token().await?;
+        let res = self
+            .http
+            .get(url)
+            .header("Authorization", format!("skype_token {token}"))
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(CoreError::Http {
+                status: status.as_u16(),
+                url: url.to_string(),
+                body: String::new(),
+            });
+        }
+        let bytes = res.bytes().await?;
+        if bytes.len() > MAX_BYTES {
+            return Err(CoreError::Push(format!(
+                "image too large: {} bytes",
+                bytes.len()
+            )));
+        }
+        Ok(bytes.to_vec())
+    }
+
     /// Moves the read marker to now, which clears unread in every Teams client.
     pub async fn mark_read(&self, conversation_id: &str) -> Result<()> {
         let url = format!(

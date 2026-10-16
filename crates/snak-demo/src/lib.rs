@@ -199,6 +199,10 @@ impl ChatBackend for DemoBackend {
         Box::pin(async { Ok(()) })
     }
 
+    fn image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(ChatError::Other("the demo has no images".into())) })
+    }
+
     fn call_url(&self, id: &ConversationId) -> Option<String> {
         let state = self.state();
         let thread = state.threads.iter().find(|t| &t.conversation.id == id)?;
@@ -310,6 +314,7 @@ fn message(id: MessageId, author: &str, at: DateTime<Utc>, html: &str) -> Messag
         body: Body::Html(html.into()),
         edited: false,
         reactions: Vec::new(),
+        images: Vec::new(),
         replies: Vec::new(),
     }
 }

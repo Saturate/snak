@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +23,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use snak_chat::{
-    Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, Group,
+    Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, Group, ImageRef,
     LoginPrompt, Message, MessageId,
 };
 
@@ -72,6 +74,16 @@ impl Header {
     }
 }
 
+#[derive(Clone)]
+enum ImageState {
+    Loading,
+    Ready(Arc<Image>),
+    Failed,
+}
+
+/// Shared with the timeline renderers, which run outside this view's update.
+type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
+
 /// Opens the thread panel for a channel post.
 type OnThread = Rc<dyn Fn(MessageId, &mut Window, &mut App)>;
 
@@ -102,6 +114,7 @@ pub struct Snak {
     scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
 
+    images: ImageCache,
     thread_root: Option<MessageId>,
     thread_rows: Rc<Vec<Message>>,
     thread_scroller: Entity<MessageScrollerState>,
@@ -176,6 +189,7 @@ impl Snak {
             rows: Rc::default(),
             scroller,
             composer,
+            images: ImageCache::default(),
             thread_root: None,
             thread_rows: Rc::default(),
             thread_scroller,
@@ -587,6 +601,7 @@ impl Snak {
     fn set_rows(&mut self, rows: Vec<Message>, cx: &mut Context<Self>) {
         sync_scroller(&self.scroller, &self.rows, &rows, cx);
         self.rows = Rc::new(rows);
+        self.load_images(cx);
 
         if let Some(root_id) = &self.thread_root {
             let thread = self
@@ -599,6 +614,50 @@ impl Snak {
             self.thread_rows = Rc::new(thread);
         }
         cx.notify();
+    }
+
+    /// Starts fetching every image in the loaded messages that isn't cached yet.
+    fn load_images(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let wanted: Vec<String> = self
+            .rows
+            .iter()
+            .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
+            .flat_map(|m| m.images.iter().map(|i| i.url.clone()))
+            .filter(|url| !self.images.borrow().contains_key(url))
+            .collect();
+        for url in wanted {
+            self.images
+                .borrow_mut()
+                .insert(url.clone(), ImageState::Loading);
+            let backend = backend.clone();
+            cx.spawn(async move |this, cx| {
+                let fetched = {
+                    let url = url.clone();
+                    io(async move { backend.image(&url).await }).await
+                };
+                let state = match fetched {
+                    Ok(bytes) => match image_format(&bytes) {
+                        Some(format) => {
+                            ImageState::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                        }
+                        None => ImageState::Failed,
+                    },
+                    Err(_) => ImageState::Failed,
+                };
+                this.update(cx, |this, cx| {
+                    this.images.borrow_mut().insert(url, state);
+                    // Loaded images can differ from the reserved size.
+                    this.scroller.update(cx, |s, cx| s.remeasure(cx));
+                    this.thread_scroller.update(cx, |s, cx| s.remeasure(cx));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     fn open_thread(&mut self, root_id: MessageId, window: &mut Window, cx: &mut Context<Self>) {
@@ -705,11 +764,88 @@ fn avatar_color(name: &str) -> Hsla {
     hsla((hash % 360) as f32 / 360., 0.45, 0.45, 1.)
 }
 
+fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
+        [0xFF, 0xD8, 0xFF, ..] => Some(ImageFormat::Jpeg),
+        [b'G', b'I', b'F', b'8', ..] => Some(ImageFormat::Gif),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some(ImageFormat::Webp),
+        [b'B', b'M', ..] => Some(ImageFormat::Bmp),
+        _ => None,
+    }
+}
+
+/// Fits the sender's reported size into the timeline, keeping the aspect ratio.
+fn image_size(image: &ImageRef) -> (f32, f32) {
+    const MAX_W: f32 = 360.;
+    const MAX_H: f32 = 300.;
+    let (w, h) = match (image.width, image.height) {
+        (Some(w), Some(h)) if w > 0. && h > 0. => (w, h),
+        _ => (240., 160.),
+    };
+    let scale = (MAX_W / w).min(MAX_H / h).min(1.);
+    (w * scale, h * scale)
+}
+
+fn render_images(row: &Message, images: &ImageCache, cx: &App) -> Option<AnyElement> {
+    if row.images.is_empty() {
+        return None;
+    }
+    let theme = cx.theme();
+    let cache = images.borrow();
+    let mut list = h_flex().flex_wrap().gap_2().pt_1();
+    for image in &row.images {
+        let (w, h) = image_size(image);
+        let frame = div()
+            .w(px(w))
+            .h(px(h))
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.border);
+        list = list.child(match cache.get(&image.url) {
+            Some(ImageState::Ready(data)) => frame
+                .child(
+                    img(ImageSource::Image(data.clone()))
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+            Some(ImageState::Failed) => frame
+                .bg(theme.muted)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Image unavailable")
+                .into_any_element(),
+            _ => frame.bg(theme.muted).into_any_element(),
+        });
+    }
+    Some(list.into_any_element())
+}
+
 fn render_row(
     row: &Message,
     previous: Option<&Message>,
     on_thread: Option<OnThread>,
     index: usize,
+    images: &ImageCache,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -795,6 +931,7 @@ fn render_row(
         .min_w_0()
         .gap_0p5()
         .child(body)
+        .children(render_images(row, images, cx))
         .child(footer);
 
     if continues {
@@ -1461,13 +1598,14 @@ impl Snak {
         scroller: &Entity<MessageScrollerState>,
         rows: Rc<Vec<Message>>,
         on_thread: Option<OnThread>,
+        images: ImageCache,
     ) -> impl IntoElement {
         MessageScroller::new(id, scroller.clone(), move |index, _, cx| {
             let Some(row) = rows.get(index) else {
                 return div().into_any_element();
             };
             let previous = index.checked_sub(1).and_then(|i| rows.get(i));
-            render_row(row, previous, on_thread.clone(), index, cx)
+            render_row(row, previous, on_thread.clone(), index, &images, cx)
         })
     }
 
@@ -1634,6 +1772,7 @@ impl Snak {
                 &self.scroller,
                 self.rows.clone(),
                 on_thread,
+                self.images.clone(),
             )))
             .child(
                 div()
@@ -1677,6 +1816,7 @@ impl Snak {
                 &self.thread_scroller,
                 self.thread_rows.clone(),
                 None,
+                self.images.clone(),
             )))
             .child(
                 div()
@@ -1725,11 +1865,17 @@ impl Snak {
             .unwrap_or_else(|| "Not signed in".into());
         let service = self.service_name();
         let view = cx.entity();
+        let first_name = name.split_whitespace().next().unwrap_or(&name).to_string();
         Button::new("account")
             .ghost()
-            .xsmall()
+            .small()
             .tooltip(name.clone())
-            .child(Avatar::new().name(name.clone()).xsmall())
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(Avatar::new().name(name.clone()).small())
+                    .child(div().text_sm().child(first_name)),
+            )
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
                 let item = |label: &str, run: fn(&mut Snak, &mut Window, &mut Context<Snak>)| {
                     PopupMenuItem::new(label.to_string()).on_click(

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, CredentialStorage, Event, Group, LoginPrompt, Me, Message, MessageId,
-    Reaction,
+    ConversationKind, CredentialStorage, Event, Group, ImageRef, LoginPrompt, Me, Message,
+    MessageId, Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -143,6 +143,10 @@ impl ChatBackend for TeamsBackend {
             let reply_to = reply_to.map(|m| m.0.as_str());
             Ok(self.client.send_message(&target, reply_to, text).await?)
         })
+    }
+
+    fn image<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Vec<u8>> {
+        Box::pin(async move { Ok(self.client.image(url).await?) })
     }
 
     fn mark_read<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, ()> {
@@ -478,8 +482,52 @@ fn to_message(message: &models::Message) -> Option<Message> {
                 count: r.count,
             })
             .collect(),
+        images: if message_type.starts_with("RichText/Html") {
+            message_images(message.content.as_deref().unwrap_or(""))
+        } else {
+            Vec::new()
+        },
         replies: Vec::new(),
     })
+}
+
+/// Hosts that serve Teams message media and accept the Skype token.
+pub(crate) fn is_teams_media_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo or a port would let a crafted URL look like a Microsoft host.
+    if authority.contains('@') || authority.contains(':') {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    host.ends_with(".asm.skype.com")
+        || host.ends_with(".asyncgw.teams.microsoft.com")
+        || host == "teams.microsoft.com"
+}
+
+fn message_images(html: &str) -> Vec<ImageRef> {
+    let mut images = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<img") {
+        let Some(len) = rest[start..].find('>') else {
+            break;
+        };
+        let tag = &rest[start..start + len + 1];
+        if let Some(url) = attribute(tag, "src").filter(|u| is_teams_media_url(u))
+            && !tag.to_ascii_lowercase().contains("schema.skype.com/emoji")
+        {
+            let size = |name| attribute(tag, name).and_then(|v| v.parse::<f32>().ok());
+            images.push(ImageRef {
+                url: html_escape::decode_html_entities(&url).into_owned(),
+                width: size("width"),
+                height: size("height"),
+            });
+        }
+        rest = &rest[start + len + 1..];
+    }
+    images
 }
 
 /// Images in Teams messages sit behind Teams auth, so the renderer can't fetch
@@ -496,7 +544,8 @@ fn display_html(html: &str) -> String {
         let tag = &rest[start..start + len + 1];
         if tag.to_ascii_lowercase().contains("schema.skype.com/emoji") {
             out.push_str(&attribute(tag, "alt").unwrap_or_default());
-        } else {
+        } else if !attribute(tag, "src").is_some_and(|u| is_teams_media_url(&u)) {
+            // Teams media renders under the text; anything else is never fetched.
             out.push_str("<i>[image]</i>");
         }
         rest = &rest[start + len + 1..];
@@ -629,6 +678,38 @@ mod tests {
     fn images_are_replaced_and_emoji_keep_alt_text() {
         let html = r#"<p>hi <img itemtype="http://schema.skype.com/Emoji" alt="😀" src="x"> <img src="https://asm/x"></p>"#;
         assert_eq!(display_html(html), "<p>hi 😀 <i>[image]</i></p>");
+    }
+
+    #[test]
+    fn only_microsoft_media_hosts_get_the_token() {
+        assert!(is_teams_media_url(
+            "https://eu-api.asm.skype.com/v1/objects/0-weu-d1-abc/views/imgo"
+        ));
+        assert!(is_teams_media_url(
+            "https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/x"
+        ));
+        assert!(!is_teams_media_url(
+            "http://eu-api.asm.skype.com/v1/objects/x"
+        ));
+        assert!(!is_teams_media_url(
+            "https://evil.example/eu-api.asm.skype.com"
+        ));
+        assert!(!is_teams_media_url(
+            "https://eu-api.asm.skype.com.evil.example/x"
+        ));
+        assert!(!is_teams_media_url(
+            "https://eu-api.asm.skype.com@evil.example/x"
+        ));
+        assert!(!is_teams_media_url("https://eu-api.asm.skype.com:8443/x"));
+    }
+
+    #[test]
+    fn teams_images_become_attachments_and_others_placeholders() {
+        let html = r#"<p>look <img itemtype="http://schema.skype.com/AMSImage" src="https://eu-api.asm.skype.com/v1/objects/0-a/views/imgo" width="250" height="180"><img src="https://tracker.example/p.gif"></p>"#;
+        let images = message_images(html);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].width, Some(250.));
+        assert_eq!(display_html(html), "<p>look <i>[image]</i></p>");
     }
 
     #[test]

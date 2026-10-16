@@ -12,6 +12,10 @@ use snak_teams::TeamsConnector;
 #[tokio::main]
 async fn main() {
     let connector = TeamsConnector::new();
+    // Use the same place the app keeps the login: SNAK_STORE=file|keychain.
+    if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
+        snak_teams::store::set_storage(snak_teams::store::Storage::File).await;
+    }
     let backend: Arc<dyn ChatBackend> = match connector.restore().await {
         Ok(Some(backend)) => backend,
         Ok(None) => return println!("no stored login; sign in through the app first"),
@@ -82,6 +86,28 @@ async fn main() {
                 );
             }
             Err(e) => println!("{label} messages failed: {}", redact(&e.to_string())),
+        }
+    }
+
+    // First embedded image in the newest few conversations, to check fetching works.
+    let mut by_recent: Vec<_> = list.iter().collect();
+    by_recent.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
+    'search: for conversation in by_recent.iter().take(15) {
+        let Ok(messages) = backend.messages(&conversation.id).await else { continue };
+        for message in messages.iter().flat_map(|m| std::iter::once(m).chain(m.replies.iter())) {
+            if let Some(image) = message.images.first() {
+                match backend.image(&image.url).await {
+                    Ok(bytes) => println!(
+                        "image: fetched {} bytes, magic {:02x?}, reported size {:?}x{:?}",
+                        bytes.len(),
+                        &bytes[..bytes.len().min(4)],
+                        image.width,
+                        image.height
+                    ),
+                    Err(e) => println!("image: fetch failed: {}", redact(&e.to_string())),
+                }
+                break 'search;
+            }
         }
     }
 

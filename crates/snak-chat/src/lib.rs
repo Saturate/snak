@@ -81,6 +81,14 @@ pub enum Body {
     Event(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRef {
+    pub url: String,
+    /// Size the sender's client reported, so space can be reserved before loading.
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Reaction {
     pub emoji: String,
@@ -96,6 +104,8 @@ pub struct Message {
     pub body: Body,
     pub edited: bool,
     pub reactions: Vec<Reaction>,
+    /// Images shown under the text; fetched through [`ChatBackend::image`].
+    pub images: Vec<ImageRef>,
     /// Replies, oldest first. Only channel posts have them.
     pub replies: Vec<Message>,
 }
@@ -166,6 +176,9 @@ pub trait ChatBackend: Send + Sync {
     /// clients stop showing it as unread.
     fn mark_read<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, ()>;
 
+    /// Image bytes for an [`ImageRef`]; services keep these behind auth.
+    fn image<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Vec<u8>>;
+
     /// Link that hands a call for this conversation to another app, if any.
     fn call_url(&self, id: &ConversationId) -> Option<String>;
 
@@ -226,6 +239,7 @@ mod tests {
             body: Body::Text("x".into()),
             edited: false,
             reactions: Vec::new(),
+            images: Vec::new(),
             replies: Vec::new(),
         }
     }

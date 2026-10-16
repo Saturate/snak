@@ -77,9 +77,37 @@ impl Header {
 #[derive(Clone)]
 enum ImageState {
     Loading,
-    Ready(Arc<Image>),
+    Ready(LoadedImage),
     Failed,
 }
+
+#[derive(Clone)]
+struct LoadedImage {
+    data: Arc<Image>,
+    /// Real pixel size, read from the header.
+    size: Option<(u32, u32)>,
+    /// First frame of an animated GIF, shown while it isn't playing;
+    /// GPUI's img has no pause, so a still is the way to stop it.
+    still: Option<Arc<Image>>,
+}
+
+fn first_frame_png(bytes: &[u8]) -> Option<Arc<Image>> {
+    use image::AnimationDecoder as _;
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut frames = decoder.into_frames();
+    let first = frames.next()?.ok()?;
+    // A single-frame GIF is just a picture; nothing to pause.
+    frames.next()?.ok()?;
+    let mut png = Vec::new();
+    first
+        .into_buffer()
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(Arc::new(Image::from_bytes(ImageFormat::Png, png)))
+}
+
+/// GIFs the user clicked; they play when this differs from the autoplay setting.
+type GifToggles = Rc<RefCell<std::collections::HashSet<String>>>;
 
 /// Shared with the timeline renderers, which run outside this view's update.
 type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
@@ -115,6 +143,7 @@ pub struct Snak {
     composer: Entity<TextareaState>,
 
     images: ImageCache,
+    gif_toggles: GifToggles,
     thread_root: Option<MessageId>,
     thread_rows: Rc<Vec<Message>>,
     thread_scroller: Entity<MessageScrollerState>,
@@ -190,6 +219,7 @@ impl Snak {
             scroller,
             composer,
             images: ImageCache::default(),
+            gif_toggles: GifToggles::default(),
             thread_root: None,
             thread_rows: Rc::default(),
             thread_scroller,
@@ -644,7 +674,18 @@ impl Snak {
                 let state = match fetched {
                     Ok(bytes) => match image_format(&bytes) {
                         Some(format) => {
-                            ImageState::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                            let size = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                                .with_guessed_format()
+                                .ok()
+                                .and_then(|r| r.into_dimensions().ok());
+                            let still = (format == ImageFormat::Gif)
+                                .then(|| first_frame_png(&bytes))
+                                .flatten();
+                            ImageState::Ready(LoadedImage {
+                                data: Arc::new(Image::from_bytes(format, bytes)),
+                                size,
+                                still,
+                            })
                         }
                         None => {
                             tracing::warn!(
@@ -802,19 +843,40 @@ fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
-/// Fits the sender's reported size into the timeline, keeping the aspect ratio.
-fn image_size(image: &ImageRef) -> (f32, f32) {
+/// Fits the image into the timeline, keeping its aspect ratio. The real size
+/// wins once known; until then the sender's reported size reserves space.
+fn image_size(image: &ImageRef, actual: Option<(u32, u32)>) -> (f32, f32) {
     const MAX_W: f32 = 360.;
     const MAX_H: f32 = 300.;
-    let (w, h) = match (image.width, image.height) {
-        (Some(w), Some(h)) if w > 0. && h > 0. => (w, h),
-        _ => (240., 160.),
+    let reported = match (image.width, image.height) {
+        (Some(w), Some(h)) if w > 0. && h > 0. => Some((w, h)),
+        _ => None,
     };
+    let (w, h) = actual
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| (w as f32, h as f32))
+        .or(reported)
+        .unwrap_or((240., 160.));
     let scale = (MAX_W / w).min(MAX_H / h).min(1.);
     (w * scale, h * scale)
 }
 
-fn render_images(row: &Message, images: &ImageCache, cx: &App) -> Option<AnyElement> {
+fn return_image(frame: Div, data: Arc<Image>) -> AnyElement {
+    frame
+        .child(
+            img(ImageSource::Image(data))
+                .size_full()
+                .object_fit(ObjectFit::Cover),
+        )
+        .into_any_element()
+}
+
+fn render_images(
+    row: &Message,
+    images: &ImageCache,
+    gif_toggles: &GifToggles,
+    cx: &App,
+) -> Option<AnyElement> {
     if row.images.is_empty() {
         return None;
     }
@@ -822,22 +884,63 @@ fn render_images(row: &Message, images: &ImageCache, cx: &App) -> Option<AnyElem
     let cache = images.borrow();
     let mut list = h_flex().flex_wrap().gap_2().pt_1();
     for image in &row.images {
-        let (w, h) = image_size(image);
-        let frame = div()
-            .w(px(w))
-            .h(px(h))
-            .rounded_md()
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.border);
-        list = list.child(match cache.get(&image.url) {
-            Some(ImageState::Ready(data)) => frame
-                .child(
-                    img(ImageSource::Image(data.clone()))
+        let state = cache.get(&image.url);
+        let actual = match state {
+            Some(ImageState::Ready(loaded)) => loaded.size,
+            _ => None,
+        };
+        let (w, h) = image_size(image, actual);
+        // Sized to the image itself, so there's no letterboxing inside the frame.
+        let frame = div().w(px(w)).h(px(h)).rounded_md().overflow_hidden();
+        list = list.child(match state {
+            Some(ImageState::Ready(loaded)) if loaded.still.is_none() => {
+                return_image(frame, loaded.data.clone())
+            }
+            Some(ImageState::Ready(loaded)) => {
+                let still = loaded.still.clone().unwrap_or_else(|| loaded.data.clone());
+                let toggled = gif_toggles.borrow().contains(&image.url);
+                let playing = Settings::get(cx).autoplay_gifs != toggled;
+                let url = image.url.clone();
+                let toggles = gif_toggles.clone();
+                frame
+                    .id(ElementId::Name(format!("gif-{}", image.url).into()))
+                    .relative()
+                    .cursor_pointer()
+                    .child(
+                        // GPUI keeps the GIF frame counter in element state, which needs an id.
+                        img(ImageSource::Image(if playing {
+                            loaded.data.clone()
+                        } else {
+                            still
+                        }))
+                        .id(ElementId::Name(image.url.clone().into()))
                         .size_full()
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element(),
+                        .object_fit(ObjectFit::Cover),
+                    )
+                    .when(!playing, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left_2()
+                                .bottom_2()
+                                .px_1p5()
+                                .rounded_sm()
+                                .bg(hsla(0., 0., 0., 0.6))
+                                .text_color(white())
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .child("▶ GIF"),
+                        )
+                    })
+                    .on_click(move |_, window, _| {
+                        let mut toggles = toggles.borrow_mut();
+                        if !toggles.remove(&url) {
+                            toggles.insert(url.clone());
+                        }
+                        window.refresh();
+                    })
+                    .into_any_element()
+            }
             Some(ImageState::Failed) => frame
                 .bg(theme.muted)
                 .flex()
@@ -859,6 +962,7 @@ fn render_row(
     on_thread: Option<OnThread>,
     index: usize,
     images: &ImageCache,
+    gif_toggles: &GifToggles,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -944,7 +1048,7 @@ fn render_row(
         .min_w_0()
         .gap_0p5()
         .child(body)
-        .children(render_images(row, images, cx))
+        .children(render_images(row, images, gif_toggles, cx))
         .child(footer);
 
     if continues {
@@ -1612,13 +1716,22 @@ impl Snak {
         rows: Rc<Vec<Message>>,
         on_thread: Option<OnThread>,
         images: ImageCache,
+        gif_toggles: GifToggles,
     ) -> impl IntoElement {
         MessageScroller::new(id, scroller.clone(), move |index, _, cx| {
             let Some(row) = rows.get(index) else {
                 return div().into_any_element();
             };
             let previous = index.checked_sub(1).and_then(|i| rows.get(i));
-            render_row(row, previous, on_thread.clone(), index, &images, cx)
+            render_row(
+                row,
+                previous,
+                on_thread.clone(),
+                index,
+                &images,
+                &gif_toggles,
+                cx,
+            )
         })
     }
 
@@ -1786,6 +1899,7 @@ impl Snak {
                 self.rows.clone(),
                 on_thread,
                 self.images.clone(),
+                self.gif_toggles.clone(),
             )))
             .child(
                 div()
@@ -1830,6 +1944,7 @@ impl Snak {
                 self.thread_rows.clone(),
                 None,
                 self.images.clone(),
+                self.gif_toggles.clone(),
             )))
             .child(
                 div()
@@ -2051,5 +2166,46 @@ impl Render for Snak {
                 )
                 .into_any_element(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not a glob: gpui's `test` attribute macro would shadow the built-in one.
+    use super::{ImageFormat, ImageRef, first_frame_png, image_format, image_size};
+
+    fn gif(frames: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
+            for i in 0..frames {
+                let pixel = image::Rgba([(i * 80) as u8, 0, 0, 255]);
+                let frame = image::Frame::new(image::RgbaImage::from_pixel(4, 3, pixel));
+                encoder.encode_frame(frame).expect("encodes");
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn animated_gifs_get_a_still_and_single_frames_do_not() {
+        assert!(first_frame_png(&gif(3)).is_some());
+        assert!(first_frame_png(&gif(1)).is_none());
+        assert_eq!(image_format(&gif(1)), Some(ImageFormat::Gif));
+    }
+
+    #[test]
+    fn real_size_beats_reported_size_and_keeps_aspect() {
+        let reported = ImageRef {
+            url: String::new(),
+            width: Some(717.),
+            height: Some(146.),
+        };
+        assert_eq!(image_size(&reported, Some((200, 100))), (200., 100.));
+        let (w, h) = image_size(&reported, None);
+        assert_eq!(w, 360.);
+        assert!((h - 146. * 360. / 717.).abs() < 0.01);
+        let (w, h) = image_size(&reported, Some((1000, 1000)));
+        assert_eq!((w, h), (300., 300.));
     }
 }

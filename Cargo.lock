@@ -6247,6 +6247,7 @@ version = "0.1.0"
 dependencies = [
  "gpui-kit",
  "html-escape",
+ "image",
  "serde",
  "serde_json",
  "snak-chat",

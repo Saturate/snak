@@ -136,6 +136,22 @@ impl SettingsWindow {
                             .default_value(zed_light),
                         ),
                     ]),
+                    SettingGroup::new().title("Media").item(
+                        SettingItem::new(
+                            "Play GIFs automatically",
+                            SettingField::switch(
+                                |cx: &App| Settings::get(cx).autoplay_gifs,
+                                |value: bool, cx: &mut App| {
+                                    Settings::update(cx, |s| s.autoplay_gifs = value)
+                                },
+                            )
+                            .default_value(defaults.autoplay_gifs),
+                        )
+                        .description(
+                            "When off, GIFs show their first frame; click one to play it. \
+                             Clicking a playing GIF pauses it either way.",
+                        ),
+                    ),
                     SettingGroup::new().title("Text").item(
                         SettingItem::new(
                             "UI font size",

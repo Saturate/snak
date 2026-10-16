@@ -26,6 +26,8 @@ pub struct TeamsClient {
     tokens: Mutex<HashMap<&'static str, AccessToken>>,
     region: String,
     me: Me,
+    /// Sign-out epoch this client started under; see `store::epoch`.
+    store_epoch: u64,
 }
 
 impl TeamsClient {
@@ -36,6 +38,7 @@ impl TeamsClient {
             refresh_token: Mutex::new(refresh_token),
             tokens: Mutex::new(HashMap::new()),
             region: String::new(),
+            store_epoch: crate::store::epoch(),
             me: Me {
                 id: String::new(),
                 display_name: None,
@@ -80,7 +83,8 @@ impl TeamsClient {
             // The new access token is good either way; a failed save (say, a
             // denied Keychain prompt) only means the next launch uses an older,
             // still valid refresh token.
-            if let Err(e) = crate::store::save(rotated.clone(), false).await {
+            if let Err(e) = crate::store::save(rotated.clone(), false, Some(self.store_epoch)).await
+            {
                 tracing::warn!(error = %e, "could not save the rotated refresh token");
             }
             *refresh = rotated;

@@ -195,7 +195,15 @@ impl ChatBackend for TeamsBackend {
                     return;
                 }
             };
-            while let Some(event) = push.recv().await {
+            // Stop as soon as the app drops its receiver (sign-out), rather
+            // than at the next event: until then the push session, and its
+            // token refreshes, would keep running for a session that's gone.
+            loop {
+                let event = tokio::select! {
+                    event = push.recv() => event,
+                    _ = tx.closed() => return,
+                };
+                let Some(event) = event else { return };
                 for event in translate(event) {
                     if tx.send(event).await.is_err() {
                         return;
@@ -448,7 +456,13 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
     let my_mentions: Vec<String> = message
         .mentions()
         .into_iter()
-        .filter(|(_, mri)| !me_id.is_empty() && mri.rsplit(':').next() == Some(me_id))
+        .filter(|(_, mri)| {
+            !me_id.is_empty()
+                && mri
+                    .rsplit(':')
+                    .next()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(me_id))
+        })
         .map(|(item, _)| item)
         .collect();
     let message_type = message.message_type.as_deref().unwrap_or("");
@@ -482,6 +496,9 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
         }
     };
 
+    // Tint only real text that mentions you, not deleted or plain messages
+    // whose properties still list the mention.
+    let mentions_me = !my_mentions.is_empty() && matches!(body, Body::Html(_));
     Some(Message {
         // Without an id a message can't anchor a thread or be told apart
         // from another, so it is skipped.
@@ -509,7 +526,7 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
         },
         replies: Vec::new(),
         pending: false,
-        mentions_me: !my_mentions.is_empty(),
+        mentions_me,
     })
 }
 
@@ -668,12 +685,16 @@ fn render_mentions(html: &str, my_mentions: &[String]) -> String {
             continue;
         };
         // Collect this span and any directly following spans for the same person.
+        let mut exhausted = false;
         let mut words = Vec::new();
         let mut end = start;
         let mut cursor = start;
         while let Some(open_len) = lower[cursor..].find('>') {
             let inner_start = cursor + open_len + 1;
             let Some(close) = lower[inner_start..].find("</span>") else {
+                // No closing tag anywhere after here, so none for any later
+                // span either; stop instead of rescanning to the end each time.
+                exhausted = true;
                 break;
             };
             let inner = &html[inner_start..inner_start + close];
@@ -700,6 +721,9 @@ fn render_mentions(html: &str, my_mentions: &[String]) -> String {
             cursor = next;
         }
         if words.is_empty() {
+            if exhausted {
+                break;
+            }
             at = open_end;
             continue;
         }
@@ -711,8 +735,10 @@ fn render_mentions(html: &str, my_mentions: &[String]) -> String {
             .join(" ");
         out.push_str(&html[copied..start]);
         let label = html_escape::encode_text(&name);
+        // Compared raw; encoding is only for the attribute it goes into.
+        let mine = my_mentions.contains(&item);
         let item = html_escape::encode_double_quoted_attribute(&item);
-        if my_mentions.iter().any(|m| m.as_str() == item.as_ref()) {
+        if mine {
             out.push_str(&format!(
                 "<a href=\"snak-mention:{item}\"><b>@{label}</b></a>"
             ));
@@ -721,6 +747,9 @@ fn render_mentions(html: &str, my_mentions: &[String]) -> String {
         }
         copied = end;
         at = end;
+        if exhausted {
+            break;
+        }
     }
     out.push_str(&html[copied..]);
     out
@@ -915,6 +944,15 @@ mod tests {
             display_html(html, &["0".to_string()]),
             r#"<p>hi <a href="snak-mention:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:1">@Maja</a></p>"#
         );
+    }
+
+    #[test]
+    fn unclosed_mention_spans_stay_linear() {
+        let span = r#"<span itemtype="http://schema.skype.com/Mention" itemid="0">x"#;
+        let html = span.repeat(20_000);
+        let started = std::time::Instant::now();
+        let _ = display_html(&html, &[]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

@@ -108,8 +108,18 @@ pub async fn load() -> Option<String> {
     .flatten()
 }
 
-/// `force` skips the 1Password write throttle, for a fresh login.
-pub(crate) async fn save(token: String, force: bool) -> Result<()> {
+/// Bumped by every sign-out. A client remembers the value it started under,
+/// and its token saves are dropped once it no longer matches: an old session
+/// still refreshing in the background must not write its login back.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn epoch() -> u64 {
+    EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `force` skips the 1Password write throttle, for a fresh login. With
+/// `epoch`, nothing is written if a sign-out happened since.
+pub(crate) async fn save(token: String, force: bool, epoch: Option<u64>) -> Result<()> {
     let storage = {
         let state = state();
         let throttled = matches!(state.storage, Storage::OnePassword { .. })
@@ -124,6 +134,11 @@ pub(crate) async fn save(token: String, force: bool) -> Result<()> {
     };
     let written = tokio::task::spawn_blocking(move || {
         let _ops = exclusive();
+        // Checked under the lock, so it can't race the clear that bumps it.
+        if epoch.is_some_and(|e| e != self::epoch()) {
+            tracing::debug!("dropping a token save from a signed-out session");
+            return Ok(());
+        }
         write(&storage, &token)
     })
     .await
@@ -137,9 +152,13 @@ pub(crate) async fn save(token: String, force: bool) -> Result<()> {
 /// Signs out everywhere Snak might have put the login.
 pub fn clear() {
     let _ops = exclusive();
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     delete(&Storage::Keychain);
     delete(&Storage::File);
-    if let Storage::OnePassword { account } = state().storage.clone() {
+    // Bound first: a temporary in the `if let` would keep STATE locked through
+    // the `op` calls below, which can sit on a Touch ID prompt.
+    let storage = state().storage.clone();
+    if let Storage::OnePassword { account } = storage {
         for id in op_item_ids(&account) {
             let _ = op(&account, &["item", "delete", &id, "--archive"], None);
         }

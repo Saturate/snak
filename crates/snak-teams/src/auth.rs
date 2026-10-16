@@ -127,7 +127,8 @@ pub async fn complete_device_login(http: &reqwest::Client, code: &DeviceCode) ->
             let refresh = token
                 .refresh_token
                 .ok_or_else(|| CoreError::SessionExpired("no refresh token in response".into()))?;
-            crate::store::save(refresh.clone(), true).await?;
+            // A brand-new login: always stored, whatever happened before it.
+            crate::store::save(refresh.clone(), true, None).await?;
             return Ok(refresh);
         }
 

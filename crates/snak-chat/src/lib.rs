@@ -26,12 +26,20 @@ pub struct ConversationId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId(pub String);
 
+/// What channels belong to: a Teams team, a Slack workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Group {
+    /// Stable across renames, so saved layouts keep working.
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationKind {
     /// A channel inside a group (a Teams team, a Slack workspace section).
     /// Channel posts carry threads.
     Channel {
-        group: String,
+        group: Group,
     },
     Direct,
     Group,
@@ -55,7 +63,7 @@ impl Conversation {
         matches!(self.kind, ConversationKind::Channel { .. })
     }
 
-    pub fn group(&self) -> Option<&str> {
+    pub fn group(&self) -> Option<&Group> {
         match &self.kind {
             ConversationKind::Channel { group } => Some(group),
             _ => None,

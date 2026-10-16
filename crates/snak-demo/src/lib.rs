@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, LoginPrompt, Me, Message, MessageId, Reaction,
+    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -321,7 +321,10 @@ fn seed(now: DateTime<Utc>) -> State {
     let channel = |id: &str, group: &str, title: &str| Conversation {
         id: ConversationId(id.into()),
         kind: ConversationKind::Channel {
-            group: group.into(),
+            group: Group {
+                id: group.to_lowercase().replace(' ', "-"),
+                name: group.into(),
+            },
         },
         title: title.into(),
         unread: false,

@@ -7,20 +7,21 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
+    highlighter::HighlightTheme,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
-    text::TextView,
-    v_flex,
+    text::{TextView, TextViewStyle},
+    v_flex, {Theme, ThemeMode},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use snak_chat::{
-    Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, LoginPrompt,
-    Message, MessageId,
+    Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, Group,
+    LoginPrompt, Message, MessageId,
 };
 
-use crate::prefs::{Placement, Prefs};
+use crate::prefs::{Appearance, Placement, Prefs, group_key, team_key};
 use crate::sidebar;
 use crate::{CloseThread, JumpTo, NextConversation, PreviousConversation, io};
 
@@ -31,22 +32,38 @@ const DM_LIMIT: usize = 40;
 const SIDEBAR_WIDTH: f32 = 272.;
 const THREAD_WIDTH: f32 = 400.;
 
-struct SidebarGroups {
-    starred: Vec<Conversation>,
-    sections: Vec<(usize, String, Vec<Conversation>)>,
-    channels: Vec<Conversation>,
-    dms: Vec<Conversation>,
+enum SidebarRow {
+    Header(Header),
+    Item {
+        conversation: Conversation,
+        depth: usize,
+        /// Show the team name next to a channel shown outside its team.
+        show_group: bool,
+    },
 }
 
-impl SidebarGroups {
-    fn flat(self) -> Vec<Conversation> {
-        let mut all = self.starred;
-        for (_, _, entries) in self.sections {
-            all.extend(entries);
+#[derive(Clone)]
+struct Header {
+    /// Collapse key in prefs.
+    key: String,
+    label: String,
+    depth: usize,
+    collapsed: bool,
+    /// Set for team headers, which can be filed into sections.
+    team: Option<String>,
+    section: Option<usize>,
+}
+
+impl Header {
+    fn new(key: &str, label: &str, depth: usize) -> Self {
+        Self {
+            key: key.to_string(),
+            label: label.to_string(),
+            depth,
+            collapsed: false,
+            team: None,
+            section: None,
         }
-        all.extend(self.channels);
-        all.extend(self.dms);
-        all
     }
 }
 
@@ -111,6 +128,9 @@ impl Snak {
         let thread_scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
 
         let subscriptions = vec![
+            cx.observe_window_appearance(window, |this, window, cx| {
+                this.apply_appearance(window, cx)
+            }),
             cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.observe(&thread_scroller, |_, _, cx| cx.notify()),
             cx.subscribe_in(&jump, window, |this, _, event, window, cx| match event {
@@ -161,6 +181,7 @@ impl Snak {
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);
+        this.apply_appearance(window, cx);
         this.restore(cx);
         this
     }
@@ -322,6 +343,20 @@ impl Snak {
             })
             .ok();
         }));
+    }
+
+    fn apply_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.prefs.appearance {
+            Appearance::System => Theme::sync_system_appearance(Some(window), cx),
+            Appearance::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+            Appearance::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+        }
+        window.refresh();
+    }
+
+    fn cycle_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_prefs(cx, |p| p.appearance = p.appearance.next());
+        self.apply_appearance(window, cx);
     }
 
     fn update_prefs(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Prefs)) {
@@ -606,6 +641,17 @@ fn render_row(
                     ElementId::Name(format!("msg-{}", row.id.0).into()),
                     SharedString::from(html.clone()),
                 )
+                // Chat messages are mostly one-line paragraphs; document spacing
+                // makes every line look double-spaced.
+                .style(TextViewStyle {
+                    paragraph_gap: rems(0.2),
+                    highlight_theme: if theme.is_dark() {
+                        HighlightTheme::default_dark()
+                    } else {
+                        HighlightTheme::default_light()
+                    },
+                    ..TextViewStyle::default()
+                })
                 .selectable(true),
             )
             .into_any_element(),
@@ -811,6 +857,8 @@ impl Snak {
         &self,
         entry: &Conversation,
         ix: usize,
+        depth: usize,
+        show_group: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -836,7 +884,8 @@ impl Snak {
             .id(("entry", ix))
             .w_full()
             .gap_1p5()
-            .px_2()
+            .pl(px(8. + 12. * depth.saturating_sub(1) as f32))
+            .pr_2()
             .py(px(3.))
             .rounded_md()
             .cursor_pointer()
@@ -864,22 +913,25 @@ impl Snak {
                     .truncate()
                     .child(entry.title.clone()),
             )
-            .when_some(entry.group().map(str::to_string), |el, detail| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .max_w(px(96.))
-                        .truncate()
-                        .text_xs()
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(if active {
-                            theme.sidebar_primary_foreground
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(detail),
-                )
-            })
+            .when_some(
+                entry.group().filter(|_| show_group).map(|g| g.name.clone()),
+                |el, detail| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(96.))
+                            .truncate()
+                            .text_xs()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(if active {
+                                theme.sidebar_primary_foreground
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(detail),
+                    )
+                },
+            )
             .on_click(
                 cx.listener(move |this, _, window, cx| this.select(clicked.clone(), window, cx)),
             )
@@ -949,56 +1001,146 @@ impl Snak {
             })
     }
 
-    /// The sidebar's groups in display order, shared by rendering and Option+arrow navigation.
-    fn sidebar_groups(&self, query: &str) -> SidebarGroups {
+    /// The sidebar as display rows, shared by rendering and Option+arrow navigation.
+    fn sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
         let searching = !query.is_empty();
         let prefs = &self.prefs;
-        let visible = |e: &&Conversation| {
-            let key = e.id.0.as_str();
-            let is_selected = self.selected.as_ref() == Some(&e.id);
-            sidebar::matches(e, query)
+        let is_selected = |c: &Conversation| self.selected.as_ref() == Some(&c.id);
+        let visible = |c: &&Conversation| {
+            let key = c.id.0.as_str();
+            sidebar::matches(c, query)
                 // Search reaches everything, including what you hid.
                 && (searching || self.show_hidden || !prefs.hidden.contains(key))
-                && (searching || !prefs.unreads_only || is_selected
-                    || (e.unread && !self.is_muted(e)))
+                && (searching || !prefs.unreads_only || is_selected(c)
+                    || (c.unread && !self.is_muted(c)))
+        };
+        // A collapsed group still shows what needs attention, as Slack does.
+        let shown_when_collapsed =
+            |c: &Conversation| is_selected(c) || (c.unread && !self.is_muted(c));
+        let collapsed = |key: &str| !searching && prefs.collapsed.contains(key);
+
+        let all: Vec<&Conversation> = self.conversations.iter().filter(visible).collect();
+        let placed = |placement: Placement| {
+            all.iter()
+                .copied()
+                .filter(move |c| prefs.placement(&c.id.0) == placement)
+        };
+        let team_channels = |team_id: &str| -> Vec<&Conversation> {
+            let mut channels: Vec<&Conversation> = placed(Placement::Default)
+                .filter(|c| c.group().is_some_and(|g| g.id == team_id))
+                .collect();
+            channels.sort_by_key(|c| (c.title != "general", c.title.to_lowercase()));
+            channels
         };
 
-        let mut all: Vec<&Conversation> = self.conversations.iter().filter(visible).collect();
-        // Channels read best grouped by team; DMs by recency.
-        all.sort_by(|a, b| match (a.group(), b.group()) {
-            (Some(x), Some(y)) => x
-                .cmp(y)
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
-            _ => b.last_activity.cmp(&a.last_activity),
-        });
-        let filed = |placement: Placement| -> Vec<Conversation> {
-            all.iter()
-                .filter(|e| prefs.placement(&e.id.0) == placement)
-                .map(|e| (*e).clone())
-                .collect()
-        };
-        let unfiled = filed(Placement::Default);
-        SidebarGroups {
-            starred: filed(Placement::Starred),
-            sections: prefs
-                .sections
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (i, s.name.clone(), filed(Placement::Section(i))))
-                .collect(),
-            channels: unfiled.iter().filter(|e| e.is_channel()).cloned().collect(),
-            dms: unfiled
-                .iter()
-                .filter(|e| !e.is_channel())
-                .take(if searching { usize::MAX } else { DM_LIMIT })
-                .cloned()
-                .collect(),
+        let mut teams: Vec<Group> = Vec::new();
+        for group in self.conversations.iter().filter_map(Conversation::group) {
+            if !teams.iter().any(|t| t.id == group.id) {
+                teams.push(group.clone());
+            }
         }
+        teams.sort_by_key(|t| t.name.to_lowercase());
+
+        let mut rows = Vec::new();
+        let push_group = |rows: &mut Vec<SidebarRow>,
+                          header: Header,
+                          items: Vec<&Conversation>,
+                          show_group: bool,
+                          always_show_header: bool| {
+            let is_collapsed = collapsed(&header.key);
+            let depth = header.depth + 1;
+            let items: Vec<SidebarRow> = items
+                .into_iter()
+                .filter(|c| !is_collapsed || shown_when_collapsed(c))
+                .map(|c| SidebarRow::Item {
+                    conversation: c.clone(),
+                    depth,
+                    show_group,
+                })
+                .collect();
+            if items.is_empty() && !always_show_header && !is_collapsed {
+                return;
+            }
+            rows.push(SidebarRow::Header(Header {
+                collapsed: is_collapsed,
+                ..header
+            }));
+            rows.extend(items);
+        };
+
+        push_group(
+            &mut rows,
+            Header::new("starred", "Starred", 0),
+            placed(Placement::Starred).collect(),
+            true,
+            false,
+        );
+
+        let filing = !searching && !prefs.unreads_only;
+        for (i, section) in prefs.sections.iter().enumerate() {
+            let mut header = Header::new(&group_key("section", &section.name), &section.name, 0);
+            header.section = Some(i);
+            let loose: Vec<&Conversation> = placed(Placement::Section(i)).collect();
+            push_group(&mut rows, header.clone(), loose, true, filing);
+            let section_collapsed = collapsed(&header.key);
+            for team in teams
+                .iter()
+                .filter(|t| prefs.placement(&team_key(&t.id)) == Placement::Section(i))
+            {
+                let channels = team_channels(&team.id);
+                if section_collapsed {
+                    rows.extend(
+                        channels
+                            .into_iter()
+                            .filter(|c| shown_when_collapsed(c))
+                            .map(|c| SidebarRow::Item {
+                                conversation: c.clone(),
+                                depth: 1,
+                                show_group: true,
+                            }),
+                    );
+                    continue;
+                }
+                let mut team_header = Header::new(&team_key(&team.id), &team.name, 1);
+                team_header.team = Some(team.id.clone());
+                push_group(&mut rows, team_header, channels, false, false);
+            }
+        }
+
+        for team in teams
+            .iter()
+            .filter(|t| prefs.placement(&team_key(&t.id)) == Placement::Default)
+        {
+            let mut header = Header::new(&team_key(&team.id), &team.name, 0);
+            header.team = Some(team.id.clone());
+            push_group(&mut rows, header, team_channels(&team.id), false, false);
+        }
+
+        let mut dms: Vec<&Conversation> = placed(Placement::Default)
+            .filter(|c| !c.is_channel())
+            .collect();
+        dms.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
+        dms.truncate(if searching { usize::MAX } else { DM_LIMIT });
+        push_group(
+            &mut rows,
+            Header::new("dms", "Direct messages", 0),
+            dms,
+            false,
+            true,
+        );
+        rows
     }
 
     fn step_conversation(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.query(cx);
-        let order = self.sidebar_groups(&query).flat();
+        let order: Vec<ConversationId> = self
+            .sidebar_rows(&query)
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Item { conversation, .. } => Some(conversation.id),
+                SidebarRow::Header(_) => None,
+            })
+            .collect();
         if order.is_empty() {
             return;
         }
@@ -1006,25 +1148,108 @@ impl Snak {
             .selected
             .as_ref()
             .filter(|_| !self.showing_unreads)
-            .and_then(|s| order.iter().position(|e| &e.id == s));
+            .and_then(|s| order.iter().position(|id| id == s));
         let next = match current {
             Some(i) => (i as isize + delta).clamp(0, order.len() as isize - 1) as usize,
             None if delta > 0 => 0,
             None => order.len() - 1,
         };
-        self.select(order[next].id.clone(), window, cx);
+        self.select(order[next].clone(), window, cx);
+    }
+
+    fn render_sidebar_header(
+        &self,
+        header: &Header,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let key = header.key.clone();
+        let view = cx.entity();
+        let team = header.team.clone();
+        let section = header.section;
+        let team_placement = team.as_deref().map(|t| self.prefs.placement(&team_key(t)));
+        let sections: Vec<(usize, String)> = self
+            .prefs
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.name.clone()))
+            .collect();
+
+        h_flex()
+            .id(("group", ix))
+            .w_full()
+            .gap_1()
+            .pl(px(8. + 12. * header.depth as f32))
+            .pr_2()
+            .pt(if header.depth == 0 { px(14.) } else { px(6.) })
+            .pb_1()
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.muted_foreground)
+            .hover(|s| s.text_color(theme.sidebar_foreground))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(10.))
+                    .child(if header.collapsed { "▸" } else { "▾" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(header.label.clone()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.update_prefs(cx, |p| p.toggle_collapsed(&key))
+            }))
+            .context_menu(move |menu, window, _| {
+                if let Some(i) = section {
+                    return menu.item(PopupMenuItem::new("Delete section").on_click(
+                        window.listener_for(&view, move |this, _, _, cx| {
+                            this.update_prefs(cx, |p| p.delete_section(i))
+                        }),
+                    ));
+                }
+                let Some(team) = team.clone() else {
+                    return menu;
+                };
+                let key = team_key(&team);
+                let mut menu = menu;
+                for (i, name) in &sections {
+                    if team_placement == Some(Placement::Section(*i)) {
+                        continue;
+                    }
+                    let (i, key) = (*i, key.clone());
+                    menu = menu.item(PopupMenuItem::new(format!("Move team to {name}")).on_click(
+                        window.listener_for(&view, move |this, _, _, cx| {
+                            this.update_prefs(cx, |p| p.move_to_section(&key, i))
+                        }),
+                    ));
+                }
+                if let Some(Placement::Section(_)) = team_placement {
+                    let key = key.clone();
+                    menu = menu.item(PopupMenuItem::new("Remove team from section").on_click(
+                        window.listener_for(&view, move |this, _, _, cx| {
+                            this.update_prefs(cx, |p| p.remove_from_section(&key))
+                        }),
+                    ));
+                }
+                menu.item(PopupMenuItem::new("Move team to new section…").on_click(
+                    window.listener_for(&view, move |this, _, window, cx| {
+                        this.new_section_dialog(Some(key.clone()), window, cx)
+                    }),
+                ))
+            })
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.query(cx);
-        let prefs = &self.prefs;
-        let SidebarGroups {
-            starred,
-            sections,
-            channels,
-            dms,
-        } = self.sidebar_groups(&query);
-        let hidden_count = prefs.hidden.len();
+        let rows = self.sidebar_rows(&query);
+        let hidden_count = self.prefs.hidden.len();
 
         let me = self
             .backend
@@ -1033,31 +1258,9 @@ impl Snak {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Snak".into());
 
-        let heading = |label: String, cx: &mut Context<Self>| {
-            div()
-                .px_2()
-                .pt_4()
-                .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(cx.theme().muted_foreground)
-                .child(label)
-        };
-
-        let mut ix = 0;
-        let mut list = v_flex().px_2().pb_4();
-        let mut push = |list: Div, entries: &[Conversation], cx: &mut Context<Self>| {
-            let mut list = list;
-            for entry in entries {
-                list = list.child(self.render_sidebar_entry(entry, ix, cx));
-                ix += 1;
-            }
-            list
-        };
-
         let unread_count = self.unread_entries().len();
         let theme = cx.theme();
-        list = list.child(
+        let mut list = v_flex().px_2().pb_4().child(
             h_flex()
                 .id("all-unreads")
                 .mt_1()
@@ -1091,31 +1294,23 @@ impl Snak {
                     cx.notify();
                 })),
         );
-        if !starred.is_empty() {
-            list = list.child(heading("Starred".into(), cx));
-            list = push(list, &starred, cx);
+        for (ix, row) in rows.iter().enumerate() {
+            list = match row {
+                SidebarRow::Header(header) => {
+                    list.child(self.render_sidebar_header(header, ix, cx))
+                }
+                SidebarRow::Item {
+                    conversation,
+                    depth,
+                    show_group,
+                } => {
+                    list.child(self.render_sidebar_entry(conversation, ix, *depth, *show_group, cx))
+                }
+            };
         }
-        for (i, name, entries) in &sections {
-            let view = cx.entity();
-            let i = *i;
-            list = list.child(heading(name.clone(), cx).id(("section", i)).context_menu(
-                move |menu, window, _| {
-                    menu.item(PopupMenuItem::new("Delete section").on_click(
-                        window.listener_for(&view, move |this, _, _, cx| {
-                            this.update_prefs(cx, |p| p.delete_section(i))
-                        }),
-                    ))
-                },
-            ));
-            list = push(list, entries, cx);
-        }
-        list = list.child(heading("Channels".into(), cx));
-        list = push(list, &channels, cx);
-        list = list.child(heading("Direct messages".into(), cx));
-        list = push(list, &dms, cx);
 
         let theme = cx.theme();
-        let unreads_only = prefs.unreads_only;
+        let unreads_only = self.prefs.unreads_only;
         v_flex()
             .flex_none()
             .w(px(SIDEBAR_WIDTH))
@@ -1136,6 +1331,18 @@ impl Snak {
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme.sidebar_foreground)
                             .child(me),
+                    )
+                    .child(
+                        Button::new("appearance")
+                            .xsmall()
+                            .ghost()
+                            .label(self.prefs.appearance.label())
+                            .tooltip("Theme: follow macOS, light or dark")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.cycle_appearance(window, cx)
+                                }),
+                            ),
                     )
                     .child(
                         Button::new("unreads-only")
@@ -1247,7 +1454,7 @@ impl Snak {
                         h_flex()
                             .gap_2()
                             .child(div().font_weight(FontWeight::BOLD).child(title))
-                            .when_some(entry.group().map(str::to_string), |el, team| {
+                            .when_some(entry.group().map(|g| g.name.clone()), |el, team| {
                                 el.child(
                                     div()
                                         .text_sm()
@@ -1303,7 +1510,7 @@ impl Snak {
         };
         let is_channel = selected.is_channel();
         let title = selected.title.clone();
-        let subtitle = selected.group().map(str::to_string);
+        let subtitle = selected.group().map(|g| g.name.clone());
         let can_call = self
             .backend
             .as_ref()

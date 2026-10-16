@@ -8,5 +8,5 @@ pub fn matches(conversation: &Conversation, query: &str) -> bool {
     conversation.title.to_lowercase().contains(&query)
         || conversation
             .group()
-            .is_some_and(|g| g.to_lowercase().contains(&query))
+            .is_some_and(|g| g.name.to_lowercase().contains(&query))
 }

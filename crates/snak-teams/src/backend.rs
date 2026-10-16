@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, LoginPrompt, Me, Message, MessageId, Reaction,
+    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -318,7 +318,10 @@ fn channel_conversations(
             list.push(Conversation {
                 id,
                 kind: ConversationKind::Channel {
-                    group: team.display_name.clone(),
+                    group: Group {
+                        id: team.id.clone(),
+                        name: team.display_name.clone(),
+                    },
                 },
                 title: if channel.is_general == Some(true) {
                     "general".to_string()
@@ -484,7 +487,21 @@ fn display_html(html: &str) -> String {
         rest = &rest[start + len + 1..];
     }
     out.push_str(rest);
-    out
+    collapse_blank_paragraphs(&out)
+}
+
+/// Teams writes a blank line as `<p>&nbsp;</p>`; keep one, drop the rest.
+fn collapse_blank_paragraphs(html: &str) -> String {
+    const BLANKS: [&str; 3] = ["<p>&nbsp;</p>", "<p></p>", "<p><br></p>"];
+    let mut out = html.to_string();
+    for blank in BLANKS {
+        out = out.replace(blank, "<p>&nbsp;</p>");
+    }
+    let doubled = "<p>&nbsp;</p><p>&nbsp;</p>";
+    while out.contains(doubled) {
+        out = out.replace(doubled, "<p>&nbsp;</p>");
+    }
+    out.trim_end_matches("<p>&nbsp;</p>").to_string()
 }
 
 fn attribute(tag: &str, name: &str) -> Option<String> {
@@ -597,6 +614,12 @@ mod tests {
     fn images_are_replaced_and_emoji_keep_alt_text() {
         let html = r#"<p>hi <img itemtype="http://schema.skype.com/Emoji" alt="😀" src="x"> <img src="https://asm/x"></p>"#;
         assert_eq!(display_html(html), "<p>hi 😀 <i>[image]</i></p>");
+    }
+
+    #[test]
+    fn runs_of_blank_paragraphs_collapse_to_one() {
+        let html = "<p>a</p><p>&nbsp;</p><p></p><p>&nbsp;</p><p>b</p><p>&nbsp;</p>";
+        assert_eq!(display_html(html), "<p>a</p><p>&nbsp;</p><p>b</p>");
     }
 
     #[test]

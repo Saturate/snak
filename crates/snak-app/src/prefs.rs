@@ -14,6 +14,45 @@ pub struct Prefs {
     pub hidden: HashSet<String>,
     pub muted: HashSet<String>,
     pub unreads_only: bool,
+    /// Keys of collapsed sidebar groups (see [`group_key`]).
+    pub collapsed: HashSet<String>,
+    pub appearance: Appearance,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub fn next(self) -> Self {
+        match self {
+            Appearance::System => Appearance::Light,
+            Appearance::Light => Appearance::Dark,
+            Appearance::Dark => Appearance::System,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "Auto",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        }
+    }
+}
+
+/// Sidebar groups and whole teams share one key space with conversations,
+/// so a team can be filed into a section the same way a channel can.
+pub fn team_key(team_id: &str) -> String {
+    format!("team:{team_id}")
+}
+
+pub fn group_key(kind: &str, id: &str) -> String {
+    format!("{kind}:{id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +175,12 @@ impl Prefs {
         }
     }
 
+    pub fn toggle_collapsed(&mut self, key: &str) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key.to_string());
+        }
+    }
+
     pub fn toggle_muted(&mut self, key: &str) {
         if !self.muted.remove(key) {
             self.muted.insert(key.to_string());
@@ -168,6 +213,16 @@ mod tests {
         assert_eq!(prefs.placement("c1"), Placement::Default);
         prefs.toggle_hidden("c1");
         assert!(prefs.hidden.is_empty());
+    }
+
+    #[test]
+    fn teams_file_into_sections_like_conversations() {
+        let mut prefs = Prefs::default();
+        let team = team_key("t1");
+        prefs.add_section("Customers", Some(&team));
+        assert_eq!(prefs.placement(&team), Placement::Section(0));
+        prefs.remove_from_section(&team);
+        assert_eq!(prefs.placement(&team), Placement::Default);
     }
 
     #[test]

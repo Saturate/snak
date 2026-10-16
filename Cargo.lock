@@ -3789,7 +3789,7 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "make-icon"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "resvg 0.45.1",
 ]
@@ -6250,7 +6250,7 @@ dependencies = [
 
 [[package]]
 name = "snak-app"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -6268,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "snak-chat"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "chrono",
  "thiserror 2.0.21",
@@ -6277,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "snak-demo"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "chrono",
  "snak-chat",
@@ -6286,7 +6286,7 @@ dependencies = [
 
 [[package]]
 name = "snak-teams"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "chrono",
  "futures-util",

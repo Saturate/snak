@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Opens or updates the "Next Release" PR from pending changesets; merging it
+  # bumps the version, writes CHANGELOG.md and tags the release.
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.changesetter.outputs.released }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: saturate/changesetter/actions/release@v1
+        id: changesetter
+        with:
+          version-pr: true
+          version-pr-title: "Next Release"
+          token: ${{ steps.app-token.outputs.token }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Extract version
+        id: version
+        if: steps.changesetter.outputs.released == 'true'
+        env:
+          RELEASES_JSON: ${{ steps.changesetter.outputs.releases }}
+        run: |
+          VERSION=$(echo "$RELEASES_JSON" | jq -r '.[0].version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            archive: Snak-macos-aarch64.zip
+          - target: x86_64-apple-darwin
+            archive: Snak-macos-x86_64.zip
+    runs-on: macos-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.97"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Snak.app
+        run: ./scripts/bundle.sh --release --target ${{ matrix.target }}
+
+      # Not notarized: without a Developer ID, macOS needs right-click → Open
+      # the first time. An ad-hoc signature over the whole bundle still keeps
+      # Apple Silicon from refusing to launch it.
+      - name: Package
+        run: |
+          codesign --force --deep --sign - target/Snak.app
+          ditto -c -k --keepParent target/Snak.app "${{ matrix.archive }}"
+
+      - name: Upload to release
+        run: gh release upload "v${{ needs.release.outputs.version }}" "${{ matrix.archive }}" --clobber
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}

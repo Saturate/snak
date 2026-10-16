@@ -4,6 +4,7 @@ description = "Backend-neutral chat model and the trait every backend implements
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
+publish = false
 license = "GPL-3.0-or-later"
 
 [dependencies]

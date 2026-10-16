@@ -3,6 +3,7 @@ name = "snak-app"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
+publish = false
 license = "GPL-3.0-or-later"
 
 [[bin]]
@@ -16,9 +17,9 @@ html-escape = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-snak-chat = { version = "0.1.0", path = "../snak-chat" }
-snak-demo = { version = "0.1.0", path = "../snak-demo" }
-snak-teams = { version = "0.1.0", path = "../snak-teams" }
+snak-chat = { path = "../snak-chat" }
+snak-demo = { path = "../snak-demo" }
+snak-teams = { path = "../snak-teams" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }

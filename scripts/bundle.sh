@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 # Builds Snak.app in the cargo target dir: the binary, the icon from assets/icon.svg and an
 # Info.plist, signed with the dev identity when it exists (scripts/dev-cert.sh).
-# Usage: scripts/bundle.sh [--release] [--open]
+# Usage: scripts/bundle.sh [--release] [--open] [--target <triple>]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 profile=debug
 open_after=false
-for arg in "$@"; do
-  case "$arg" in
+target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --release) profile=release ;;
     --open) open_after=true ;;
+    --target) target="$2"; shift ;;
   esac
+  shift
 done
 
-if [ "$profile" = release ]; then
-  cargo build -p snak-app --release
-else
-  cargo build -p snak-app
-fi
+build_args=(-p snak-app)
+[ "$profile" = release ] && build_args+=(--release)
+[ -n "$target" ] && build_args+=(--target "$target")
+cargo build "${build_args[@]}"
 
 target_dir=$(cargo metadata --format-version 1 --no-deps \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['target_directory'])")
@@ -32,7 +34,10 @@ iconutil -c icns "$work/Snak.iconset" -o "$work/Snak.icns"
 # The target dir is build output; the bundle is rebuilt from scratch every time.
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$target_dir/$profile/snak" "$app/Contents/MacOS/snak"
+# With --target, cargo puts the binary under a per-target folder.
+binary_dir="$target_dir/$profile"
+[ -n "$target" ] && binary_dir="$target_dir/$target/$profile"
+cp "$binary_dir/snak" "$app/Contents/MacOS/snak"
 cp "$work/Snak.icns" "$app/Contents/Resources/Snak.icns"
 version=$(cargo metadata --format-version 1 --no-deps \
   | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='snak-app'))")

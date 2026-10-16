@@ -6292,6 +6292,7 @@ dependencies = [
  "futures-util",
  "html-escape",
  "keyring",
+ "libc",
  "reqwest",
  "rustls",
  "rustls-platform-verifier",

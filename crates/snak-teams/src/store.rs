@@ -68,23 +68,16 @@ pub async fn set_storage(storage: Storage) {
         if previous == storage {
             return Ok(());
         }
-        // A login on its way out stays where it is for the delete to find;
-        // only the setting moves.
-        let token = if clear_pending() {
-            None
-        } else {
-            read(&previous)
-        };
-        if let Some(token) = token {
+        if stored_login_signed_out() {
+            // Its delete may only look in the new place, so remove it here.
+            delete(&previous);
+        } else if let Some(token) = read(&previous) {
             write(&storage, &token)?;
-            // 1Password keeps its item; deleting there archives it, which is
-            // surprising for something the user may have looked at.
-            if !matches!(previous, Storage::OnePassword { .. }) {
-                delete(&previous);
-            }
+            // A copy left behind would survive a later sign-out, which only
+            // looks where the setting points.
+            delete(&previous);
             state().last_op_write = Some(Instant::now());
         }
-        // Under the lock, so a waiting delete looks in the new place.
         state().storage = storage;
         Ok::<(), CoreError>(())
     })
@@ -111,16 +104,16 @@ pub struct StoredLogin {
 pub async fn load() -> Option<StoredLogin> {
     // A sign-out whose delete hasn't run yet: the stored login is on its way
     // out and must not be read back in by a quick "Try again".
-    if clear_pending() {
+    if stored_login_signed_out() {
         return None;
     }
-    let storage = state().storage.clone();
     tokio::task::spawn_blocking(move || {
         let _ops = exclusive();
         let epoch = epoch();
-        if clear_pending() {
+        if stored_login_signed_out() {
             return None;
         }
+        let storage = state().storage.clone();
         let token = read(&storage)?;
         // Sign-out doesn't wait for the lock, so it may have happened while
         // the read sat on a prompt.
@@ -152,21 +145,15 @@ fn clear_pending() -> bool {
     CLEARED.load(SeqCst) != EPOCH.load(SeqCst)
 }
 
+/// A sign-out's delete hasn't run yet, and no login has been saved since the
+/// latest sign-out: whatever is stored belongs to a signed-out session.
+fn stored_login_signed_out() -> bool {
+    clear_pending() && WRITTEN.load(SeqCst) < EPOCH.load(SeqCst)
+}
+
 /// `fresh` marks a new login, which skips the 1Password write throttle.
 /// Nothing is written if a sign-out happened since `epoch`.
 pub(crate) async fn save(token: String, fresh: bool, epoch: u64) -> Result<()> {
-    let storage = {
-        let state = state();
-        let throttled = matches!(state.storage, Storage::OnePassword { .. })
-            && !fresh
-            && state
-                .last_op_write
-                .is_some_and(|at| at.elapsed() < OP_WRITE_INTERVAL);
-        if throttled {
-            return Ok(());
-        }
-        state.storage.clone()
-    };
     let written = tokio::task::spawn_blocking(move || {
         let _ops = exclusive();
         // Checked under the lock, so it can't race the delete.
@@ -174,6 +161,19 @@ pub(crate) async fn save(token: String, fresh: bool, epoch: u64) -> Result<()> {
             tracing::debug!("dropping a token save from a signed-out session");
             return Ok(false);
         }
+        // Also under the lock: a move may have finished while this waited.
+        let storage = {
+            let state = state();
+            let throttled = matches!(state.storage, Storage::OnePassword { .. })
+                && !fresh
+                && state
+                    .last_op_write
+                    .is_some_and(|at| at.elapsed() < OP_WRITE_INTERVAL);
+            if throttled {
+                return Ok(false);
+            }
+            state.storage.clone()
+        };
         write(&storage, &token)?;
         WRITTEN.fetch_max(epoch, SeqCst);
         Ok(true)
@@ -212,24 +212,21 @@ fn clear(issued: u64) {
     }
     let _ops = exclusive();
     let _cleared = MarkCleared(issued);
-    if WRITTEN.load(SeqCst) >= issued {
+    // Bound first: a temporary would keep STATE locked through the `op`
+    // calls, which can sit on a Touch ID prompt.
+    let current = state().storage.clone();
+    // A login saved since this sign-out went to the current storage (saves
+    // and moves both happen under the lock), so only that place keeps it.
+    let keep = (WRITTEN.load(SeqCst) >= issued).then_some(&current);
+    if keep.is_some() {
         tracing::info!("a new login arrived before the sign-out cleanup; keeping it");
-    } else {
-        delete_everywhere();
     }
-}
-
-/// Every place Snak might have put the login. Call with the store lock held.
-fn delete_everywhere() {
-    delete(&Storage::Keychain);
-    delete(&Storage::File);
-    // Bound first: a temporary in the `if let` would keep STATE locked through
-    // the `op` calls below, which can sit on a Touch ID prompt.
-    let storage = state().storage.clone();
-    if let Storage::OnePassword { account } = storage {
-        for id in op_item_ids(&account) {
-            let _ = op(&account, &["item", "delete", &id, "--archive"], None);
-        }
+    let mut places = vec![Storage::Keychain, Storage::File];
+    if matches!(current, Storage::OnePassword { .. }) {
+        places.push(current.clone());
+    }
+    for place in places.iter().filter(|place| Some(*place) != keep) {
+        delete(place);
     }
 }
 
@@ -348,7 +345,13 @@ fn delete(storage: &Storage) {
                 let _ = std::fs::remove_file(path);
             }
         }
-        Storage::OnePassword { .. } => {}
+        // Archived rather than deleted, so it can still be recovered from
+        // 1Password's archive.
+        Storage::OnePassword { account } => {
+            for id in op_item_ids(account) {
+                let _ = op(account, &["item", "delete", &id, "--archive"], None);
+            }
+        }
     }
 }
 
@@ -510,11 +513,26 @@ mod tests {
                 .success()
         );
         let loading = tokio::spawn(load());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A non-blocking open of a FIFO only succeeds once a reader has it
+        // open, so this waits for the read to be under way with the lock held.
+        let mut writer = None;
+        for _ in 0..500 {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(fifo) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&file)
+            {
+                writer = Some(fifo);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut writer = writer.expect("load never opened the token file");
         sign_out();
-        let writer = std::thread::spawn(move || std::fs::write(file, "OLD").unwrap());
+        writer.write_all(b"OLD").unwrap();
+        drop(writer);
         assert!(loading.await.unwrap().is_none());
-        writer.join().unwrap();
         wait_cleared();
         assert_eq!(stored(), None);
     }

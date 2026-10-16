@@ -1,4 +1,5 @@
 mod app;
+mod code_blocks;
 mod log;
 mod palette;
 mod prefs;
@@ -66,11 +67,46 @@ fn connector() -> Arc<dyn Connector> {
     }
 }
 
+// Lucide icons Snak uses beyond GPUI Kit's default set.
+gpui_kit::assets::icon_assets!(ExtraIcons, [Users]);
+
+/// GPUI Kit's default icons, then [`ExtraIcons`].
+struct SnakAssets;
+
+impl AssetSource for SnakAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        // The default source reports a path it doesn't embed as an error, not
+        // as None, so either way falls through to the extras.
+        match gpui_kit::assets::Assets.load(path) {
+            Ok(Some(bytes)) => Ok(Some(bytes)),
+            _ => ExtraIcons.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path).unwrap_or_default();
+        paths.extend(ExtraIcons.list(path)?);
+        Ok(paths)
+    }
+}
+
+/// The first window's size; `SNAK_WINDOW_SIZE=1440x900` overrides it, which
+/// `scripts/screenshot.sh` uses for a consistent capture.
+fn window_size() -> Size<Pixels> {
+    std::env::var("SNAK_WINDOW_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some(size(px(w.parse().ok()?), px(h.parse().ok()?)))
+        })
+        .unwrap_or(size(px(1280.), px(820.)))
+}
+
 fn main() {
     log::init();
     let connector = connector();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(SnakAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             theme::install(cx);
@@ -107,7 +143,7 @@ fn main() {
 
             // Snak draws its own title bar, like Zed, with the traffic lights inset.
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+                window_bounds: Some(WindowBounds::centered(window_size(), cx)),
                 window_min_size: Some(size(px(720.), px(480.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Snak".into()),

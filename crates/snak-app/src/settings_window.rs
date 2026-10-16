@@ -203,6 +203,17 @@ impl SettingsWindow {
                         "Show which team a channel belongs to when it sits in Starred or \
                          one of your sections.",
                     ),
+                    SettingItem::new(
+                        "Unread dot",
+                        SettingField::switch(
+                            |cx: &App| Settings::get(cx).unread_dot,
+                            |value: bool, cx: &mut App| {
+                                Settings::update(cx, |s| s.unread_dot = value)
+                            },
+                        )
+                        .default_value(defaults.unread_dot),
+                    )
+                    .description("Mark unread conversations with a dot as well as a bold name."),
                 ])),
             SettingPage::new("Account")
                 .icon(Icon::new(IconName::CircleUser))

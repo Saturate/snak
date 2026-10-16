@@ -12,7 +12,28 @@ path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4"
-gpui-kit.workspace = true
+# Grammars for highlighting code blocks in messages; the common chat languages
+# rather than all of them, since each one adds to the binary.
+gpui-kit = { workspace = true, features = [
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-csharp",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-kotlin",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-swift",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
 html-escape = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 serde = { version = "1", features = ["derive"] }

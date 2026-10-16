@@ -80,6 +80,8 @@ pub struct Settings {
     pub ui_font_size: f64,
     pub dm_limit: f64,
     pub show_team_names: bool,
+    /// A dot after unread conversations, on top of the bold name.
+    pub unread_dot: bool,
     pub autoplay_gifs: bool,
     pub login_storage: LoginStorage,
     /// Sign-in address of the 1Password account to use, e.g. my.1password.eu.
@@ -129,6 +131,7 @@ impl Default for Settings {
             ui_font_size: 14.,
             dm_limit: 40.,
             show_team_names: true,
+            unread_dot: true,
             autoplay_gifs: true,
             login_storage: LoginStorage::Keychain,
             onepassword_account: None,

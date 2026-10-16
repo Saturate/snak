@@ -345,9 +345,26 @@ fn convert(theme: &Value, with_syntax: bool) -> Value {
     });
     // GPUI Kit reads Zed's `style` section directly for code highlighting.
     if with_syntax {
-        config["highlight"] = style.clone();
+        let mut highlight = style.clone();
+        hash_bare_hex(&mut highlight);
+        config["highlight"] = highlight;
     }
     json!({ "name": theme["name"], "themes": [config] })
+}
+
+/// Some bundled Zed themes write a color without its `#` (Dracula's
+/// `acb0be30`), which Zed accepts and GPUI Kit's highlight theme rejects.
+fn hash_bare_hex(value: &mut Value) {
+    match value {
+        Value::String(s)
+            if matches!(s.len(), 6 | 8) && s.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            s.insert(0, '#');
+        }
+        Value::Object(map) => map.values_mut().for_each(hash_bare_hex),
+        Value::Array(items) => items.iter_mut().for_each(hash_bare_hex),
+        _ => {}
+    }
 }
 
 #[cfg(test)]

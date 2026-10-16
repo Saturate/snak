@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _,
     avatar::Avatar,
     button::{Button, ButtonVariants as _},
     command::CommandState,
@@ -22,6 +22,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+use crate::code_blocks;
 use snak_chat::{
     Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, Group, ImageRef,
     LoginPrompt, Message, MessageId,
@@ -138,6 +140,9 @@ pub struct Snak {
 
     selected: Option<ConversationId>,
     showing_unreads: bool,
+    /// A conversation to open once the list has loaded (`SNAK_OPEN`), so
+    /// `scripts/screenshot.sh` can start on a channel without clicking.
+    open_on_load: Option<ConversationId>,
     rows: Rc<Vec<Message>>,
     scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
@@ -229,6 +234,7 @@ impl Snak {
             section_name: cx.new(|cx| InputState::new(window, cx).placeholder("Section name")),
             selected: None,
             showing_unreads: true,
+            open_on_load: std::env::var("SNAK_OPEN").ok().map(ConversationId),
             rows: Rc::default(),
             scroller,
             composer,
@@ -1403,7 +1409,11 @@ fn render_images(
                                 .text_color(white())
                                 .text_xs()
                                 .font_weight(FontWeight::BOLD)
-                                .child("▶ GIF"),
+                                .flex()
+                                .items_center()
+                                .gap_0p5()
+                                .child(Icon::new(IconName::Play).xsmall())
+                                .child("GIF"),
                         )
                     })
                     .on_click(move |_, window, _| {
@@ -1430,6 +1440,34 @@ fn render_images(
     Some(list.into_any_element())
 }
 
+fn message_text(view: TextView, dark: bool) -> TextView {
+    // Message HTML is written by other people; a click must not open file:,
+    // smb: or some app's custom scheme.
+    view.on_link_click(|url, _, _, cx| {
+        // Mentions are drawn as links but go nowhere yet.
+        if url.starts_with("snak-mention:") {
+            return;
+        }
+        if is_safe_link(url) {
+            cx.open_url(url);
+        } else {
+            tracing::warn!(scheme = url.split(':').next().unwrap_or(""), "blocked link");
+        }
+    })
+    .style(TextViewStyle {
+        // Chat messages are mostly one-line paragraphs; document spacing
+        // makes every line look double-spaced.
+        paragraph_gap: rems(0.2),
+        highlight_theme: if dark {
+            HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
+        },
+        ..TextViewStyle::default()
+    })
+    .selectable(true)
+}
+
 fn render_row(
     row: &Message,
     previous: Option<&Message>,
@@ -1443,57 +1481,47 @@ fn render_row(
     let continues = previous.is_some_and(|p| row.continues(p));
 
     let body = match &row.body {
-        Body::Html(html) => div()
-            .text_sm()
-            .text_color(theme.foreground)
-            .child(
-                TextView::html(
-                    ElementId::Name(format!("msg-{}", row.id.0).into()),
-                    SharedString::from(html.clone()),
-                )
-                // Chat messages are mostly one-line paragraphs; document spacing
-                // makes every line look double-spaced.
-                // Message HTML is written by other people; a click must not
-                // open file:, smb: or some app's custom scheme.
-                .on_link_click(|url, _, _, cx| {
-                    // Mentions are drawn as links but go nowhere yet.
-                    if url.starts_with("snak-mention:") {
-                        return;
+        Body::Html(html) => {
+            let segments = code_blocks::split(html);
+            let dark = theme.is_dark();
+            v_flex()
+                .gap_1()
+                .text_sm()
+                .text_color(theme.foreground)
+                .children(segments.into_iter().enumerate().map(|(i, segment)| {
+                    let id = ElementId::Name(format!("msg-{}-{i}", row.id.0).into());
+                    match segment {
+                        code_blocks::Segment::Html(html) => {
+                            message_text(TextView::html(id, SharedString::from(html)), dark)
+                        }
+                        code_blocks::Segment::Code { lang, code } => message_text(
+                            TextView::markdown(
+                                id,
+                                SharedString::from(code_blocks::fenced(lang.as_deref(), &code)),
+                            ),
+                            dark,
+                        ),
                     }
-                    if is_safe_link(url) {
-                        cx.open_url(url);
-                    } else {
-                        tracing::warn!(
-                            scheme = url.split(':').next().unwrap_or(""),
-                            "blocked link"
-                        );
-                    }
-                })
-                .style(TextViewStyle {
-                    paragraph_gap: rems(0.2),
-                    highlight_theme: if theme.is_dark() {
-                        HighlightTheme::default_dark()
-                    } else {
-                        HighlightTheme::default_light()
-                    },
-                    ..TextViewStyle::default()
-                })
-                .selectable(true),
-            )
-            .into_any_element(),
+                }))
+                .into_any_element()
+        }
         Body::Text(text) => div()
             .text_sm()
             .text_color(theme.foreground)
             .child(text.clone())
             .into_any_element(),
-        Body::Deleted | Body::Event(_) => div()
+        Body::Deleted => div()
             .text_sm()
             .italic()
             .text_color(theme.muted_foreground)
-            .child(match &row.body {
-                Body::Event(text) => text.clone(),
-                _ => "This message was deleted".to_string(),
-            })
+            .child("This message was deleted")
+            .into_any_element(),
+        Body::Event(text) => h_flex()
+            .gap_1p5()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child(Icon::new(IconName::Info).xsmall())
+            .child(text.clone())
             .into_any_element(),
     };
 
@@ -1700,7 +1728,15 @@ impl Snak {
         let hidden = self.prefs.hidden.contains(&key);
         // Muted entries never shout; that is the point of muting.
         let unread = entry.unread && !muted;
-        let prefix = if entry.is_channel() { "#" } else { "•" };
+        let prefix = if entry.is_channel() {
+            div().child("#").into_any_element()
+        } else if matches!(entry.kind, snak_chat::ConversationKind::Group) {
+            Icon::new(gpui_kit::assets::IconName::Users)
+                .xsmall()
+                .into_any_element()
+        } else {
+            Icon::new(IconName::User).xsmall().into_any_element()
+        };
         let clicked = entry.id.clone();
         let view = cx.entity();
         let placement = self.prefs.placement(&key);
@@ -1764,6 +1800,15 @@ impl Snak {
                     )
                 },
             )
+            .when(unread && !active && Settings::get(cx).unread_dot, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .size(px(7.))
+                        .rounded_full()
+                        .bg(theme.primary),
+                )
+            })
             .on_click(
                 cx.listener(move |this, _, window, cx| this.select(clicked.clone(), window, cx)),
             )
@@ -2035,18 +2080,16 @@ impl Snak {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.muted_foreground)
             .hover(|s| s.text_color(theme.sidebar_foreground))
+            .child(div().min_w_0().truncate().child(header.label.clone()))
             .child(
-                div()
-                    .flex_none()
-                    .w(px(10.))
-                    .child(if header.collapsed { "▸" } else { "▾" }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(header.label.clone()),
+                div().flex_none().child(
+                    Icon::new(if header.collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .xsmall(),
+                ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.update_prefs(cx, |p| p.toggle_collapsed(&key))
@@ -2237,6 +2280,13 @@ impl Snak {
                 &gif_toggles,
                 cx,
             )
+        })
+        // The scroller puts 2rem under every row, for chat bubbles; rows here
+        // carry their own top padding, Slack style, so the extra gap goes.
+        .with_row_style({
+            let mut style = StyleRefinement::default();
+            style.padding.bottom = Some(px(0.).into());
+            style
         })
     }
 
@@ -2587,6 +2637,11 @@ impl Snak {
 
 impl Render for Snak {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.conversations.is_empty()
+            && let Some(id) = self.open_on_load.take()
+        {
+            cx.defer_in(window, move |this, window, cx| this.select(id, window, cx));
+        }
         // Changes queued by code that had no window at hand.
         if std::mem::take(&mut self.reset_composer) {
             let composer = self.composer.clone();

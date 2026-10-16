@@ -102,19 +102,25 @@ pub async fn set_storage(storage: Storage) -> Result<()> {
                     remember_left_behind(&previous);
                 }
             }
+            clear_if_left_behind(&storage);
         } else if let Some(token) = read(&previous)? {
             write(&storage, &token)?;
             if let Err(e) = delete(&previous) {
                 // Back to one copy, where the setting still points.
-                if let Err(undo) = delete(&storage) {
-                    tracing::warn!(error = %undo, "login left in both storages");
-                    remember_left_behind(&storage);
+                match delete(&storage) {
+                    Ok(()) => state().left_behind.retain(|place| *place != storage),
+                    Err(undo) => {
+                        tracing::warn!(error = %undo, "login left in both storages");
+                        remember_left_behind(&storage);
+                    }
                 }
                 return Err(e);
             }
             let mut state = state();
             state.last_op_write = Some(Instant::now());
             state.left_behind.retain(|place| *place != storage);
+        } else {
+            clear_if_left_behind(&storage);
         }
         state().storage = Some(storage);
         Ok(())
@@ -220,7 +226,7 @@ pub(crate) async fn save(token: String, fresh: bool, epoch: u64) -> Result<()> {
         Ok(true)
     })
     .await
-    .map_err(|e| CoreError::Keychain(e.to_string()))?;
+    .map_err(|e| CoreError::TaskFailed(e.to_string()))?;
     if matches!(written, Ok(true)) {
         state().last_op_write = Some(Instant::now());
     }
@@ -279,6 +285,22 @@ fn clear(issued: u64) {
                 tracing::warn!(error = %e, "sign-out left a login behind");
                 remember_left_behind(place);
             }
+        }
+    }
+}
+
+/// Switching to a place a sign-out couldn't clear, with nothing to carry
+/// over: clear it now, since the list doesn't survive a restart and the
+/// next launch would read it.
+fn clear_if_left_behind(place: &Storage) {
+    let left = state().left_behind.contains(place);
+    if !left {
+        return;
+    }
+    match delete(place) {
+        Ok(()) => state().left_behind.retain(|left| left != place),
+        Err(e) => {
+            tracing::warn!(error = %e, "switched to a place still holding a signed-out login")
         }
     }
 }
@@ -534,7 +556,7 @@ mod tests {
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // A sign-out thread from the last test may still be running; a test
         // that bumped the epoch by hand and then failed never clears.
-        for _ in 0..100 {
+        for _ in 0..500 {
             if !clear_pending() {
                 break;
             }

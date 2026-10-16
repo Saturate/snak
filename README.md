@@ -18,7 +18,7 @@ To get a proper app with the Dock icon, build the bundle:
 ./scripts/bundle.sh --release --open  # optimised
 ```
 
-The icon is `assets/icon.svg`; the bundle script renders it with `tools/make-icon`. Snak needs Rust 1.89 or newer and macOS 13 or newer.
+The icon is `assets/icon.svg`; the bundle script renders it with `tools/make-icon`. Snak needs Rust 1.95 or newer and macOS 13 or newer.
 
 Sign in with the device code shown in the window. Where the login is kept is a setting (⌘, → Account): the macOS Keychain (default), 1Password via the `op` CLI, or a plain 0600 file. Logs go to `~/Library/Logs/Snak/snak.log`; set `SNAK_LOG=debug` for more.
 

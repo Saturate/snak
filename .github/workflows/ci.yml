@@ -54,7 +54,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.89"
+          # The declared rust-version. GPUI's crates don't declare theirs and
+          # use std APIs stabilised in 1.95, so this is the real floor.
+          toolchain: "1.95"
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 

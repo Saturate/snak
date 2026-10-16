@@ -266,6 +266,8 @@ impl Snak {
 
     fn restore(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Starting;
+        // This replaces any sign-in task, which then never clears the flag itself.
+        self.login_in_flight = false;
         let connector = self.connector.clone();
         // Storage first, so the saved login is read from wherever the user keeps it.
         let storage = Settings::get(cx).credential_storage();
@@ -375,7 +377,12 @@ impl Snak {
         // Composers need a window to change, so they're emptied on the next render.
         self.reset_composer = true;
         self.reset_thread_composer = true;
-        self.connector.sign_out();
+        // Clearing a 1Password item shells out to `op`, which can wait on
+        // Touch ID; keep that off the UI thread.
+        let connector = self.connector.clone();
+        cx.background_executor()
+            .spawn(async move { connector.sign_out() })
+            .detach();
         self.backend = None;
         self.events_task = None;
         self.poll_task = None;
@@ -927,6 +934,9 @@ impl Snak {
 
     fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.showing_unreads = true;
+        if self.thread_root.is_some() {
+            self.put_away_thread_draft(window, cx);
+        }
         self.thread_root = None;
         window.focus(&self.focus, cx);
         cx.notify();
@@ -968,10 +978,18 @@ impl Snak {
             pending: true,
         };
         let local_id = local.id.clone();
+        let seen = self
+            .rows
+            .iter()
+            .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
+            .filter(|m| !m.pending)
+            .map(|m| m.id.clone())
+            .collect();
         self.pending.push(Pending {
             conversation: id.clone(),
             reply_to: reply_to.clone(),
             message: local,
+            seen,
         });
         let rows = (*self.rows).clone();
         self.set_rows(rows, cx);
@@ -1075,6 +1093,9 @@ struct Pending {
     conversation: ConversationId,
     reply_to: Option<MessageId>,
     message: Message,
+    /// Messages already shown when this was sent; none of them can be its copy,
+    /// however close in time, so sending the same text twice works.
+    seen: std::collections::HashSet<MessageId>,
 }
 
 /// Whether the service's copy of a locally sent message is in `rows`:
@@ -1092,8 +1113,11 @@ fn arrived(rows: &[Message], pending: &Pending) -> bool {
             .collect(),
     };
     let want = normalise(text);
-    candidates.into_iter().filter(|m| !m.pending).any(|m| {
-        m.author_id == pending.message.author_id
+    candidates
+        .into_iter()
+        .filter(|m| !m.pending && !pending.seen.contains(&m.id))
+        .any(|m| {
+            m.author_id == pending.message.author_id
             // An older copy of the same text is an earlier message, not this
             // one; a little slack covers clock skew against the server.
             && match (m.sent_at, pending.message.sent_at) {
@@ -1105,7 +1129,7 @@ fn arrived(rows: &[Message], pending: &Pending) -> bool {
                 Body::Text(t) => normalise(t) == want,
                 _ => false,
             }
-    })
+        })
 }
 
 /// A refetch returns the newest page only. When a new message pushes the
@@ -2528,7 +2552,15 @@ impl Render for Snak {
                 composer.update(cx, |state, cx| state.set_value("", window, cx))
             });
         }
-        if std::mem::take(&mut self.refocus_main) {
+        // Only rescue focus if it was in the thread composer that just went
+        // away; anywhere else, the user is typing and it stays put.
+        if std::mem::take(&mut self.refocus_main)
+            && self
+                .thread_composer
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
             let focus = self.focus.clone();
             window.defer(cx, move |window, cx| window.focus(&focus, cx));
         }
@@ -2640,10 +2672,12 @@ mod tests {
             conversation: ConversationId("c".into()),
             reply_to: None,
             message: message("pending-2", "me", Body::Text("ok".into()), true),
+            seen: ["1".to_string()].into_iter().map(MessageId).collect(),
         };
+        // Seconds old, but already on screen when the second "ok" was sent.
         let earlier = at(
             message("1", "me", Body::Html("<p>ok</p>".into()), false),
-            60,
+            10,
         );
         assert!(!arrived(&[earlier], &local));
         let just_now = at(message("2", "me", Body::Html("<p>ok</p>".into()), false), 0);
@@ -2719,6 +2753,7 @@ mod tests {
             conversation: ConversationId("c".into()),
             reply_to: Some(MessageId("root".into())),
             message: message("pending-1", "me", Body::Text("a & b\nnext".into()), true),
+            seen: Default::default(),
         };
         let mut root = message("root", "other", Body::Text("post".into()), false);
         assert!(!arrived(std::slice::from_ref(&root), &local));

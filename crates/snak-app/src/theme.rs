@@ -69,14 +69,21 @@ pub fn install(cx: &mut App) {
 }
 
 /// Makes these the themes used for dark and light mode; unknown names are ignored.
+/// Unknown names (a theme that was uninstalled) fall back to Zed's choice,
+/// then to the bundled One themes, never to GPUI Kit's own default.
 pub fn select(dark: &str, light: &str, cx: &mut App) {
     let themes = ThemeRegistry::global(cx).themes().clone();
+    let (zed_dark, zed_light) = cx
+        .try_global::<InstalledThemes>()
+        .map(|i| (i.zed_dark.clone(), i.zed_light.clone()))
+        .unwrap_or_default();
+    let find = |names: [&str; 3]| names.into_iter().find_map(|n| themes.get(n).cloned());
     let theme = Theme::global_mut(cx);
-    if let Some(dark) = themes.get(dark) {
-        theme.dark_theme = dark.clone();
+    if let Some(found) = find([dark, &zed_dark, DEFAULT_DARK]) {
+        theme.dark_theme = found;
     }
-    if let Some(light) = themes.get(light) {
-        theme.light_theme = light.clone();
+    if let Some(found) = find([light, &zed_light, DEFAULT_LIGHT]) {
+        theme.light_theme = found;
     }
 }
 
@@ -181,10 +188,39 @@ fn strip_jsonc(text: &str) -> String {
                     previous = c;
                 }
             }
-            (',', _) => {
-                // Drop the comma when only whitespace separates it from a closing bracket.
-                let rest: String = chars.clone().take_while(|c| c.is_whitespace()).collect();
-                let after = chars.clone().nth(rest.chars().count());
+            _ => out.push(c),
+        }
+    }
+    // Commas go in a second pass over comment-free text, so a comment between
+    // a trailing comma and the closing bracket can't hide it.
+    drop_trailing_commas(&out)
+}
+
+fn drop_trailing_commas(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                }
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            ',' => {
+                let after = chars.clone().find(|c| !c.is_whitespace());
                 if !matches!(after, Some('}') | Some(']')) {
                     out.push(c);
                 }
@@ -330,6 +366,13 @@ mod tests {
         assert_eq!(parsed["url"], "https://x//y");
         assert_eq!(parsed["theme"]["dark"], "One Dark");
         assert_eq!(parsed["list"], json!([1, 2]));
+    }
+
+    #[test]
+    fn trailing_comma_before_a_comment_is_dropped() {
+        let text = "{\n  \"dark\": \"Gruvbox Dark\", // favourite\n  /* x */\n}";
+        let parsed: Value = serde_json::from_str(&strip_jsonc(text)).expect("valid json");
+        assert_eq!(parsed["dark"], "Gruvbox Dark");
     }
 
     #[test]

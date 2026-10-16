@@ -20,17 +20,19 @@ else
   cargo build -p snak-app
 fi
 
-app=target/Snak.app
+target_dir=$(cargo metadata --format-version 1 --no-deps \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['target_directory'])")
+app="$target_dir/Snak.app"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 cargo run -q -p make-icon -- assets/icon.svg "$work/Snak.iconset"
 iconutil -c icns "$work/Snak.iconset" -o "$work/Snak.icns"
 
-# target/ is build output; the bundle is rebuilt from scratch every time.
+# The target dir is build output; the bundle is rebuilt from scratch every time.
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "target/$profile/snak" "$app/Contents/MacOS/snak"
+cp "$target_dir/$profile/snak" "$app/Contents/MacOS/snak"
 cp "$work/Snak.icns" "$app/Contents/Resources/Snak.icns"
 version=$(cargo metadata --format-version 1 --no-deps \
   | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='snak-app'))")

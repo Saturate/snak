@@ -21,7 +21,16 @@ fn open() -> Option<File> {
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
         let _ = std::fs::rename(&path, path.with_extension("log.1"));
     }
-    OpenOptions::new().create(true).append(true).open(path).ok()
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    // Owner-only: error lines can include request paths and Microsoft's error text.
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Some(file)
 }
 
 /// Level comes from SNAK_LOG (e.g. `debug`, `snak_teams=trace`), default info.

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Checks the Teams endpoints against a real account using the stored login.
 //! Prints only counts and shapes, never message text, names or tokens.
 //!
@@ -13,8 +17,9 @@ use snak_teams::TeamsConnector;
 async fn main() {
     let connector = TeamsConnector::new();
     // Use the same place the app keeps the login: SNAK_STORE=file|keychain.
+    // Without moving: a probe must never relocate the app's login.
     if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
-        snak_teams::store::set_storage(snak_teams::store::Storage::File).await;
+        snak_teams::store::use_storage_without_moving(snak_teams::store::Storage::File);
     }
     let backend: Arc<dyn ChatBackend> = match connector.restore().await {
         Ok(Some(backend)) => backend,

@@ -102,7 +102,7 @@ pub async fn start_device_login(http: &reqwest::Client) -> Result<DeviceCode> {
 pub async fn complete_device_login(http: &reqwest::Client, code: &DeviceCode) -> Result<String> {
     let url = format!("https://login.microsoftonline.com/{TENANT}/oauth2/token");
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
-    let interval = Duration::from_secs(code.interval.max(1));
+    let mut interval = Duration::from_secs(code.interval.max(1));
 
     while Instant::now() < deadline {
         tokio::time::sleep(interval).await;
@@ -131,9 +131,14 @@ pub async fn complete_device_login(http: &reqwest::Client, code: &DeviceCode) ->
             return Ok(refresh);
         }
 
-        let pending = serde_json::from_str::<TokenError>(&body)
-            .map(|e| e.error == "authorization_pending" || e.error == "slow_down")
-            .unwrap_or(false);
+        let error = serde_json::from_str::<TokenError>(&body)
+            .map(|e| e.error)
+            .unwrap_or_default();
+        // RFC 8628: on slow_down, wait 5 seconds longer from now on.
+        if error == "slow_down" {
+            interval += Duration::from_secs(5);
+        }
+        let pending = error == "authorization_pending" || error == "slow_down";
         if !pending {
             return Err(CoreError::Http {
                 status: status.as_u16(),

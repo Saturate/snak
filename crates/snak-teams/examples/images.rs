@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Lists the kinds of <img> tags in recent messages: itemtype and host only.
 //!
 //! SNAK_STORE=file cargo run -p snak-teams --example images
@@ -8,8 +12,9 @@ use snak_teams::{TeamsClient, store};
 
 #[tokio::main]
 async fn main() {
+    // Without moving: a probe must never relocate the app's login.
     if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
-        store::set_storage(store::Storage::File).await;
+        store::use_storage_without_moving(store::Storage::File);
     }
     let Some(token) = store::load().await else {
         return println!("no stored login");

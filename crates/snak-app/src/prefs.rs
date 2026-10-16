@@ -42,6 +42,22 @@ pub enum Placement {
     Default,
 }
 
+/// Reads a JSON settings file. One that exists but won't parse is renamed to
+/// `.broken` rather than silently overwritten by the next save, which would
+/// lose the user's sections or storage choice.
+pub fn read_json_or_set_aside<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
+    let bytes = std::fs::read(path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            let aside = path.with_extension("json.broken");
+            tracing::warn!(path = %path.display(), error = %e, "unreadable settings file set aside");
+            let _ = std::fs::rename(path, aside);
+            None
+        }
+    }
+}
+
 impl Prefs {
     /// One file per backend, so the demo workspace never touches real settings.
     fn path(profile: &str) -> Option<PathBuf> {
@@ -63,8 +79,7 @@ impl Prefs {
 
     pub fn load(profile: &str) -> Self {
         Self::path(profile)
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|path| read_json_or_set_aside(&path))
             .unwrap_or_default()
     }
 
@@ -122,7 +137,8 @@ impl Prefs {
 
     pub fn add_section(&mut self, name: &str, first_member: Option<&str>) {
         let name = name.trim();
-        if name.is_empty() {
+        // Names double as collapse keys, so two sections can't share one.
+        if name.is_empty() || self.sections.iter().any(|s| s.name == name) {
             return;
         }
         self.sections.push(Section {

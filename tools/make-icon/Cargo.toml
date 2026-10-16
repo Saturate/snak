@@ -3,6 +3,7 @@ name = "make-icon"
 description = "Renders assets/icon.svg into a macOS .iconset. Dev tool, not shipped."
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license = "GPL-3.0-or-later"
 publish = false
 

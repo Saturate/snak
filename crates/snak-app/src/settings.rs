@@ -150,13 +150,27 @@ impl Settings {
 
     pub fn load() -> Self {
         let mut settings: Settings = Self::path()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|path| crate::prefs::read_json_or_set_aside(&path))
             .unwrap_or_default();
         if settings.insecure_credentials {
             settings.login_storage = LoginStorage::File;
         }
+        settings.sanitise();
         settings
+    }
+
+    /// The file can be edited by hand; keep values in the ranges the UI allows.
+    fn sanitise(&mut self) {
+        let defaults = Settings::default();
+        let clamp = |value: f64, min: f64, max: f64, default: f64| {
+            if value.is_finite() {
+                value.clamp(min, max)
+            } else {
+                default
+            }
+        };
+        self.ui_font_size = clamp(self.ui_font_size, 11., 22., defaults.ui_font_size);
+        self.dm_limit = clamp(self.dm_limit, 5., 500., defaults.dm_limit);
     }
 
     /// The backend-neutral form; 1Password without an account falls back to the Keychain.

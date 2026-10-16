@@ -48,28 +48,43 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 }
 
 /// Switches storage, moving an existing login across. Call before restoring a session.
+/// The switch only takes effect once the login is safely in the new place,
+/// so a failed write leaves it readable where it was.
 pub async fn set_storage(storage: Storage) {
-    let previous = {
-        let mut state = state();
-        std::mem::replace(&mut state.storage, storage.clone())
-    };
+    let previous = state().storage.clone();
     if previous == storage {
         return;
     }
+    let target = storage.clone();
     let moved = tokio::task::spawn_blocking(move || {
-        let token = read(&previous)?;
-        write(&storage, &token).ok()?;
+        let Some(token) = read(&previous) else {
+            return Ok(false);
+        };
+        write(&target, &token)?;
         // 1Password keeps its item; deleting there archives it, which is
         // surprising for something the user may have looked at.
         if !matches!(previous, Storage::OnePassword { .. }) {
             delete(&previous);
         }
-        Some(())
+        Ok::<bool, CoreError>(true)
     })
     .await;
-    if matches!(moved, Ok(Some(()))) {
-        state().last_op_write = Some(Instant::now());
+    match moved {
+        Ok(Ok(moved)) => {
+            let mut state = state();
+            state.storage = storage;
+            if moved {
+                state.last_op_write = Some(Instant::now());
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "login not moved; keeping the old storage"),
+        Err(e) => tracing::warn!(error = %e, "login move task failed"),
     }
+}
+
+/// Points at a storage without moving anything, for tools that only read.
+pub fn use_storage_without_moving(storage: Storage) {
+    state().storage = storage;
 }
 
 pub async fn load() -> Option<String> {
@@ -161,9 +176,11 @@ fn write(storage: &Storage, token: &str) -> Result<()> {
                 }],
             })
             .to_string();
+            // `credential` is the field our template creates; `title` is not a
+            // field, so asking for it always failed and created duplicates.
             let exists = op(
                 account,
-                &["item", "get", OP_ITEM, "--fields", "label=title"],
+                &["item", "get", OP_ITEM, "--fields", "label=credential"],
                 None,
             )
             .is_ok();
@@ -210,6 +227,8 @@ fn write_file(token: &str) -> Result<()> {
         std::fs::create_dir_all(dir).map_err(io_error)?;
     }
     let tmp = path.with_extension("tmp");
+    // A leftover from a crash keeps its old mode through `create`, so start fresh.
+    let _ = std::fs::remove_file(&tmp);
     // Created owner-only from the start, so the token is never briefly world-readable.
     let mut file = std::fs::OpenOptions::new()
         .write(true)

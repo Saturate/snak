@@ -66,12 +66,23 @@ impl TeamsClient {
         }
 
         let mut refresh = self.refresh_token.lock().await;
+        // Someone may have refreshed this scope while we waited for the lock.
+        if let Some(token) = self.tokens.lock().await.get(scope)
+            && token.expires_at > Instant::now()
+        {
+            return Ok(token.value.clone());
+        }
         let (token, rotated) = auth::access_token(&self.http, &refresh, scope)
             .await
             .inspect_err(|e| tracing::warn!(scope, error = %e, "token refresh failed"))?;
         tracing::debug!(scope, "access token refreshed");
         if let Some(rotated) = rotated {
-            crate::store::save(rotated.clone(), false).await?;
+            // The new access token is good either way; a failed save (say, a
+            // denied Keychain prompt) only means the next launch uses an older,
+            // still valid refresh token.
+            if let Err(e) = crate::store::save(rotated.clone(), false).await {
+                tracing::warn!(error = %e, "could not save the rotated refresh token");
+            }
             *refresh = rotated;
         }
         let value = token.value.clone();
@@ -154,8 +165,28 @@ impl TeamsClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, scope: &'static str, url: &str) -> Result<T> {
+        self.call(scope, url, |http, token| http.get(url).bearer_auth(token))
+            .await
+    }
+
+    /// Sends with a token for `scope`. A 401 means the token was revoked or
+    /// its claims changed (we advertise CP1, so Entra may issue long-lived
+    /// tokens and revoke them mid-life): drop it and retry once with a new one.
+    async fn call<T: DeserializeOwned>(
+        &self,
+        scope: &'static str,
+        url: &str,
+        build: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder,
+    ) -> Result<T> {
         let token = self.token(scope).await?;
-        let res = self.http.get(url).bearer_auth(token).send().await?;
+        let res = build(&self.http, token).send().await?;
+        if res.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return decode(res, url).await;
+        }
+        tracing::info!(scope, "access token rejected; getting a new one");
+        self.tokens.lock().await.remove(scope);
+        let token = self.token(scope).await?;
+        let res = build(&self.http, token).send().await?;
         decode(res, url).await
     }
 
@@ -219,34 +250,42 @@ impl TeamsClient {
     /// hosts get the Skype token: message HTML is written by other people.
     pub async fn image(&self, url: &str) -> Result<Vec<u8>> {
         const MAX_BYTES: usize = 25 * 1024 * 1024;
-        let request = if crate::backend::is_teams_media_url(url) {
-            let token = self.skype_token().await?;
-            self.http
-                .get(url)
-                .header("Authorization", format!("skype_token {token}"))
-        } else if crate::backend::is_giphy_url(url) {
-            // Public CDN: deliberately no credentials.
-            self.http.get(url)
-        } else {
-            return Err(CoreError::Push(format!("refusing to fetch {url}")));
+        let Some((url, host)) = crate::backend::classify_media_url(url) else {
+            return Err(CoreError::Push(
+                "refusing to fetch an image from that host".into(),
+            ));
         };
-        let res = request.send().await?;
+        let request = match host {
+            crate::backend::MediaHost::Teams => {
+                let token = self.skype_token().await?;
+                self.http
+                    .get(url.clone())
+                    .header("Authorization", format!("skype_token {token}"))
+            }
+            // Public CDN: deliberately no credentials.
+            crate::backend::MediaHost::Giphy => self.http.get(url.clone()),
+        };
+        let mut res = request.send().await?;
         let status = res.status();
         if !status.is_success() {
             return Err(CoreError::Http {
                 status: status.as_u16(),
-                url: url.to_string(),
+                url: url.path().to_string(),
                 body: String::new(),
             });
         }
-        let bytes = res.bytes().await?;
-        if bytes.len() > MAX_BYTES {
-            return Err(CoreError::Push(format!(
-                "image too large: {} bytes",
-                bytes.len()
-            )));
+        // Capped while streaming, not after: the server picks the body size.
+        if res.content_length().is_some_and(|n| n > MAX_BYTES as u64) {
+            return Err(CoreError::Push("image too large".into()));
         }
-        Ok(bytes.to_vec())
+        let mut bytes = Vec::new();
+        while let Some(chunk) = res.chunk().await? {
+            if bytes.len() + chunk.len() > MAX_BYTES {
+                return Err(CoreError::Push("image too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     /// Moves the read marker to now, which clears unread in every Teams client.
@@ -260,15 +299,11 @@ impl TeamsClient {
         // timestamp; client message id) and Teams accepts it.
         let now = chrono::Utc::now().timestamp_millis();
         let body = json!({ "consumptionhorizon": format!("{now};{now};{now}") });
-        let token = self.token(scope::CHAT).await?;
-        let res = self
-            .http
-            .put(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
+        let _: Value = self
+            .call(scope::CHAT, &url, |http, token| {
+                http.put(&url).bearer_auth(token).json(&body)
+            })
             .await?;
-        let _: Value = decode(res, &url).await?;
         Ok(())
     }
 
@@ -324,15 +359,11 @@ impl TeamsClient {
             self.region,
             urlencode(&target)
         );
-        let token = self.token(scope::CHAT).await?;
-        let res = self
-            .http
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
+        let _: Value = self
+            .call(scope::CHAT, &url, |http, token| {
+                http.post(&url).bearer_auth(token).json(&body)
+            })
             .await?;
-        let _: Value = decode(res, &url).await?;
         Ok(())
     }
 
@@ -352,15 +383,12 @@ impl TeamsClient {
                     })
                 })
                 .collect();
-            let token = self.token(scope::GRAPH).await?;
-            let res = self
-                .http
-                .post(url)
-                .bearer_auth(token)
-                .json(&json!({ "requests": requests }))
-                .send()
+            let batch = json!({ "requests": requests });
+            let body: Value = self
+                .call(scope::GRAPH, url, |http, token| {
+                    http.post(url).bearer_auth(token).json(&batch)
+                })
                 .await?;
-            let body: Value = decode(res, url).await?;
             for response in body["responses"].as_array().into_iter().flatten() {
                 let user = &response["body"];
                 if let Some(id) = user["id"].as_str() {
@@ -384,12 +412,14 @@ pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &st
     let path = url.split(['?', '#']).next().unwrap_or(url);
     if !status.is_success() {
         // Error bodies are Microsoft's error JSON, never message content.
+        // Bounded and without the query, since this text reaches the log
+        // and the status bar.
         let snippet: String = body.chars().take(300).collect();
         tracing::warn!(status = status.as_u16(), url = path, body = %snippet, "request failed");
         return Err(CoreError::Http {
             status: status.as_u16(),
-            url: url.to_string(),
-            body,
+            url: path.to_string(),
+            body: snippet,
         });
     }
     // Some write endpoints answer 201 with an empty body.
@@ -407,5 +437,23 @@ pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &st
 // Conversation IDs look like `19:abc@thread.v2`; Teams expects them unescaped
 // apart from characters that would break the path.
 fn urlencode(id: &str) -> String {
-    id.replace('#', "%23").replace('?', "%3F")
+    let mut out = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b':'
+            | b'@'
+            | b';'
+            | b'='
+            | b',' => out.push(byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }

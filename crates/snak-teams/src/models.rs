@@ -6,7 +6,7 @@
 // Every field the server might omit is optional: these are undocumented APIs.
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,7 +39,11 @@ pub struct Channel {
     pub consumption_horizon: Option<ConsumptionHorizon>,
     pub is_message_read: Option<bool>,
     pub is_muted: Option<bool>,
-    #[serde(rename = "lastL2MessageIdNFS")]
+    #[serde(
+        rename = "lastL2MessageIdNFS",
+        default,
+        deserialize_with = "lenient_i64"
+    )]
     pub last_l2_message_id: Option<i64>,
 }
 
@@ -77,6 +81,7 @@ impl Channel {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumptionHorizon {
+    #[serde(default, deserialize_with = "lenient_i64")]
     pub original_arrival_time: Option<i64>,
 }
 
@@ -102,24 +107,56 @@ pub struct Chat {
     pub is_conversation_deleted: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Message {
     pub id: Option<String>,
     pub content: Option<String>,
-    #[serde(alias = "messageType", alias = "messagetype")]
     pub message_type: Option<String>,
-    #[serde(alias = "imDisplayName", alias = "imdisplayname")]
     pub display_name: Option<String>,
     pub from: Option<String>,
-    #[serde(alias = "originalArrivalTime", alias = "originalarrivaltime")]
     pub arrival_time: Option<String>,
-    #[serde(alias = "composeTime", alias = "composetime")]
     pub compose_time: Option<String>,
-    #[serde(alias = "clientMessageId", alias = "clientmessageid")]
     pub client_message_id: Option<String>,
     // Values here come back as strings, numbers or JSON-in-strings depending
     // on the endpoint, so they're read through the helpers below.
     pub properties: Option<Value>,
+}
+
+// The chat service spells fields in lowercase, the aggregator in camelCase,
+// and a payload carrying both would fail serde's aliases as a duplicate
+// field, losing the whole page. So pick by hand: first spelling present wins.
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let text = |keys: &[&str]| {
+            keys.iter().find_map(|key| match value.get(*key)? {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+        };
+        Ok(Message {
+            id: text(&["id"]),
+            content: text(&["content"]),
+            message_type: text(&["messagetype", "messageType"]),
+            display_name: text(&["imdisplayname", "imDisplayName"]),
+            from: text(&["from"]),
+            arrival_time: text(&["originalarrivaltime", "originalArrivalTime"]),
+            compose_time: text(&["composetime", "composeTime"]),
+            client_message_id: text(&["clientmessageid", "clientMessageId"]),
+            properties: value.get("properties").cloned(),
+        })
+    }
+}
+
+/// Accepts a number or a numeric string; anything else is treated as absent
+/// rather than failing the whole list it sits in.
+fn lenient_i64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.parse().ok(),
+        _ => None,
+    })
 }
 
 impl Message {
@@ -228,4 +265,36 @@ pub struct Me {
 pub struct Person {
     pub display_name: Option<String>,
     pub upn: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_spellings_of_a_field_still_parse() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": 42, "messagetype": "Text", "messageType": "RichText/Html", "content": "x"
+        }))
+        .expect("parses");
+        assert_eq!(message.message_type.as_deref(), Some("Text"));
+        assert_eq!(message.id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn numbers_sent_as_strings_do_not_fail_the_channel() {
+        let channel: Channel = serde_json::from_value(serde_json::json!({
+            "id": "c", "displayName": "a",
+            "lastL2MessageIdNFS": "1760000000000",
+            "consumptionHorizon": { "originalArrivalTime": "oops" }
+        }))
+        .expect("parses");
+        assert_eq!(channel.last_l2_message_id, Some(1_760_000_000_000));
+        assert_eq!(
+            channel
+                .consumption_horizon
+                .and_then(|h| h.original_arrival_time),
+            None
+        );
+    }
 }

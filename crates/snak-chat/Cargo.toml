@@ -3,6 +3,7 @@ name = "snak-chat"
 description = "Backend-neutral chat model and the trait every backend implements."
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license = "GPL-3.0-or-later"
 
 [dependencies]

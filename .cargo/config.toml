@@ -1,2 +1,7 @@
+# Signs dev builds with a stable identity so Keychain approvals survive
+# rebuilds; see scripts/dev-cert.sh. Harmless without the identity.
 [target.aarch64-apple-darwin]
+runner = "scripts/run-signed.sh"
+
+[target.x86_64-apple-darwin]
 runner = "scripts/run-signed.sh"

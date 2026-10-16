@@ -78,7 +78,7 @@ impl Header {
 enum ImageState {
     Loading,
     Ready(LoadedImage),
-    Failed,
+    Failed(std::time::Instant),
 }
 
 #[derive(Clone)]
@@ -147,6 +147,11 @@ pub struct Snak {
     pending: Vec<Pending>,
     next_pending: u64,
     refetch_task: Option<Task<()>>,
+    refetch_started: Option<std::time::Instant>,
+    sidebar_loading: bool,
+    sidebar_dirty: bool,
+    /// Unsent composer text per conversation.
+    drafts: HashMap<ConversationId, String>,
     thread_root: Option<MessageId>,
     thread_rows: Rc<Vec<Message>>,
     thread_scroller: Entity<MessageScrollerState>,
@@ -226,6 +231,10 @@ impl Snak {
             pending: Vec::new(),
             next_pending: 0,
             refetch_task: None,
+            refetch_started: None,
+            sidebar_loading: false,
+            sidebar_dirty: false,
+            drafts: HashMap::new(),
             thread_root: None,
             thread_rows: Rc::default(),
             thread_scroller,
@@ -322,13 +331,38 @@ impl Snak {
     }
 
     fn session_expired(&mut self, cx: &mut Context<Self>) {
+        // Several in-flight requests can each report the expiry; the first
+        // one starts the sign-in, the rest must not replace its code.
+        if self.backend.is_none() {
+            return;
+        }
         tracing::warn!("session expired; asking to sign in again");
+        self.end_session(cx);
+        self.error = Some("Your session expired. Sign in again.".into());
+        self.begin_login(cx);
+    }
+
+    /// Drops everything tied to the signed-in account, including requests in
+    /// flight, so nothing from it lands after the next sign-in.
+    fn end_session(&mut self, cx: &mut Context<Self>) {
         self.connector.sign_out();
         self.backend = None;
         self.events_task = None;
         self.poll_task = None;
-        self.error = Some("Your session expired. Sign in again.".into());
-        self.begin_login(cx);
+        self.sidebar_task = None;
+        self.conversation_task = None;
+        self.refetch_task = None;
+        self.sidebar_loading = false;
+        self.sidebar_dirty = false;
+        self.live = false;
+        self.conversations.clear();
+        self.selected = None;
+        self.showing_unreads = true;
+        self.thread_root = None;
+        self.pending.clear();
+        self.drafts.clear();
+        self.error = None;
+        self.set_rows(Vec::new(), cx);
     }
 
     // Updates
@@ -360,7 +394,10 @@ impl Snak {
                 // Anything that happened while disconnected was missed.
                 self.live = true;
                 self.load_conversations(cx);
-                self.load_conversation(cx);
+                // Loading marks it read, so only when it's actually on screen.
+                if !self.showing_unreads {
+                    self.load_conversation(cx);
+                }
             }
             Event::Reconnecting => {
                 tracing::info!("push down, falling back to polling");
@@ -397,14 +434,27 @@ impl Snak {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        // Push sends a change for every message anywhere. Restarting the fetch
+        // each time could starve it; instead one more fetch follows this one.
+        if self.sidebar_loading {
+            self.sidebar_dirty = true;
+            return;
+        }
+        self.sidebar_loading = true;
         self.sidebar_task = Some(cx.spawn(async move |this, cx| {
             let result = io(async move { backend.conversations().await }).await;
-            this.update(cx, |this, cx| match result {
-                Ok(list) => {
-                    this.conversations = list;
-                    cx.notify();
+            this.update(cx, |this, cx| {
+                this.sidebar_loading = false;
+                match result {
+                    Ok(list) => {
+                        this.conversations = list;
+                        cx.notify();
+                    }
+                    Err(e) => this.show_error(e, cx),
                 }
-                Err(e) => this.show_error(e, cx),
+                if std::mem::take(&mut this.sidebar_dirty) {
+                    this.load_conversations(cx);
+                }
             })
             .ok();
         }));
@@ -435,24 +485,26 @@ impl Snak {
     }
 
     fn set_all_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
-        let query = String::new();
-        let keys: Vec<String> = self
-            .sidebar_rows(&query, cx)
-            .into_iter()
-            .filter_map(|row| match row {
-                SidebarRow::Header(header) => Some(header.key),
-                SidebarRow::Item { .. } => None,
-            })
-            .collect();
-        self.update_prefs(cx, |p| {
-            for key in keys {
-                if collapsed {
-                    p.collapsed.insert(key);
-                } else {
-                    p.collapsed.remove(&key);
-                }
-            }
-        });
+        if !collapsed {
+            self.update_prefs(cx, |p| p.collapsed.clear());
+            return;
+        }
+        // Every group, not just the visible ones: teams inside a collapsed
+        // section don't render, but should still end up collapsed.
+        let mut keys = vec!["starred".to_string(), "dms".to_string()];
+        keys.extend(
+            self.prefs
+                .sections
+                .iter()
+                .map(|s| group_key("section", &s.name)),
+        );
+        keys.extend(
+            self.conversations
+                .iter()
+                .filter_map(Conversation::group)
+                .map(|g| team_key(&g.id)),
+        );
+        self.update_prefs(cx, |p| p.collapsed.extend(keys));
     }
 
     pub fn signed_in_as(&self) -> Option<String> {
@@ -480,13 +532,7 @@ impl Snak {
     }
 
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
-        self.connector.sign_out();
-        self.backend = None;
-        self.events_task = None;
-        self.poll_task = None;
-        self.conversations.clear();
-        self.selected = None;
-        self.set_rows(Vec::new(), cx);
+        self.end_session(cx);
         self.begin_login(cx);
     }
 
@@ -554,11 +600,14 @@ impl Snak {
 
     fn open_first_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.query(cx);
+        // The top row the sidebar shows, not the backend's order.
         let first = self
-            .conversations
-            .iter()
-            .find(|c| sidebar::matches(c, &query))
-            .map(|c| c.id.clone());
+            .sidebar_rows(&query, cx)
+            .into_iter()
+            .find_map(|row| match row {
+                SidebarRow::Item { conversation, .. } => Some(conversation.id),
+                SidebarRow::Header(_) => None,
+            });
         if let Some(id) = first {
             self.jump
                 .update(cx, |state, cx| state.set_value("", window, cx));
@@ -580,6 +629,19 @@ impl Snak {
     ) {
         self.showing_unreads = false;
         if self.selected.as_ref() != Some(&id) {
+            // Each conversation keeps its own unsent text, so switching never
+            // carries a half-written message into the wrong place.
+            let typed = self.composer.read(cx).value().to_string();
+            if let Some(previous) = self.selected.take() {
+                if typed.trim().is_empty() {
+                    self.drafts.remove(&previous);
+                } else {
+                    self.drafts.insert(previous, typed);
+                }
+            }
+            let draft = self.drafts.remove(&id).unwrap_or_default();
+            self.composer
+                .update(cx, |state, cx| state.set_value(draft, window, cx));
             self.selected = Some(id);
             self.thread_root = None;
             self.set_rows(Vec::new(), cx);
@@ -642,12 +704,15 @@ impl Snak {
         // so a message lost in transit doesn't sit there as sending forever.
         const PENDING_TIMEOUT_SECS: i64 = 120;
         let now = chrono::Utc::now();
+        let selected = self.selected.clone();
         self.pending.retain(|p| {
             let fresh = p
                 .message
                 .sent_at
                 .is_some_and(|t| (now - t).num_seconds() < PENDING_TIMEOUT_SECS);
-            fresh && !arrived(&rows, p)
+            // Rows only say anything about the conversation they came from.
+            let here = Some(&p.conversation) == selected.as_ref();
+            fresh && !(here && arrived(&rows, p))
         });
         rows.retain(|m| !m.pending);
         for row in &mut rows {
@@ -671,15 +736,20 @@ impl Snak {
         self.rows = Rc::new(rows);
         self.load_images(cx);
 
-        if let Some(root_id) = &self.thread_root {
-            let thread = self
-                .rows
-                .iter()
-                .find(|r| &r.id == root_id)
-                .map(thread_rows)
-                .unwrap_or_default();
-            sync_scroller(&self.thread_scroller, &self.thread_rows, &thread, cx);
-            self.thread_rows = Rc::new(thread);
+        if let Some(root_id) = self.thread_root.clone() {
+            match self.rows.iter().find(|r| r.id == root_id).map(thread_rows) {
+                Some(thread) => {
+                    sync_scroller(&self.thread_scroller, &self.thread_rows, &thread, cx);
+                    self.thread_rows = Rc::new(thread);
+                }
+                // An empty page is a load in progress; a loaded page without
+                // the root means the post is gone, so the panel goes too.
+                None if !self.rows.is_empty() => {
+                    self.thread_root = None;
+                    self.thread_rows = Rc::default();
+                }
+                None => {}
+            }
         }
         cx.notify();
     }
@@ -689,13 +759,21 @@ impl Snak {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let wanted: Vec<String> = self
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        let mut wanted: Vec<String> = self
             .rows
             .iter()
             .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
             .flat_map(|m| m.images.iter().map(|i| i.url.clone()))
-            .filter(|url| !self.images.borrow().contains_key(url))
+            .filter(|url| match self.images.borrow().get(url) {
+                None => true,
+                // A blip or an expired token shouldn't hide an image for the whole session.
+                Some(ImageState::Failed(at)) => at.elapsed() > RETRY_AFTER,
+                Some(_) => false,
+            })
             .collect();
+        wanted.sort();
+        wanted.dedup();
         for url in wanted {
             self.images
                 .borrow_mut()
@@ -728,12 +806,12 @@ impl Snak {
                                 magic = ?&bytes[..bytes.len().min(8)],
                                 "image in an unknown format"
                             );
-                            ImageState::Failed
+                            ImageState::Failed(std::time::Instant::now())
                         }
                     },
                     Err(e) => {
                         tracing::warn!(url = crate::log::redact_url(&url), error = %e, "image failed");
-                        ImageState::Failed
+                        ImageState::Failed(std::time::Instant::now())
                     }
                 };
                 this.update(cx, |this, cx| {
@@ -765,8 +843,18 @@ impl Snak {
         cx.notify();
     }
 
-    fn close_thread(&mut self, cx: &mut Context<Self>) {
+    // Removing the focused composer would leave key presses with no target
+    // under this view, which silently disables every shortcut.
+    fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thread_root = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.showing_unreads = true;
+        self.thread_root = None;
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -815,6 +903,8 @@ impl Snak {
         self.set_rows(rows, cx);
 
         let started = std::time::Instant::now();
+        let sent_to = id.clone();
+        let sent_in_thread = reply_to.clone();
         cx.spawn_in(window, async move |this, cx| {
             let sent = text.clone();
             let result = io(async move { backend.send(&id, reply_to.as_ref(), &sent).await }).await;
@@ -827,13 +917,20 @@ impl Snak {
                     this.pending.retain(|p| p.message.id != local_id);
                     let rows = (*this.rows).clone();
                     this.set_rows(rows, cx);
-                    // Nothing typed is lost when a send fails.
+                    // Nothing typed is lost: back into the box it came from if
+                    // that's still on screen and empty, otherwise into its draft.
+                    let same_place = this.selected.as_ref() == Some(&sent_to)
+                        && (!in_thread || this.thread_root == sent_in_thread);
                     let input = if in_thread {
                         this.thread_composer.clone()
                     } else {
                         this.composer.clone()
                     };
-                    input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+                    if same_place && input.read(cx).value().trim().is_empty() {
+                        input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+                    } else if !in_thread {
+                        this.drafts.entry(sent_to.clone()).or_insert(text.clone());
+                    }
                     this.show_error(e, cx);
                 }
             })
@@ -846,6 +943,15 @@ impl Snak {
     /// right after sending often misses the new message.
     fn refetch_soon(&mut self, cx: &mut Context<Self>) {
         const DELAYS_MS: [u64; 4] = [0, 1500, 4000, 10000];
+        // A burst of push events would otherwise keep cancelling the fetch at
+        // delay 0 before it finishes; within a second, the running schedule covers it.
+        if self
+            .refetch_started
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.refetch_started = Some(std::time::Instant::now());
         let conversation = self.selected.clone();
         self.refetch_task = Some(cx.spawn(async move |this, cx| {
             let mut waited = 0;
@@ -856,7 +962,7 @@ impl Snak {
                 waited = delay;
                 let still_here = this
                     .update(cx, |this, cx| {
-                        let same = this.selected == conversation;
+                        let same = this.selected == conversation && !this.showing_unreads;
                         if same {
                             this.load_conversation(cx);
                         }
@@ -952,14 +1058,20 @@ fn sync_scroller(
     new: &[Message],
     cx: &mut App,
 ) {
-    let same_prefix = old.len() <= new.len() && old.iter().zip(new).all(|(a, b)| a.id == b.id);
+    // Pending rows sit at the end and get swapped for the service's copy,
+    // so they don't count against the prefix; that swap is a remeasure.
+    let confirmed: Vec<&MessageId> = old.iter().filter(|m| !m.pending).map(|m| &m.id).collect();
+    let same_prefix =
+        confirmed.len() <= new.len() && confirmed.iter().zip(new).all(|(a, b)| *a == &b.id);
     scroller.update(cx, |state, cx| {
         if same_prefix && new.len() > old.len() {
             state.append(new.len() - old.len(), cx);
-        } else if !same_prefix || old.len() != new.len() {
-            state.reset(new.len(), cx);
-        } else {
+            // Rows already shown may have changed too, e.g. an edit or a reaction.
             state.remeasure(cx);
+        } else if same_prefix {
+            state.remeasure(cx);
+        } else {
+            state.reset(new.len(), cx);
         }
     });
 }
@@ -977,6 +1089,11 @@ fn avatar_color(name: &str) -> Hsla {
         .bytes()
         .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     hsla((hash % 360) as f32 / 360., 0.45, 0.45, 1.)
+}
+
+fn is_safe_link(url: &str) -> bool {
+    let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(scheme.as_str(), "https" | "http" | "mailto" | "msteams")
 }
 
 fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
@@ -1010,7 +1127,8 @@ fn image_size(image: &ImageRef, actual: Option<(u32, u32)>) -> (f32, f32) {
     const MAX_W: f32 = 360.;
     const MAX_H: f32 = 300.;
     let reported = match (image.width, image.height) {
-        (Some(w), Some(h)) if w > 0. && h > 0. => Some((w, h)),
+        // The attributes come from other people's messages; "inf" parses as f32.
+        (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0. && h > 0. => Some((w, h)),
         _ => None,
     };
     let (w, h) = actual
@@ -1102,7 +1220,7 @@ fn render_images(
                     })
                     .into_any_element()
             }
-            Some(ImageState::Failed) => frame
+            Some(ImageState::Failed(_)) => frame
                 .bg(theme.muted)
                 .flex()
                 .items_center()
@@ -1140,6 +1258,18 @@ fn render_row(
                 )
                 // Chat messages are mostly one-line paragraphs; document spacing
                 // makes every line look double-spaced.
+                // Message HTML is written by other people; a click must not
+                // open file:, smb: or some app's custom scheme.
+                .on_link_click(|url, _, _, cx| {
+                    if is_safe_link(url) {
+                        cx.open_url(url);
+                    } else {
+                        tracing::warn!(
+                            scheme = url.split(':').next().unwrap_or(""),
+                            "blocked link"
+                        );
+                    }
+                })
                 .style(TextViewStyle {
                     paragraph_gap: rems(0.2),
                     highlight_theme: if theme.is_dark() {
@@ -1182,7 +1312,8 @@ fn render_row(
                     .join("   "),
             )
         })
-        .when_some(on_thread, |el, on_thread| {
+        // A pending post has no id Teams knows, so it can't be replied to yet.
+        .when_some(on_thread.filter(|_| !row.pending), |el, on_thread| {
             let label: SharedString = match row.replies.len() {
                 0 => "Reply in thread".into(),
                 1 => "1 reply".into(),
@@ -1295,6 +1426,7 @@ impl Snak {
                     .child(format!("Sign in to {service}")),
             )
             .map(|el| match prompt {
+                None if self.error.is_some() => el,
                 None => el.child(
                     div()
                         .text_sm()
@@ -1520,6 +1652,7 @@ impl Snak {
         let shown_when_collapsed =
             |c: &Conversation| is_selected(c) || (c.unread && !self.is_muted(c));
         let collapsed = |key: &str| !searching && prefs.collapsed.contains(key);
+        let filtering = searching || prefs.unreads_only;
 
         let all: Vec<&Conversation> = self.conversations.iter().filter(visible).collect();
         let placed = |placement: Placement| {
@@ -1560,7 +1693,9 @@ impl Snak {
                     show_group: show_group && team_names,
                 })
                 .collect();
-            if items.is_empty() && !always_show_header && !is_collapsed {
+            // A collapsed header normally stays so it can be reopened, but when
+            // filtering, an empty group is noise whether collapsed or not.
+            if items.is_empty() && !always_show_header && (!is_collapsed || filtering) {
                 return;
             }
             rows.push(SidebarRow::Header(Header {
@@ -1583,7 +1718,10 @@ impl Snak {
             let mut header = Header::new(&group_key("section", &section.name), &section.name, 0);
             header.section = Some(i);
             let loose: Vec<&Conversation> = placed(Placement::Section(i)).collect();
-            push_group(&mut rows, header.clone(), loose, true, filing);
+            // Built apart so the section header can be kept whenever anything
+            // inside it shows, including a team below it.
+            let mut section_rows = Vec::new();
+            push_group(&mut section_rows, header.clone(), loose, true, true);
             let section_collapsed = collapsed(&header.key);
             for team in teams
                 .iter()
@@ -1591,7 +1729,7 @@ impl Snak {
             {
                 let channels = team_channels(&team.id);
                 if section_collapsed {
-                    rows.extend(
+                    section_rows.extend(
                         channels
                             .into_iter()
                             .filter(|c| shown_when_collapsed(c))
@@ -1605,7 +1743,11 @@ impl Snak {
                 }
                 let mut team_header = Header::new(&team_key(&team.id), &team.name, 1);
                 team_header.team = Some(team.id.clone());
-                push_group(&mut rows, team_header, channels, false, false);
+                push_group(&mut section_rows, team_header, channels, false, false);
+            }
+            let only_header = section_rows.len() == 1;
+            if !only_header || filing || (section_collapsed && !filtering) {
+                rows.extend(section_rows);
             }
         }
 
@@ -1751,7 +1893,11 @@ impl Snak {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.query(cx);
         let rows = self.sidebar_rows(&query, cx);
-        let hidden_count = self.prefs.hidden.len();
+        let hidden_count = self
+            .conversations
+            .iter()
+            .filter(|c| self.prefs.hidden.contains(&c.id.0))
+            .count();
 
         let unread_count = self.unread_entries().len();
         let theme = cx.theme();
@@ -1783,11 +1929,7 @@ impl Snak {
                             .child(unread_count.to_string()),
                     )
                 })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.showing_unreads = true;
-                    this.thread_root = None;
-                    cx.notify();
-                })),
+                .on_click(cx.listener(|this, _, window, cx| this.show_unreads(window, cx))),
         );
         for (ix, row) in rows.iter().enumerate() {
             list = match row {
@@ -2097,7 +2239,9 @@ impl Snak {
                             .small()
                             .ghost()
                             .label("Close")
-                            .on_click(cx.listener(|this, _, _, cx| this.close_thread(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_thread(window, cx)),
+                            ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(Self::render_timeline(
@@ -2260,15 +2404,15 @@ impl Render for Snak {
             .on_action(cx.listener(|this, _: &PreviousConversation, window, cx| {
                 this.step_conversation(-1, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &CloseThread, _, cx| this.close_thread(cx)))
+            .on_action(
+                cx.listener(|this, _: &CloseThread, window, cx| this.close_thread(window, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &ShowUnreads, _, cx| {
-                this.showing_unreads = true;
-                this.thread_root = None;
-                cx.notify();
-            }))
+            .on_action(
+                cx.listener(|this, _: &ShowUnreads, window, cx| this.show_unreads(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleUnreadsOnly, _, cx| {
                 this.update_prefs(cx, |p| p.unreads_only = !p.unreads_only)
             }))
@@ -2351,6 +2495,22 @@ mod tests {
             images: Vec::new(),
             replies: Vec::new(),
             pending,
+        }
+    }
+
+    #[test]
+    fn only_web_mail_and_teams_links_open() {
+        assert!(super::is_safe_link("https://example.com"));
+        assert!(super::is_safe_link("HTTPS://example.com"));
+        assert!(super::is_safe_link("mailto:a@b.c"));
+        for bad in [
+            "file:///Applications/Calculator.app",
+            "smb://host/share",
+            "x-apple.systempreferences:",
+            "javascript:alert(1)",
+            "",
+        ] {
+            assert!(!super::is_safe_link(bad), "{bad}");
         }
     }
 

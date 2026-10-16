@@ -2,6 +2,12 @@
 # Creates a self-signed "Snak Development" code-signing identity in the login
 # keychain. Builds signed with it keep the same identity across rebuilds, so the
 # Keychain's "Always Allow" sticks instead of prompting after every build.
+#
+# Trade-off: codesign may use this key without asking, so any program running
+# as you could sign a binary as Snak and read the login Snak stored in the
+# Keychain without a prompt. That's no worse than the file storage option, but
+# it is weaker than an unsigned Keychain entry. Delete the identity in Keychain
+# Access to undo.
 set -euo pipefail
 
 NAME="Snak Development"
@@ -20,9 +26,15 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -addext "extendedKeyUsage=critical,codeSigning" \
   -keyout "$work/key.pem" -out "$work/cert.pem" 2>/dev/null
 
-# macOS's importer can't read OpenSSL 3's default PKCS#12 encryption.
+# macOS's importer can't read OpenSSL 3's default PKCS#12 encryption, so ask
+# OpenSSL 3 for the legacy format. LibreSSL (/usr/bin/openssl) already writes
+# it and has no -legacy flag.
+legacy=()
+if openssl version | grep -q '^OpenSSL [3-9]'; then
+  legacy=(-legacy)
+fi
 pass=$(openssl rand -hex 16)
-openssl pkcs12 -export -legacy -inkey "$work/key.pem" -in "$work/cert.pem" \
+openssl pkcs12 -export "${legacy[@]}" -inkey "$work/key.pem" -in "$work/cert.pem" \
   -name "$NAME" -out "$work/identity.p12" -passout "pass:$pass"
 
 security import "$work/identity.p12" -k "$HOME/Library/Keychains/login.keychain-db" \

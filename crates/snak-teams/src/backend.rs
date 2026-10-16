@@ -169,7 +169,12 @@ impl ChatBackend for TeamsBackend {
             .filter_map(|o| directory.upns.get(o).map(String::as_str))
             .collect();
         // Hands the call to the installed Teams app; Snak has no media stack.
-        (!upns.is_empty()).then(|| format!("msteams:/l/call/0/0?users={}", upns.join(",")))
+        // Guest UPNs contain `#EXT#`, which would otherwise start a URL fragment.
+        let users: Vec<String> = upns
+            .iter()
+            .map(|u| url::form_urlencoded::byte_serialize(u.as_bytes()).collect())
+            .collect();
+        (!users.is_empty()).then(|| format!("msteams:/l/call/0/0?users={}", users.join(",")))
     }
 
     fn subscribe(self: Arc<Self>) -> mpsc::Receiver<Event> {
@@ -468,7 +473,9 @@ fn to_message(message: &models::Message) -> Option<Message> {
     };
 
     Some(Message {
-        id: MessageId(message.id.clone().unwrap_or_default()),
+        // Without an id a message can't anchor a thread or be told apart
+        // from another, so it is skipped.
+        id: MessageId(message.id.clone()?),
         author: message
             .display_name
             .clone()
@@ -495,83 +502,107 @@ fn to_message(message: &models::Message) -> Option<Message> {
     })
 }
 
-/// Giphy serves Teams' GIF picker results publicly; they need no token.
-pub(crate) fn is_giphy_url(url: &str) -> bool {
-    https_host(url).is_some_and(|host| {
-        host == "giphy.com"
-            || host
-                .strip_suffix(".giphy.com")
-                .is_some_and(|sub| sub.starts_with("media") || sub == "i")
-    })
+/// Which kind of media host an image URL points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaHost {
+    /// Microsoft's message media store; takes the Skype token.
+    Teams,
+    /// Giphy's public CDN, which Teams' GIF picker links to; no credentials.
+    Giphy,
 }
 
-/// The lowercased host of an https URL, or None for anything that could
-/// disguise its real host (userinfo, ports, other schemes).
-fn https_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') || authority.contains(':') {
+/// Classifies an `<img src>` value as it appears in message HTML.
+///
+/// Message HTML is written by other people, so this decodes entities first and
+/// parses once with the same URL parser reqwest uses, then checks the parsed
+/// host. The caller fetches the returned `Url`, never the raw string: checking
+/// one representation and fetching another is how `\` or `&sol;` tricks would
+/// steer the token to another host.
+pub(crate) fn classify_media_url(raw: &str) -> Option<(url::Url, MediaHost)> {
+    let decoded = html_escape::decode_html_entities(raw);
+    let url = url::Url::parse(decoded.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return None;
     }
-    Some(authority.to_ascii_lowercase())
+    let Some(url::Host::Domain(host)) = url.host() else {
+        return None;
+    };
+    let host = host.to_ascii_lowercase();
+    let kind = if host.ends_with(".asm.skype.com") || host.ends_with(".asyncgw.teams.microsoft.com")
+    {
+        MediaHost::Teams
+    } else if host == "giphy.com"
+        || host
+            .strip_suffix(".giphy.com")
+            .is_some_and(|sub| sub == "i" || (sub.starts_with("media") && !sub.contains('.')))
+    {
+        MediaHost::Giphy
+    } else {
+        return None;
+    };
+    Some((url, kind))
 }
 
-/// Hosts that serve Teams message media and accept the Skype token.
-pub(crate) fn is_teams_media_url(url: &str) -> bool {
-    let Some(host) = https_host(url) else {
-        return false;
-    };
-    host.ends_with(".asm.skype.com")
-        || host.ends_with(".asyncgw.teams.microsoft.com")
-        || host == "teams.microsoft.com"
+/// Byte offsets of each `<img ...>` tag, case-insensitively.
+fn img_tags(html: &str) -> Vec<(usize, usize)> {
+    // ASCII lowercasing keeps byte offsets identical to the original.
+    let lower = html.to_ascii_lowercase();
+    let mut tags = Vec::new();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("<img") {
+        let start = from + found;
+        let Some(len) = lower[start..].find('>') else {
+            break;
+        };
+        tags.push((start, start + len + 1));
+        from = start + len + 1;
+    }
+    tags
 }
 
 fn message_images(html: &str) -> Vec<ImageRef> {
-    let mut images = Vec::new();
-    let mut rest = html;
-    while let Some(start) = rest.find("<img") {
-        let Some(len) = rest[start..].find('>') else {
-            break;
-        };
-        let tag = &rest[start..start + len + 1];
-        if let Some(url) =
-            attribute(tag, "src").filter(|u| is_teams_media_url(u) || is_giphy_url(u))
-            && !tag.to_ascii_lowercase().contains("schema.skype.com/emoji")
-        {
+    img_tags(html)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let tag = &html[start..end];
+            if tag.to_ascii_lowercase().contains("schema.skype.com/emoji") {
+                return None;
+            }
+            let (url, _) = classify_media_url(&attribute(tag, "src")?)?;
             let size = |name| attribute(tag, name).and_then(|v| v.parse::<f32>().ok());
-            images.push(ImageRef {
-                url: html_escape::decode_html_entities(&url).into_owned(),
+            Some(ImageRef {
+                url: url.to_string(),
                 width: size("width"),
                 height: size("height"),
-            });
-        }
-        rest = &rest[start + len + 1..];
-    }
-    images
+            })
+        })
+        .collect()
 }
 
 /// Images in Teams messages sit behind Teams auth, so the renderer can't fetch
-/// them. Emoji become their alt text; other images become a placeholder.
+/// them. Emoji become their alt text, media we fetch is drawn under the text,
+/// and every other image becomes a placeholder: no `<img>` reaches the renderer.
 fn display_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(start) = rest.find("<img") {
-        out.push_str(&rest[..start]);
-        let Some(len) = rest[start..].find('>') else {
-            rest = "";
-            break;
-        };
-        let tag = &rest[start..start + len + 1];
+    let mut copied = 0;
+    for (start, end) in img_tags(html) {
+        out.push_str(&html[copied..start]);
+        let tag = &html[start..end];
         if tag.to_ascii_lowercase().contains("schema.skype.com/emoji") {
             out.push_str(&attribute(tag, "alt").unwrap_or_default());
-        } else if !attribute(tag, "src").is_some_and(|u| is_teams_media_url(&u) || is_giphy_url(&u))
+        } else if attribute(tag, "src")
+            .and_then(|u| classify_media_url(&u))
+            .is_none()
         {
-            // Teams media renders under the text; anything else is never fetched.
             out.push_str("<i>[image]</i>");
         }
-        rest = &rest[start + len + 1..];
+        copied = end;
     }
-    out.push_str(rest);
+    out.push_str(&html[copied..]);
     collapse_blank_paragraphs(&out)
 }
 
@@ -589,11 +620,23 @@ fn collapse_blank_paragraphs(html: &str) -> String {
     out.trim_end_matches("<p>&nbsp;</p>").to_string()
 }
 
+/// A quoted attribute value. Only matches the whole attribute name, so
+/// `data-src` is not mistaken for `src`.
 fn attribute(tag: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')?;
-    Some(tag[start..start + end].to_string())
+    let lower = tag.to_ascii_lowercase();
+    let needle = format!("{}=\"", name.to_ascii_lowercase());
+    let mut from = 0;
+    while let Some(found) = lower[from..].find(&needle) {
+        let at = from + found;
+        let standalone = at > 0 && lower.as_bytes()[at - 1].is_ascii_whitespace();
+        let start = at + needle.len();
+        if standalone {
+            let end = tag[start..].find('"')?;
+            return Some(tag[start..start + end].to_string());
+        }
+        from = start;
+    }
+    None
 }
 
 // Teams sends reaction names, not emoji.
@@ -703,36 +746,56 @@ mod tests {
 
     #[test]
     fn only_microsoft_media_hosts_get_the_token() {
-        assert!(is_teams_media_url(
+        let teams = |u| classify_media_url(u).map(|(_, k)| k) == Some(MediaHost::Teams);
+        assert!(teams(
             "https://eu-api.asm.skype.com/v1/objects/0-weu-d1-abc/views/imgo"
         ));
-        assert!(is_teams_media_url(
+        assert!(teams(
             "https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/x"
         ));
-        assert!(!is_teams_media_url(
-            "http://eu-api.asm.skype.com/v1/objects/x"
-        ));
-        assert!(!is_teams_media_url(
-            "https://evil.example/eu-api.asm.skype.com"
-        ));
-        assert!(!is_teams_media_url(
-            "https://eu-api.asm.skype.com.evil.example/x"
-        ));
-        assert!(!is_teams_media_url(
-            "https://eu-api.asm.skype.com@evil.example/x"
-        ));
-        assert!(!is_teams_media_url("https://eu-api.asm.skype.com:8443/x"));
+        for bad in [
+            "http://eu-api.asm.skype.com/v1/objects/x",
+            "https://evil.example/eu-api.asm.skype.com",
+            "https://eu-api.asm.skype.com.evil.example/x",
+            "https://eu-api.asm.skype.com@evil.example/x",
+            "https://eu-api.asm.skype.com:8443/x",
+            // Found in review: each of these passed the old string check while
+            // the fetched URL pointed elsewhere.
+            "https://attacker.example\\.asm.skype.com/x",
+            "https://attacker.example&sol;.asm.skype.com/x",
+            "https://attacker.example&quest;.asm.skype.com",
+            "https://127.0.0.1\\.asm.skype.com/x",
+            "https://localhost&colon;8080&sol;.asm.skype.com",
+            "javascript:alert(1)//.asm.skype.com",
+        ] {
+            assert!(classify_media_url(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_fetched_url_is_the_checked_one() {
+        let (url, _) = classify_media_url("https://eu-api.asm.skype.com/v1/objects/a?x=1&amp;y=2")
+            .expect("allowed");
+        assert_eq!(url.host_str(), Some("eu-api.asm.skype.com"));
+        assert_eq!(url.query(), Some("x=1&y=2"));
     }
 
     #[test]
     fn giphy_is_allowed_without_the_token() {
-        assert!(is_giphy_url("https://media2.giphy.com/media/abc/giphy.gif"));
-        assert!(is_giphy_url("https://i.giphy.com/abc.gif"));
-        assert!(!is_giphy_url("https://media2.giphy.com.evil.example/x.gif"));
-        assert!(!is_giphy_url("https://evilgiphy.com/x.gif"));
-        assert!(!is_teams_media_url(
-            "https://media2.giphy.com/media/abc/giphy.gif"
-        ));
+        let giphy = |u| classify_media_url(u).map(|(_, k)| k) == Some(MediaHost::Giphy);
+        assert!(giphy("https://media2.giphy.com/media/abc/giphy.gif"));
+        assert!(giphy("https://i.giphy.com/abc.gif"));
+        assert!(!giphy("https://media2.giphy.com.evil.example/x.gif"));
+        assert!(!giphy("https://evilgiphy.com/x.gif"));
+        assert!(!giphy("https://media.attacker.example\\.giphy.com/x"));
+        assert!(!giphy("https://media.evil.giphy.com/x"));
+    }
+
+    #[test]
+    fn uppercase_and_data_src_images_never_reach_the_renderer() {
+        let html = r#"<p><IMG SRC="https://tracker.example/p.gif"><img data-src="https://eu-api.asm.skype.com/x" src="https://tracker.example/q.gif"></p>"#;
+        assert_eq!(display_html(html), "<p><i>[image]</i><i>[image]</i></p>");
+        assert!(message_images(html).is_empty());
     }
 
     #[test]

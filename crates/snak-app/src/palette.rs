@@ -181,8 +181,13 @@ impl Snak {
             // The palette dispatches from its dialog, which sits beside this
             // view rather than inside it, so view actions are re-sent from here.
             Entry::Action(action) => {
-                self.focus_main(window, cx);
-                window.dispatch_action(action(), cx);
+                let action = action();
+                // App-level actions already ran from the palette's own dispatch.
+                let global = action.as_any().is::<OpenLog>() || action.as_any().is::<Quit>();
+                if !global {
+                    self.focus_main(window, cx);
+                    window.dispatch_action(action, cx);
+                }
             }
             Entry::Conversation(id) => self.select(id, window, cx),
             Entry::Theme { name, dark } => {

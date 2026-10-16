@@ -25,7 +25,7 @@ Use `patch` for fixes, `minor` for new features. The package name is always `def
 
 For internal changes that don't affect users (CI, tooling, docs), use `none` instead of `patch`/`minor`.
 
-CI will block the PR if the changeset is missing.
+CI blocks the PR if the changeset is missing (once the check is required in branch protection).
 
 ## Releases
 

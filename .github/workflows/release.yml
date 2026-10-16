@@ -4,9 +4,11 @@ on:
   push:
     branches: [main]
 
+# Never cancel: a merge to main during the (slow) GPUI release builds would
+# otherwise cancel them for good and leave the release without downloads.
 concurrency:
   group: release
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -76,10 +78,6 @@ jobs:
         with:
           toolchain: "1.97"
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Build Snak.app
         run: ./scripts/bundle.sh --release --target ${{ matrix.target }}

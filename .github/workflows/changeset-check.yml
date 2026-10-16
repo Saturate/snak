@@ -17,4 +17,5 @@ jobs:
           fetch-depth: 0
       - uses: saturate/changesetter/actions/check@v1
         with:
-          comment: true
+          # Fork PRs get a read-only token, so commenting would fail the check.
+          comment: ${{ github.event.pull_request.head.repo.full_name == github.repository }}

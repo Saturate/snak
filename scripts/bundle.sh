@@ -12,7 +12,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --release) profile=release ;;
     --open) open_after=true ;;
-    --target) target="$2"; shift ;;
+    --target)
+      [ $# -ge 2 ] || { echo "bundle.sh: --target needs a value" >&2; exit 2; }
+      target="$2"; shift ;;
+    *) echo "bundle.sh: unknown option $1" >&2; exit 2 ;;
   esac
   shift
 done

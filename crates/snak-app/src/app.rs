@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -11,7 +11,9 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
+    status_bar::StatusBar,
     text::{TextView, TextViewStyle},
+    tooltip::Tooltip,
     v_flex, {Theme, ThemeMode},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -1333,18 +1335,6 @@ impl Snak {
                             .child(me),
                     )
                     .child(
-                        Button::new("appearance")
-                            .xsmall()
-                            .ghost()
-                            .label(self.prefs.appearance.label())
-                            .tooltip("Theme: follow macOS, light or dark")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.cycle_appearance(window, cx)
-                                }),
-                            ),
-                    )
-                    .child(
                         Button::new("unreads-only")
                             .xsmall()
                             .map(|b| if unreads_only { b.primary() } else { b.ghost() })
@@ -1621,6 +1611,75 @@ impl Snak {
     }
 }
 
+impl Snak {
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let title = match self.selected_conversation() {
+            Some(c) if !self.showing_unreads => match c.group() {
+                Some(group) => format!("{} › #{}", group.name, c.title),
+                None => c.title.clone(),
+            },
+            _ => "All unreads".to_string(),
+        };
+        TitleBar::new().child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .text_sm()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Snak"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(title),
+                ),
+        )
+    }
+
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (dot, state) = if self.live {
+            (theme.success, "Live")
+        } else {
+            (theme.warning, "Polling")
+        };
+        let mut left = h_flex()
+            .gap_1p5()
+            .child(div().size(px(7.)).rounded_full().bg(dot))
+            .child(state)
+            .child(
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child(self.connector.service_name().to_string()),
+            );
+        if let Some(error) = self.error.clone() {
+            left = left.child(
+                div()
+                    .id("status-error")
+                    .ml_3()
+                    .max_w(px(640.))
+                    .truncate()
+                    .cursor_pointer()
+                    .text_color(theme.danger)
+                    .child(error)
+                    .tooltip(|window, cx| Tooltip::new("Click to dismiss").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.error = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        StatusBar::new().text_xs().left(left).right(
+            Button::new("appearance")
+                .xsmall()
+                .ghost()
+                .label(format!("Theme: {}", self.prefs.appearance.label()))
+                .on_click(cx.listener(|this, _, window, cx| this.cycle_appearance(window, cx))),
+        )
+    }
+}
+
 impl Render for Snak {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -1650,12 +1709,19 @@ impl Render for Snak {
                         .child(format!("Connecting to {}…", self.connector.service_name())),
                 )
                 .into_any_element(),
-            Screen::Login { .. } => root.child(self.render_login(cx)).into_any_element(),
-            Screen::Main => {
-                let error = self.error.clone();
-                root.child(
+            Screen::Login { .. } => root
+                .child(
                     v_flex()
                         .size_full()
+                        .child(TitleBar::new())
+                        .child(self.render_login(cx)),
+                )
+                .into_any_element(),
+            Screen::Main => root
+                .child(
+                    v_flex()
+                        .size_full()
+                        .child(self.render_title_bar(cx))
                         .child(
                             h_flex()
                                 .flex_1()
@@ -1666,29 +1732,9 @@ impl Render for Snak {
                                     el.child(self.render_thread(cx))
                                 }),
                         )
-                        .when_some(error, |el, error| {
-                            el.child(
-                                h_flex()
-                                    .id("error-bar")
-                                    .flex_none()
-                                    .px_4()
-                                    .py_1()
-                                    .gap_2()
-                                    .text_xs()
-                                    .bg(cx.theme().danger)
-                                    .text_color(cx.theme().danger_foreground)
-                                    .cursor_pointer()
-                                    .child(div().flex_1().truncate().child(error))
-                                    .child("Dismiss")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.error = None;
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
+                        .child(self.render_status_bar(cx)),
                 )
-                .into_any_element()
-            }
+                .into_any_element(),
         }
     }
 }

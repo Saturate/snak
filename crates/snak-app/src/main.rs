@@ -1,6 +1,7 @@
 mod app;
 mod prefs;
 mod sidebar;
+mod theme;
 
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
@@ -49,6 +50,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            theme::install(cx);
             cx.bind_keys([
                 KeyBinding::new("cmd-k", JumpTo, None),
                 KeyBinding::new("alt-down", NextConversation, None),
@@ -56,13 +58,15 @@ fn main() {
                 KeyBinding::new("escape", CloseThread, Some("Snak")),
             ]);
 
+            // Snak draws its own title bar, like Zed, with the traffic lights inset.
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+                window_min_size: Some(size(px(720.), px(480.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Snak".into()),
-                    ..Default::default()
+                    ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..gpui_kit::component::TitleBar::window_options()
             };
             if let Err(e) = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| app::Snak::new(connector.clone(), window, cx))

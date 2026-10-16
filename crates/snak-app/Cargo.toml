@@ -2,6 +2,7 @@
 name = "snak-app"
 edition.workspace = true
 version.workspace = true
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "snak"

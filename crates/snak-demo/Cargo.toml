@@ -3,6 +3,7 @@ name = "snak-demo"
 description = "In-memory workspace for developing the UI without a Teams account."
 edition.workspace = true
 version.workspace = true
+license = "GPL-3.0-or-later"
 
 [dependencies]
 chrono = "0.4"

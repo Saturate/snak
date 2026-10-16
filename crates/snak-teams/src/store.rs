@@ -38,8 +38,10 @@ struct State {
     /// Unset until the first `set_storage` of the run adopts the setting.
     storage: Option<Storage>,
     last_op_write: Option<Instant>,
-    /// Places a sign-out couldn't clear (1Password locked, a prompt
-    /// dismissed). What they hold is signed out until a write replaces it.
+    /// Places a sign-out or a move couldn't clear (1Password locked, `op`
+    /// gone, a prompt dismissed), so they may hold a login that must not be
+    /// read back. The next sign-out tries them again, and a write there
+    /// replaces what they hold.
     left_behind: Vec<Storage>,
 }
 
@@ -90,15 +92,23 @@ pub async fn set_storage(storage: Storage) -> Result<()> {
             return Ok(());
         }
         if signed_out(&previous) {
-            // Its delete may only look in the new place, so remove it here.
-            delete(&previous)?;
-            state().left_behind.retain(|place| *place != previous);
+            // Nothing to move, so the switch goes ahead even if the old copy
+            // can't be removed (a broken 1Password would otherwise be a dead
+            // end); it's remembered for the next sign-out instead.
+            match delete(&previous) {
+                Ok(()) => state().left_behind.retain(|place| *place != previous),
+                Err(e) => {
+                    tracing::warn!(error = %e, "switching away from a login that couldn't be removed");
+                    remember_left_behind(&previous);
+                }
+            }
         } else if let Some(token) = read(&previous)? {
             write(&storage, &token)?;
             if let Err(e) = delete(&previous) {
                 // Back to one copy, where the setting still points.
                 if let Err(undo) = delete(&storage) {
                     tracing::warn!(error = %undo, "login left in both storages");
+                    remember_left_behind(&storage);
                 }
                 return Err(e);
             }
@@ -256,14 +266,27 @@ fn clear(issued: u64) {
     if matches!(current, Storage::OnePassword { .. }) {
         places.push(current.clone());
     }
+    let left_behind = state().left_behind.clone();
+    for place in left_behind {
+        if !places.contains(&place) {
+            places.push(place);
+        }
+    }
     for place in places.iter().filter(|place| Some(*place) != keep) {
-        if let Err(e) = delete(place) {
-            tracing::warn!(error = %e, "sign-out left a login behind");
-            let mut state = state();
-            if !state.left_behind.contains(place) {
-                state.left_behind.push(place.clone());
+        match delete(place) {
+            Ok(()) => state().left_behind.retain(|left| left != place),
+            Err(e) => {
+                tracing::warn!(error = %e, "sign-out left a login behind");
+                remember_left_behind(place);
             }
         }
+    }
+}
+
+fn remember_left_behind(place: &Storage) {
+    let mut state = state();
+    if !state.left_behind.contains(place) {
+        state.left_behind.push(place.clone());
     }
 }
 
@@ -509,7 +532,14 @@ mod tests {
     /// doesn't cascade into the rest.
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        wait_cleared();
+        // A sign-out thread from the last test may still be running; a test
+        // that bumped the epoch by hand and then failed never clears.
+        for _ in 0..100 {
+            if !clear_pending() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         CLEARED.store(EPOCH.load(SeqCst), SeqCst);
         {
             let mut state = state();
@@ -691,5 +721,25 @@ mod tests {
         assert_eq!(loaded().await.as_deref(), Some("NEW"));
         // Writing the File says nothing about what the Keychain holds.
         assert!(state().left_behind.contains(&Storage::Keychain));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signed_out_store_that_cannot_be_cleared_can_be_left() {
+        let _serial = setup();
+        let file = break_token_file();
+        sign_out();
+        wait_cleared();
+        assert!(state().left_behind.contains(&Storage::File));
+        // Still broken, but there's nothing to move, so the switch goes ahead.
+        set_storage(Storage::Keychain).await.unwrap();
+        assert_eq!(current(), Storage::Keychain);
+        assert!(state().left_behind.contains(&Storage::File));
+        // The next sign-out tries it again.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, "OLD").unwrap();
+        sign_out();
+        wait_cleared();
+        assert_eq!(stored(), None);
+        assert!(state().left_behind.is_empty());
     }
 }

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,7 @@ use crate::*;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 272.;
 const THREAD_WIDTH: f32 = 400.;
+const SNAK_OPEN: &str = "SNAK_OPEN";
 
 enum SidebarRow {
     Header(Header),
@@ -172,7 +173,12 @@ pub struct Snak {
     /// Unsent composer text per conversation.
     drafts: HashMap<ConversationId, String>,
     /// Presence by person, from push; the service's own word for it.
-    presences: HashMap<String, String>,
+    presences: HashMap<String, PresenceInfo>,
+    /// DM partners' photos, keyed by display name, shown in the sidebar
+    /// and the profile panel.
+    avatars: HashMap<String, Arc<Image>>,
+    /// Names whose photo is on its way.
+    avatar_pending: HashSet<String>,
     /// Who is typing where, and until when: no "stopped" arrives.
     typing: HashMap<ConversationId, (String, std::time::Instant)>,
     thread_root: Option<MessageId>,
@@ -256,7 +262,7 @@ impl Snak {
             section_name: cx.new(|cx| InputState::new(window, cx).placeholder("Section name")),
             selected: None,
             showing_unreads: true,
-            open_on_load: std::env::var("SNAK_OPEN").ok().map(ConversationId),
+            open_on_load: std::env::var(SNAK_OPEN).ok().map(ConversationId),
             rows: Rc::default(),
             scroller,
             composer,
@@ -275,6 +281,8 @@ impl Snak {
             sidebar_dirty: false,
             drafts: HashMap::new(),
             presences: HashMap::new(),
+            avatars: HashMap::new(),
+            avatar_pending: HashSet::new(),
             typing: HashMap::new(),
             thread_root: None,
             thread_rows: Rc::default(),
@@ -521,14 +529,27 @@ impl Snak {
                 );
                 cx.notify();
             }
-            Event::PresenceChanged { user, presence } => {
-                self.presences.insert(user, presence);
+            Event::PresenceChanged {
+                user,
+                presence,
+                activity,
+                last_online,
+            } => {
+                self.presences.insert(
+                    user,
+                    PresenceInfo {
+                        availability: presence,
+                        activity,
+                        last_online,
+                    },
+                );
                 cx.notify();
             }
             Event::Connected => {
                 // Anything that happened while disconnected was missed.
                 self.live = true;
                 self.load_conversations(cx);
+                self.load_avatars(cx);
                 // Loading marks it read, so only when it's actually on screen.
                 if !self.showing_unreads {
                     self.load_conversation(cx);
@@ -743,8 +764,8 @@ impl Snak {
     /// Teams' availability words map to Slack-style dot colors; anything
     /// unknown gets the grey of Offline rather than nothing, so a status
     /// is never silently missing.
-    fn presence_color(presence: &str, theme: &gpui_kit::component::Theme) -> Hsla {
-        match presence {
+    fn presence_color(availability: &str, theme: &gpui_kit::component::Theme) -> Hsla {
+        match availability {
             "Available" => theme.success,
             "Busy" | "DoNotDisturb" => theme.danger,
             "Away" | "BeRightBack" => theme.warning,
@@ -953,6 +974,8 @@ impl Snak {
         let mut wanted: Vec<String> = self
             .rows
             .iter()
+            .chain(self.thread_rows.iter())
+            .chain(self.profile_rows.iter())
             .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
             .flat_map(|m| m.images.iter().map(|i| i.url.clone()))
             .filter(|url| match self.images.borrow().get(url) {
@@ -1058,6 +1081,51 @@ impl Snak {
 
     /// Opens the profile panel for whoever `key` names: a DM conversation, a
     /// member id, a mention link.
+    /// Fetches the photo of every DM partner without one yet, so the sidebar
+    /// can show them without a profile opened first.
+    fn load_avatars(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let partners: Vec<(String, String)> = self
+            .conversations
+            .iter()
+            .filter(|conversation| matches!(conversation.kind, ConversationKind::Direct))
+            .filter(|conversation| {
+                !self.avatars.contains_key(&conversation.title)
+                    && !self.avatar_pending.contains(&conversation.title)
+            })
+            .map(|conversation| (conversation.id.0.clone(), conversation.title.clone()))
+            .collect::<Vec<_>>();
+        for (id, name) in partners {
+            self.avatar_pending.insert(name.clone());
+            let name = name.clone();
+            let backend = backend.clone();
+            cx.spawn(async move |this, cx| {
+                let photo = io(async move { backend.person(&id).await })
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|person| person.photo)
+                    .and_then(|bytes| {
+                        image_format(&bytes)
+                            .map(|format| Arc::new(Image::from_bytes(format, bytes)))
+                    });
+                this.update(cx, |this, cx| {
+                    if let Some(photo) = photo {
+                        this.avatars.insert(name.clone(), photo);
+                    } else {
+                        // No photo, or no person: stop asking for this one.
+                        this.avatar_pending.remove(&name);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
     fn open_profile(&mut self, key: String, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -1078,6 +1146,16 @@ impl Snak {
             this.update(cx, |this, cx| match result.ok().flatten() {
                 Some((person, rows)) => {
                     sync_scroller(&this.profile_scroller, &this.profile_rows, &rows, cx);
+                    if let Some(photo) = person
+                        .photo
+                        .as_ref()
+                        .and_then(|bytes| image_format(bytes).map(|format| (format, bytes)))
+                    {
+                        this.avatars.insert(
+                            person.display_name.clone(),
+                            Arc::new(Image::from_bytes(photo.0, photo.1.to_vec())),
+                        );
+                    }
                     this.profile = Some(person);
                     this.profile_rows = Rc::new(rows);
                     cx.notify();
@@ -1441,6 +1519,43 @@ fn mentioned<E: Styled>(el: E, cx: &App) -> E {
 fn is_safe_link(url: &str) -> bool {
     let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
     matches!(scheme.as_str(), "https" | "http" | "mailto" | "msteams")
+}
+
+/// One person's live state, kept under their display name.
+#[derive(Clone)]
+struct PresenceInfo {
+    availability: String,
+    activity: Option<String>,
+    last_online: Option<String>,
+}
+
+/// Teams' activity words in something a person reads.
+fn activity_text(activity: &str) -> String {
+    match activity {
+        "InACall" | "InACallPresentation" => "in a call".into(),
+        "InAMeeting" | "InAMeetingPresentation" => "in a meeting".into(),
+        "Presenting" => "presenting".into(),
+        "Working" => "working".into(),
+        other => other.to_lowercase(),
+    }
+}
+
+/// When a person was last seen, from Teams' UTC timestamp.
+fn last_online_text(iso: &str) -> Option<String> {
+    let seen = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
+    let minutes = chrono::Utc::now()
+        .signed_duration_since(seen)
+        .num_minutes()
+        .max(0);
+    Some(if minutes < 1 {
+        "just now".into()
+    } else if minutes < 60 {
+        format!("{minutes} min ago")
+    } else if minutes < 24 * 60 {
+        format!("{} h ago", minutes / 60)
+    } else {
+        format!("{} d ago", minutes / (24 * 60))
+    })
 }
 
 fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
@@ -1893,7 +2008,7 @@ impl Snak {
         let presence_dot = if matches!(entry.kind, ConversationKind::Direct) {
             self.presences
                 .get(&entry.title)
-                .map(|presence| Self::presence_color(presence, theme))
+                .map(|presence| Self::presence_color(presence.availability.as_str(), theme))
         } else {
             None
         };
@@ -1901,6 +2016,12 @@ impl Snak {
             div().child("#").into_any_element()
         } else if matches!(entry.kind, snak_chat::ConversationKind::Group) {
             Icon::new(gpui_kit::assets::IconName::Users)
+                .xsmall()
+                .into_any_element()
+        } else if let Some(avatar) = self.avatars.get(&entry.title) {
+            Avatar::new()
+                .src(avatar.clone())
+                .name(entry.title.clone())
                 .xsmall()
                 .into_any_element()
         } else {
@@ -2716,10 +2837,19 @@ impl Snak {
         let Some(person) = self.profile.as_ref() else {
             return div().into_any_element();
         };
-        let presence_dot = self
-            .presences
-            .get(&person.display_name)
-            .map(|presence| Self::presence_color(presence, theme));
+        let presence = self.presences.get(&person.display_name);
+        let presence_dot = presence.map(|p| Self::presence_color(p.availability.as_str(), theme));
+        let availability = presence.map(|p| p.availability.clone());
+        let activity = presence
+            .and_then(|p| p.activity.as_deref())
+            .map(activity_text);
+        let last_online = presence
+            .and_then(|p| p.last_online.as_deref())
+            .and_then(last_online_text);
+        // Photos come as raw bytes; decode once when the panel opens.
+        let avatar = person.photo.as_ref().and_then(|bytes| {
+            image_format(bytes).map(|format| Arc::new(Image::from_bytes(format, bytes.clone())))
+        });
         let mail = person.mail.clone();
         let call_url = person
             .dm
@@ -2733,35 +2863,72 @@ impl Snak {
             .border_color(theme.border)
             .bg(theme.background)
             .child(
-                h_flex()
+                // The about block: photo and name on top, then a line each for
+                // title, online state, mail and call, stacked like a card.
+                v_flex()
                     .flex_none()
-                    .h(px(48.))
+                    .h(px(96.))
                     .px_4()
+                    .gap_0()
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .child(person.display_name.clone()),
+                        h_flex()
+                            .flex_none()
+                            .h(px(48.))
+                            .gap_1p5()
+                            .child(
+                                Avatar::new()
+                                    .name(person.display_name.clone())
+                                    .when_some(avatar.clone(), |el, avatar| el.src(avatar)),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(person.display_name.clone()),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .when_some(person.job_title.clone(), |el, title| {
-                                el.child(div().text_xs().child(title))
-                            }),
-                    )
+                    .when_some(person.job_title.clone(), |el, title| {
+                        el.child(div().flex_none().h(px(16.)).text_sm().child(title))
+                    })
                     .when_some(presence_dot, |el, dot| {
-                        el.child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+                        el.child(
+                            div()
+                                .flex_none()
+                                .h(px(16.))
+                                .text_sm()
+                                .child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+                                .when_some(availability.clone(), |el, word| {
+                                    el.child(div().child(word))
+                                })
+                                .when_some(activity, |el, activity| el.child(div().child(activity)))
+                                .when_some(last_online, |el, last| el.child(div().child(last))),
+                        )
                     })
                     .when_some(mail.clone(), |el, mail| {
+                        let copy = mail.clone();
+                        let open = mail.clone();
                         el.child(
-                            Button::new("profile-email")
-                                .small()
-                                .ghost()
-                                .label("Email")
+                            div()
+                                .flex_none()
+                                .h(px(16.))
+                                .id("profile-email")
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(theme.link)
+                                .child(format!("Mail: {mail}"))
+                                .child(
+                                    div()
+                                        .id("profile-email-copy")
+                                        .child(Icon::new(IconName::Copy).xsmall())
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy.clone(),
+                                            ))
+                                        }),
+                                )
                                 .on_click(move |_, _, cx| {
-                                    let mailto = format!("mailto:{mail}");
+                                    let mailto = format!("mailto:{open}");
                                     cx.open_url(&mailto)
                                 }),
                         )
@@ -2771,7 +2938,7 @@ impl Snak {
                             Button::new("profile-call")
                                 .small()
                                 .ghost()
-                                .label("Call")
+                                .icon(Icon::new(gpui_kit::assets::IconName::Phone))
                                 .on_click(move |_, _, cx| {
                                     let url = url.clone();
                                     cx.open_url(&url)

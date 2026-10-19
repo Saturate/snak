@@ -152,6 +152,8 @@ pub struct Me {
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub display_name: String,
+    /// Profile photo bytes, when the backend can fetch one.
+    pub photo: Option<Vec<u8>>,
     pub mail: Option<String>,
     pub job_title: Option<String>,
     pub phones: Vec<String>,
@@ -177,10 +179,13 @@ pub enum Event {
         user: String,
     },
     /// Someone's presence changed; `presence` is the service's own word for
-    /// it, e.g. Teams' `Available`, `Away` or `Offline`.
+    /// it, e.g. Teams' `Available`, `Away` or `Offline`. `activity` is what
+    /// they're doing, and `last_online` when they were last seen, if known.
     PresenceChanged {
         user: String,
         presence: String,
+        activity: Option<String>,
+        last_online: Option<String>,
     },
 }
 

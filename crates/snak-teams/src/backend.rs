@@ -130,12 +130,14 @@ impl ChatBackend for TeamsBackend {
             let Some(person) = people.get(&object_id) else {
                 return Ok(None);
             };
+            let photo = client.photo(&object_id).await.ok().flatten();
             Ok(Some(Profile {
                 display_name: person.display_name.clone().unwrap_or_default(),
                 // Graph's `mail` is missing for guests; the UPN still works.
                 mail: person.mail.clone().or(person.upn.clone()),
                 job_title: person.job_title.clone(),
                 phones: person.phones.clone(),
+                photo,
                 dm,
             }))
         })
@@ -296,6 +298,8 @@ fn translate(event: PushEvent, names: &HashMap<String, String>) -> Vec<Event> {
             .map(|p| Event::PresenceChanged {
                 user: name(&p.mri).cloned().unwrap_or_default(),
                 presence: p.availability.clone().unwrap_or("Offline".into()),
+                activity: p.activity.clone(),
+                last_online: p.last_active_time.clone(),
             })
             .collect(),
     }
@@ -1593,8 +1597,12 @@ mod tests {
         );
         assert!(matches!(
             events.as_slice(),
-            [Event::PresenceChanged { user, presence }]
-                if user == "Maja" && presence == "Available"
+            [Event::PresenceChanged {
+                user,
+                presence,
+                activity: None,
+                last_online: None,
+            }] if user == "Maja" && presence == "Available"
         ));
     }
 

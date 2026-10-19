@@ -391,7 +391,12 @@ impl Link {
             .header("Content-Length", "0")
             .send()
             .await?;
-        decode(res, &url).await
+        let alloc: Allocation = decode(res, &url).await?;
+        // Issue #19: allocation carries the signature parameters whose names
+        // Squads guessed; log the keys that came back, never their values.
+        let keys: Vec<&str> = alloc.connectparams.keys().map(String::as_str).collect();
+        tracing::debug!(has_ccid = alloc.ccid.is_some(), ?keys, "trouter allocation");
+        Ok(alloc)
     }
 
     /// The socket.io handshake answers `<session id>:<heartbeat>:<close>:<transports>`.
@@ -423,10 +428,15 @@ impl Link {
                 body,
             });
         }
-        parse_session_id(&body).ok_or(CoreError::MissingField {
+        let session_id = parse_session_id(&body).ok_or(CoreError::MissingField {
             url: redacted,
             field: "socket.io session id",
-        })
+        })?;
+        // Issue #19: the handshake body says what socket.io dialect Trouter
+        // speaks; log its parts (ids and timeouts only) to check the
+        // `1::` handshake guess.
+        tracing::debug!(handshake = %body.chars().take(60).collect::<String>(), "trouter handshake");
+        Ok(session_id)
     }
 
     /// Tells the registrar which Trouter path should receive pushes for each app.
@@ -465,7 +475,12 @@ impl Link {
                 .json(&body)
                 .send()
                 .await?;
+            // Issue #19: the templateKey and platformUIVersion are guesses
+            // from Squads; log what each registration returns so a live run
+            // shows whether Teams accepts them or nudges a version.
+            let status = res.status();
             let _: Value = decode(res, REGISTRAR).await?;
+            tracing::debug!(app_id, template_key, %status, "registered with the registrar");
         }
         Ok(())
     }
@@ -532,6 +547,11 @@ fn trusted_url(raw: &str) -> Result<Url> {
     } else {
         Err(CoreError::Push(format!("refusing Trouter host {host}")))
     }
+}
+
+/// Frame text can carry message bodies; only a shape prefix reaches logs.
+fn truncate(text: &str) -> String {
+    text.chars().take(120).collect()
 }
 
 fn redact(url: &Url) -> String {
@@ -629,15 +649,26 @@ fn handle_frame(text: &str) -> Handled {
     match parse_frame(text) {
         Frame::Heartbeat => handled.replies.push("2::".into()),
         Frame::Disconnect => handled.close = Some("server disconnected".into()),
-        Frame::Error(reason) => handled.close = Some(format!("server error: {reason}")),
-        Frame::Event { ack_id, .. } => {
+        Frame::Error(reason) => {
+            tracing::debug!(%reason, "trouter error frame");
+            handled.close = Some(format!("server error: {reason}"));
+        }
+        Frame::Event { ack_id, data } => {
+            // Events Trouter itself sends (`trouter.connected` and friends);
+            // the name is all we log, acked or not.
+            let name = serde_json::from_str::<Value>(data)
+                .ok()
+                .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string));
+            tracing::debug!(event = name.as_deref(), "trouter event frame");
             // Unacked events are redelivered and hold back later ones (per ost).
             if let Some(id) = ack_id {
+                tracing::debug!(%id, "acknowledging event");
                 handled.replies.push(format!("6:{id}::"));
             }
         }
         Frame::Message(data) => {
             let Ok(request) = serde_json::from_str::<Value>(data) else {
+                tracing::debug!(frame = %truncate(text), "unreadable push frame");
                 return handled;
             };
             // Each `3:::` frame is an HTTP request relayed from a backend;
@@ -646,13 +677,81 @@ fn handle_frame(text: &str) -> Handled {
                 let response = json!({ "id": id, "status": 200 });
                 handled.replies.push(format!("3:::{response}"));
             }
-            if let Some(event) = request.get("body").and_then(parse_notification) {
-                handled.events.push(event);
+            if let Some(body) = request.get("body") {
+                log_push_shape(body);
+                if let Some(event) = parse_notification(body) {
+                    handled.events.push(event);
+                }
+            } else {
+                log_push_shape(&request);
             }
         }
-        Frame::Connect | Frame::Ack | Frame::Noop | Frame::Unknown => {}
+        // Ack frames can carry data; their raw shape is what the guess
+        // verification needs, never their payload.
+        Frame::Ack => {
+            tracing::debug!(frame = %truncate(text), "trouter ack frame");
+        }
+        Frame::Connect => tracing::debug!("trouter connect frame"),
+        Frame::Noop => tracing::debug!("trouter noop frame"),
+        Frame::Unknown => {
+            tracing::debug!(frame = %truncate(text), "unknown trouter frame");
+        }
     }
     handled
+}
+
+/// Debug-shapes for issue #19: verify the payload guesses against live
+/// traffic by running with `SNAK_LOG=debug` (or the push example) and
+/// reading what resourceTypes and body keys Teams actually sends. Values
+/// are never logged, only field names, so message text stays out of logs.
+fn log_push_shape(body: &Value) {
+    let Some(object) = body.as_object() else {
+        // Bodies arrive both as inline objects and as JSON strings, the
+        // same way `parse_notification` takes them.
+        if let Value::String(raw) = body
+            && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+            && parsed.is_object()
+        {
+            return log_push_shape(&parsed);
+        }
+        tracing::debug!(kind = "non object", "push body ignored");
+        return;
+    };
+    let keys: String = object
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    match body.get("presence") {
+        Some(list) => {
+            let count = list.as_array().map_or(0, Vec::len);
+            tracing::debug!(%keys, count, "presence push");
+        }
+        None => {
+            let resource_type = body.get("resourceType").and_then(Value::as_str);
+            let Some(resource) = body.get("resource").and_then(Value::as_object) else {
+                tracing::debug!(%keys, ?resource_type, "push body without resource");
+                return;
+            };
+            let resource_keys = resource
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            let message_type = resource.get("messagetype").and_then(Value::as_str);
+            // A resourceType outside the handled set says exactly what to add
+            // next; flag it so a shared debug log greps straight to it.
+            let known = matches!(
+                resource_type,
+                Some("NewMessage" | "MessageUpdate" | "ConversationUpdate" | "ThreadUpdate")
+            );
+            if !known {
+                tracing::debug!(%keys, ?resource_type, %resource_keys, ?message_type, "UNKNOWN push resource type");
+            } else {
+                tracing::debug!(%keys, ?resource_type, %resource_keys, ?message_type, "push notification");
+            }
+        }
+    }
 }
 
 /// Turns the relayed request body into an event. Squads sends it as a JSON
@@ -710,7 +809,10 @@ fn parse_notification(body: &Value) -> Option<PushEvent> {
                     user_mri,
                 });
             }
-            if kind.starts_with("Control/") {
+            // Live traffic also sends `ThreadActivity/...` markers (read
+            // receipts, consumption horizons) with no message content; they
+            // carry no message.
+            if kind.starts_with("Control/") || kind.starts_with("ThreadActivity/") {
                 return None;
             }
             let changed = resource_type == Some("MessageUpdate")
@@ -936,6 +1038,13 @@ mod tests {
 
         let clear = message_body("NewMessage", "Control/ClearTyping", json!({}));
         assert!(parse_notification(&clear).is_none());
+
+        let horizon = message_body(
+            "NewMessage",
+            "ThreadActivity/MemberConsumptionHorizonUpdate",
+            json!({}),
+        );
+        assert!(parse_notification(&horizon).is_none());
     }
 
     #[test]
@@ -980,6 +1089,32 @@ mod tests {
         });
         assert!(parse_notification(&body).is_none());
         assert!(parse_notification(&json!({ "nothing": true })).is_none());
+    }
+
+    #[test]
+    fn push_shapes_log_without_panicking() {
+        // Odd bodies must reach the shape log without unwinding; a live day
+        // of traffic sends shapes we have no structs for.
+        for body in [
+            json!("a string"),
+            json!(42),
+            json!({}),
+            json!({ "presence": "not a list" }),
+            json!({ "resourceType": "NewMessage", "resource": "not an object" }),
+            json!({ "resourceType": 7, "resource": { "id": "x" } }),
+            message_body("NewMessage", "RichText/Html", json!({})),
+        ] {
+            log_push_shape(&body);
+        }
+    }
+
+    #[test]
+    fn truncate_stays_on_char_boundaries() {
+        assert_eq!(truncate("plain"), "plain");
+        // The euro sign is four bytes; slicing by bytes would panic.
+        let long: String = "€".repeat(50);
+        assert_eq!(truncate(&long).chars().count(), 50);
+        assert_eq!(truncate(&"x".repeat(300)).chars().count(), 120);
     }
 
     #[test]

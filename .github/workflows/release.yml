@@ -69,11 +69,19 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: aarch64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
             archive: Snak-macos-aarch64.zip
-          - target: x86_64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
             archive: Snak-macos-x86_64.zip
-    runs-on: macos-latest
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: Snak-windows-x64.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: Snak-linux-x64.zip
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
@@ -90,16 +98,40 @@ jobs:
           toolchain: "1.97"
           targets: ${{ matrix.target }}
 
+      # GPUI's Linux build links against Wayland/X11/fontconfig and the rest
+      # of gpui-kit's system libraries (script/install-linux.sh upstream).
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+            libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libssl-dev libzstd-dev libasound2-dev libvulkan1
+
       - name: Build Snak.app
+        if: matrix.os == 'macos-latest'
         run: ./scripts/bundle.sh --release --target ${{ matrix.target }}
+
+      - name: Build binary
+        if: matrix.os != 'macos-latest'
+        run: cargo build --release -p snak-app --target ${{ matrix.target }}
 
       # Not notarized: without a Developer ID, macOS needs right-click → Open
       # the first time. An ad-hoc signature over the whole bundle still keeps
       # Apple Silicon from refusing to launch it.
-      - name: Package
+      - name: Package macOS bundle
+        if: matrix.os == 'macos-latest'
         run: |
           codesign --force --deep --sign - target/Snak.app
           ditto -c -k --keepParent target/Snak.app "${{ matrix.archive }}"
+
+      - name: Package Windows binary
+        if: matrix.os == 'windows-latest'
+        run: pwsh -c 'Compress-Archive -Path target/${{ matrix.target }}/release/snak.exe -DestinationPath ${{ matrix.archive }}'
+
+      - name: Package Linux binary
+        if: matrix.os == 'ubuntu-latest'
+        run: zip "${{ matrix.archive }}" "target/${{ matrix.target }}/release/snak"
 
       - name: Upload to release
         run: gh release upload "v${{ needs.release.outputs.version }}" "${{ matrix.archive }}" --clobber

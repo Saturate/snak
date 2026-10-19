@@ -134,6 +134,10 @@ async fn main() {
                 Some(Event::SessionExpired) => break println!("push: session expired"),
                 Some(Event::MessagesChanged(_)) => println!("push: messages changed"),
                 Some(Event::ConversationsChanged) => println!("push: conversations changed"),
+                Some(Event::Typing { user, .. }) => {
+                    println!("push: typing (named: {})", !user.is_empty())
+                }
+                Some(Event::PresenceChanged { presence, .. }) => println!("push: presence {presence}"),
                 None => break println!("push: channel closed"),
             },
         }

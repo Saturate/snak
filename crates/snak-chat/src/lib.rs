@@ -158,6 +158,19 @@ pub enum Event {
     Reconnecting,
     /// Push stopped because credentials expired; the user has to sign in again.
     SessionExpired,
+    /// Someone is typing in this conversation. Services send no "stopped",
+    /// so expire it after a few seconds.
+    Typing {
+        conversation: ConversationId,
+        /// Display name, empty when unknown.
+        user: String,
+    },
+    /// Someone's presence changed; `presence` is the service's own word for
+    /// it, e.g. Teams' `Available`, `Away` or `Offline`.
+    PresenceChanged {
+        user: String,
+        presence: String,
+    },
 }
 
 /// A signed-in chat service.

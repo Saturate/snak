@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use gpui_kit::*;
 use crate::code_blocks;
 use snak_chat::{
     Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, Group, ImageRef,
-    LoginPrompt, Message, MessageId,
+    LoginPrompt, Message, MessageId, MessagesPage,
 };
 
 use crate::prefs::{Placement, Prefs, group_key, team_key};
@@ -111,6 +111,10 @@ fn first_frame_png(bytes: &[u8]) -> Option<Arc<Image>> {
 /// GIFs the user clicked; they play when this differs from the autoplay setting.
 type GifToggles = Rc<RefCell<std::collections::HashSet<String>>>;
 
+/// The loaded page's top row was on screen, so the reader has scrolled as
+/// high as what's loaded goes: the page before it belongs on screen.
+type TopSeen = Rc<Cell<bool>>;
+
 /// Shared with the timeline renderers, which run outside this view's update.
 type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
 
@@ -178,6 +182,13 @@ pub struct Snak {
     auth_task: Option<Task<()>>,
     sidebar_task: Option<Task<()>>,
     conversation_task: Option<Task<()>>,
+    /// Where the page before the loaded rows keeps going, from the last page
+    /// the service served; `None` once it ran out of earlier messages.
+    older: Option<String>,
+    /// The page before the loaded rows loads one at a time; the task is set
+    /// while it does, so scrolling doesn't stack fetches.
+    older_task: Option<Task<()>>,
+    top_seen: TopSeen,
     poll_task: Option<Task<()>>,
     events_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -205,7 +216,10 @@ impl Snak {
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_appearance(window, cx)
             }),
-            cx.observe(&scroller, |_, _, cx| cx.notify()),
+            cx.observe(&scroller, |this, _, cx| {
+                this.check_older(cx);
+                cx.notify();
+            }),
             cx.observe(&thread_scroller, |_, _, cx| cx.notify()),
             cx.subscribe_in(&jump, window, |this, _, event, window, cx| match event {
                 InputEvent::Change => cx.notify(),
@@ -268,6 +282,9 @@ impl Snak {
             auth_task: None,
             sidebar_task: None,
             conversation_task: None,
+            older: None,
+            older_task: None,
+            top_seen: TopSeen::default(),
             poll_task: None,
             events_task: None,
             _subscriptions: subscriptions,
@@ -402,6 +419,8 @@ impl Snak {
         self.poll_task = None;
         self.sidebar_task = None;
         self.conversation_task = None;
+        self.older = None;
+        self.older_task = None;
         self.refetch_task = None;
         self.sidebar_loading = false;
         self.sidebar_dirty = false;
@@ -757,6 +776,8 @@ impl Snak {
                 .update(cx, |state, cx| state.set_value(draft, window, cx));
             self.selected = Some(id);
             self.thread_root = None;
+            self.older = None;
+            self.older_task = None;
             self.set_rows(Vec::new(), cx);
         }
         self.composer
@@ -777,8 +798,9 @@ impl Snak {
                     return;
                 }
                 match result {
-                    Ok(rows) => {
-                        let rows = keep_older_rows(&this.rows, rows);
+                    Ok(page) => {
+                        let rows = keep_older_rows(&this.rows, page.messages);
+                        this.older = page.older;
                         this.set_rows(rows, cx);
                         this.mark_read(&requested, cx);
                     }
@@ -787,6 +809,85 @@ impl Snak {
             })
             .ok();
         }));
+    }
+
+    /// The reader has scrolled as high as the loaded rows go, so the page
+    /// before them loads; one fetch at a time.
+    fn check_older(&mut self, cx: &mut Context<Self>) {
+        if !self.top_seen.get() || self.older_task.is_some() || self.older.is_none() {
+            return;
+        }
+        // Rows the scroller renders above the screen (its overdraw) can put
+        // the latch without the reader having scrolled; only a reader away
+        // from the live edge is scrolling up.
+        if !self.scroller.read(cx).is_scrolled_up() {
+            return;
+        }
+        let (Some(backend), Some(id), Some(older)) = (
+            self.backend.clone(),
+            self.selected.clone(),
+            self.older.clone(),
+        ) else {
+            return;
+        };
+        self.older_task = Some(cx.spawn(async move |this, cx| {
+            let requested = id.clone();
+            let result = io(async move { backend.older_messages(&id, &older).await }).await;
+            this.update(cx, |this, cx| {
+                this.older_task = None;
+                // The reader may have moved on while this was loading; the
+                // cursor belonged to that conversation.
+                if this.selected.as_ref() != Some(&requested) {
+                    this.older = None;
+                    return;
+                }
+                match result {
+                    Ok(page) => this.prepend_rows(page, cx),
+                    // The latch drops too, so a failed page doesn't retry on
+                    // every render; the reader scrolling again brings it back.
+                    Err(e) => {
+                        this.top_seen.set(false);
+                        this.show_error(e, cx)
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Older messages go in front of the timeline, keeping the reader's
+    /// place in it.
+    fn prepend_rows(&mut self, page: MessagesPage, cx: &mut Context<Self>) {
+        let MessagesPage { messages, older } = page;
+        self.older = older;
+        // A page can lap rows already here, e.g. when the service reshuffled
+        // them; each id shows once.
+        let ids: std::collections::HashSet<MessageId> =
+            self.rows.iter().map(|m| m.id.clone()).collect();
+        let mut older_rows: Vec<Message> = messages
+            .into_iter()
+            .filter(|m| !ids.contains(&m.id))
+            .collect();
+        older_rows.sort_by_key(|m| m.sent_at);
+        let Some(older_rows) = (!older_rows.is_empty()).then_some(older_rows) else {
+            // Nothing new came back; a service that keeps claiming more
+            // while serving nothing is done.
+            self.older = None;
+            return;
+        };
+        let count = older_rows.len();
+        let rows: Vec<Message> = older_rows
+            .into_iter()
+            .chain(self.rows.iter().cloned())
+            .collect();
+        self.scroller
+            .update(cx, |state, cx| state.prepend(count, cx));
+        self.rows = Rc::new(rows);
+        // The prepended rows are the new top, so the page before them
+        // belongs on screen once the reader gets there.
+        self.top_seen.set(false);
+        self.load_images(cx);
+        cx.notify();
     }
 
     /// Only conversations the service still calls unread get a request, so
@@ -860,6 +961,9 @@ impl Snak {
                 }
             }
         }
+        // Rows replaced wholesale, so where they now sit says nothing about
+        // the reader having scrolled up; the latch returns when rows render.
+        self.top_seen.set(false);
         sync_scroller(&self.scroller, &self.rows, &rows, cx);
         self.rows = Rc::new(rows);
         self.load_images(cx);
@@ -2307,8 +2411,16 @@ impl Snak {
         on_thread: Option<OnThread>,
         images: ImageCache,
         gif_toggles: GifToggles,
+        top_seen: Option<TopSeen>,
     ) -> impl IntoElement {
         MessageScroller::new(id, scroller.clone(), move |index, _, cx| {
+            // A row 0 on screen is the top of what's loaded; only the main
+            // timeline carries one, the thread panel pages nothing.
+            if let Some(top_seen) = top_seen.as_ref()
+                && index == 0
+            {
+                top_seen.set(true);
+            }
             let Some(row) = rows.get(index) else {
                 return div().into_any_element();
             };
@@ -2497,6 +2609,7 @@ impl Snak {
                 on_thread,
                 self.images.clone(),
                 self.gif_toggles.clone(),
+                Some(self.top_seen.clone()),
             )))
             .child(
                 div()
@@ -2544,6 +2657,7 @@ impl Snak {
                 None,
                 self.images.clone(),
                 self.gif_toggles.clone(),
+                None,
             )))
             .child(
                 div()

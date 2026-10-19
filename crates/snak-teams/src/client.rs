@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::{self, AccessToken, scope};
 use crate::error::{CoreError, Result};
-use crate::models::{ChannelPage, Me, MessagePage, Person, ReplyChain, UserDetails};
+use crate::models::{ChannelPage, Me, MessagePage, Person, UserDetails};
 use crate::store::StoredLogin;
 
 const TEAMS: &str = "https://teams.microsoft.com";
@@ -251,16 +251,50 @@ impl TeamsClient {
         self.get_json(scope::CHAT, &url).await
     }
 
-    /// Recent channel posts, each with its replies.
-    pub async fn channel_posts(&self, team_id: &str, channel_id: &str) -> Result<Vec<ReplyChain>> {
+    /// The page of a chat's messages older than `sync_state`, a cursor from
+    /// an earlier [`Self::chat_messages`] or `chat_messages_before` response.
+    pub async fn chat_messages_before(
+        &self,
+        conversation_id: &str,
+        sync_state: &str,
+    ) -> Result<MessagePage> {
+        let url = format!(
+            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/messages?pageSize=200&syncState={}",
+            self.region,
+            urlencode(conversation_id),
+            urlencode(sync_state)
+        );
+        self.get_json(scope::CHAT, &url).await
+    }
+
+    /// Recent channel posts, each with its replies, with where the next,
+    /// older page keeps going.
+    pub async fn channel_posts(&self, team_id: &str, channel_id: &str) -> Result<ChannelPage> {
         let url = format!(
             "{TEAMS}/api/csa/{}/api/v2/teams/{}/channels/{}",
             self.region,
             urlencode(team_id),
             urlencode(channel_id)
         );
-        let page: ChannelPage = self.get_json(scope::CHAT_AGGREGATOR, &url).await?;
-        Ok(page.reply_chains)
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
+    }
+
+    /// The channel posts older than `continuation_token`, a cursor from an
+    /// earlier [`Self::channel_posts`] or `channel_posts_before` response.
+    pub async fn channel_posts_before(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        continuation_token: &str,
+    ) -> Result<ChannelPage> {
+        let url = format!(
+            "{TEAMS}/api/csa/{}/api/v2/teams/{}/channels/{}?continuationToken={}",
+            self.region,
+            urlencode(team_id),
+            urlencode(channel_id),
+            urlencode(continuation_token)
+        );
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
     }
 
     /// Bytes of an image embedded in a message. Only Microsoft's own media

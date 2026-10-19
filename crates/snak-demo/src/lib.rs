@@ -8,12 +8,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, Reaction,
+    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, MessagesPage, Reaction,
 };
 use tokio::sync::mpsc;
 
 const ME_ID: &str = "me";
 const ACTIVITY_EVERY: Duration = Duration::from_secs(40);
+/// The demo pages like a real service, so scrolling up has history to load.
+const PAGE: usize = 20;
 
 struct Person {
     id: &'static str,
@@ -149,12 +151,40 @@ impl ChatBackend for DemoBackend {
         Box::pin(async move { Ok(list) })
     }
 
-    fn messages<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, Vec<Message>> {
+    fn messages<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, MessagesPage> {
         let result = match self.state().thread(id) {
             Some(thread) => {
                 // Opening a conversation reads it, as it would in a real client.
                 thread.conversation.unread = false;
-                Ok(thread.messages.clone())
+                let start = thread.messages.len().saturating_sub(PAGE);
+                Ok(MessagesPage {
+                    messages: thread.messages[start..].to_vec(),
+                    older: older_cursor(&thread.messages, start),
+                })
+            }
+            None => Err(ChatError::Other(format!("no conversation {}", id.0))),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn older_messages<'a>(
+        &'a self,
+        id: &'a ConversationId,
+        older: &'a str,
+    ) -> BoxFuture<'a, MessagesPage> {
+        let result = match self.state().thread(id) {
+            Some(thread) => {
+                // The cursor is the id of the page's oldest message.
+                let Some(end) = thread.messages.iter().position(|m| m.id.0 == older) else {
+                    return Box::pin(async {
+                        Err(ChatError::Other("stale older-messages cursor".into()))
+                    });
+                };
+                let start = end.saturating_sub(PAGE);
+                Ok(MessagesPage {
+                    messages: thread.messages[start..end].to_vec(),
+                    older: older_cursor(&thread.messages, start),
+                })
             }
             None => Err(ChatError::Other(format!("no conversation {}", id.0))),
         };
@@ -281,6 +311,15 @@ impl Connector for DemoConnector {
     fn set_credential_storage(&self, _: snak_chat::CredentialStorage) -> BoxFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// The cursor for the page starting at `start`: the id of the message
+/// before it, if the history runs deeper.
+fn older_cursor(messages: &[Message], start: usize) -> Option<String> {
+    start
+        .checked_sub(1)
+        .and_then(|older| messages.get(older))
+        .map(|m| m.id.0.clone())
 }
 
 fn escape(text: &str) -> String {
@@ -457,15 +496,29 @@ fn seed(now: DateTime<Utc>) -> State {
     );
     review_post.mentions_me = true;
 
+    // Enough backlog in #general that scrolling up has pages to load.
+    let mut backlog: Vec<Message> = (1..=3 * PAGE)
+        .map(|n| {
+            let author = &PEOPLE[n % PEOPLE.len()];
+            message(
+                id(),
+                author.id,
+                ago(1440 + 60 * (3 * PAGE - n) as i64),
+                &format!("<p>Old message {n}, from the backlog.</p>"),
+            )
+        })
+        .collect();
+    backlog.push(message(
+        id(),
+        "sara",
+        ago(1440),
+        "<p>Welcome Ida, who joins the platform team today 👋</p>",
+    ));
+
     let mut threads = vec![
         Thread {
             conversation: channel("eng-general", "Engineering", "general"),
-            messages: vec![message(
-                id(),
-                "sara",
-                ago(1440),
-                "<p>Welcome Ida, who joins the platform team today 👋</p>",
-            )],
+            messages: backlog,
         },
         Thread {
             conversation: channel("eng-backend", "Engineering", "backend"),
@@ -582,17 +635,49 @@ mod tests {
     }
 
     #[test]
+    fn only_the_newest_page_is_loaded() {
+        let backend = DemoBackend::new();
+        let id = ConversationId("eng-general".into());
+        let page = block_on(backend.messages(&id)).expect("messages");
+        assert_eq!(page.messages.len(), PAGE);
+        assert!(page.older.is_some());
+    }
+
+    #[test]
+    fn older_pages_run_out() {
+        let backend = DemoBackend::new();
+        let id = ConversationId("eng-general".into());
+        let first = block_on(backend.messages(&id)).expect("messages");
+        assert_eq!(first.messages.len(), PAGE);
+        let mut seen: Vec<String> = first.messages.iter().map(|m| m.id.0.clone()).collect();
+        let mut cursor = first.older;
+        while let Some(older) = cursor.take() {
+            let page = block_on(backend.older_messages(&id, &older)).expect("older");
+            assert!(!page.messages.is_empty());
+            seen.extend(page.messages.iter().map(|m| m.id.0.clone()));
+            cursor = page.older;
+        }
+        // Every id shows exactly once, and the backlog runs deeper than a
+        // single page.
+        assert!(seen.len() > PAGE);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len());
+    }
+
+    #[test]
     fn replies_land_under_their_post() {
         let backend = DemoBackend::new();
         let id = ConversationId("eng-backend".into());
         let posts = block_on(backend.messages(&id)).expect("messages");
-        let count = posts.len();
-        let root = posts[0].id.clone();
+        let count = posts.messages.len();
+        let root = posts.messages[0].id.clone();
         block_on(backend.send(&id, Some(&root), "on it")).expect("send");
         let posts = block_on(backend.messages(&id)).expect("messages");
-        assert_eq!(posts.len(), count);
+        assert_eq!(posts.messages.len(), count);
         assert!(
-            matches!(&posts[0].replies.last().expect("reply").body, Body::Html(h) if h == "<p>on it</p>")
+            matches!(&posts.messages[0].replies.last().expect("reply").body, Body::Html(h) if h == "<p>on it</p>")
         );
     }
 
@@ -603,7 +688,7 @@ mod tests {
         block_on(backend.send(&id, None, "<b>hi</b>")).expect("send");
         let messages = block_on(backend.messages(&id)).expect("messages");
         assert!(
-            matches!(&messages.last().expect("message").body, Body::Html(h) if h == "<p>&lt;b&gt;hi&lt;/b&gt;</p>")
+            matches!(&messages.messages.last().expect("message").body, Body::Html(h) if h == "<p>&lt;b&gt;hi&lt;/b&gt;</p>")
         );
     }
 

@@ -148,6 +148,17 @@ pub struct Me {
     pub display_name: String,
 }
 
+/// One page of a conversation's messages, and where the page before it
+/// keeps going.
+#[derive(Debug, Clone, Default)]
+pub struct MessagesPage {
+    /// Oldest first. Channel posts carry their replies.
+    pub messages: Vec<Message>,
+    /// Cursor for [`ChatBackend::older_messages`]; `None` once the service
+    /// has run out of earlier messages.
+    pub older: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Something changed in this conversation; refetch its messages.
@@ -166,8 +177,18 @@ pub trait ChatBackend: Send + Sync {
 
     fn conversations(&self) -> BoxFuture<'_, Vec<Conversation>>;
 
-    /// Messages oldest first. Channel posts carry their replies.
-    fn messages<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, Vec<Message>>;
+    /// The newest page of messages, oldest first. Channel posts carry
+    /// their replies.
+    fn messages<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, MessagesPage>;
+
+    /// The next page of messages older than `older`, a cursor from an
+    /// earlier [`ChatBackend::messages`] or `older_messages` response for
+    /// this conversation. Oldest first, replies folded under their posts.
+    fn older_messages<'a>(
+        &'a self,
+        id: &'a ConversationId,
+        older: &'a str,
+    ) -> BoxFuture<'a, MessagesPage>;
 
     fn send<'a>(
         &'a self,

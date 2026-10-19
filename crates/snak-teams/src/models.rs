@@ -258,9 +258,27 @@ pub struct Reaction {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessagePage {
     #[serde(default)]
     pub messages: Vec<Message>,
+    /// Where the next, older page of this chat keeps going. The service
+    /// returns it while messages remain before this page.
+    #[serde(default)]
+    pub sync_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelPage {
+    #[serde(default)]
+    pub reply_chains: Vec<ReplyChain>,
+    /// Where the next, older page of this channel keeps going.
+    #[serde(default)]
+    pub continuation_token: Option<String>,
+    /// True while posts remain before this page.
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,13 +287,6 @@ pub struct ReplyChain {
     pub id: String,
     #[serde(default)]
     pub messages: Vec<Message>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChannelPage {
-    #[serde(default)]
-    pub reply_chains: Vec<ReplyChain>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,5 +333,34 @@ mod tests {
                 .and_then(|h| h.original_arrival_time),
             None
         );
+    }
+
+    #[test]
+    fn pages_parse_their_older_cursors() {
+        let chat: MessagePage = serde_json::from_value(serde_json::json!({
+            "messages": [], "syncState": "next"
+        }))
+        .expect("parses");
+        assert_eq!(chat.sync_state.as_deref(), Some("next"));
+
+        let channel: ChannelPage = serde_json::from_value(serde_json::json!({
+            "replyChains": [], "continuationToken": "next", "hasMore": true
+        }))
+        .expect("parses");
+        assert_eq!(channel.continuation_token.as_deref(), Some("next"));
+        assert!(channel.has_more);
+
+        // A page with nothing older behind it carries no cursor.
+        let done: MessagePage = serde_json::from_value(serde_json::json!({
+            "messages": []
+        }))
+        .expect("parses");
+        assert_eq!(done.sync_state, None);
+        let done: ChannelPage = serde_json::from_value(serde_json::json!({
+            "replyChains": [], "hasMore": false
+        }))
+        .expect("parses");
+        assert_eq!(done.continuation_token, None);
+        assert!(!done.has_more);
     }
 }

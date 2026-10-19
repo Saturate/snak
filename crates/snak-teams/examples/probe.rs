@@ -69,7 +69,7 @@ async fn main() {
         let Some(id) = id else { continue };
         match backend.messages(&id).await {
             Ok(messages) => {
-                let kinds = messages.iter().fold([0; 4], |mut k, m| {
+                let kinds = messages.messages.iter().fold([0; 4], |mut k, m| {
                     k[match m.body {
                         Body::Html(_) => 0,
                         Body::Text(_) => 1,
@@ -80,14 +80,26 @@ async fn main() {
                 });
                 println!(
                     "{label} messages: {} (html {}, text {}, deleted {}, events {}), {} with replies, {} replies total, {} with author id",
-                    messages.len(),
+                    messages.messages.len(),
                     kinds[0],
                     kinds[1],
                     kinds[2],
                     kinds[3],
-                    messages.iter().filter(|m| !m.replies.is_empty()).count(),
-                    messages.iter().map(|m| m.replies.len()).sum::<usize>(),
-                    messages.iter().filter(|m| m.author_id.is_some()).count(),
+                    messages
+                        .messages
+                        .iter()
+                        .filter(|m| !m.replies.is_empty())
+                        .count(),
+                    messages
+                        .messages
+                        .iter()
+                        .map(|m| m.replies.len())
+                        .sum::<usize>(),
+                    messages
+                        .messages
+                        .iter()
+                        .filter(|m| m.author_id.is_some())
+                        .count(),
                 );
             }
             Err(e) => println!("{label} messages failed: {}", redact(&e.to_string())),
@@ -102,6 +114,7 @@ async fn main() {
             continue;
         };
         for message in messages
+            .messages
             .iter()
             .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
         {

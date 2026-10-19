@@ -9,16 +9,19 @@
 
 use std::sync::Arc;
 
+const SNAK_STORE: &str = "SNAK_STORE";
+const SNAK_FIND: &str = "SNAK_FIND";
+
 use snak_chat::{ChatBackend, Connector, ConversationKind};
 use snak_teams::TeamsConnector;
 
 #[tokio::main]
 async fn main() {
-    let Some(name) = std::env::var("SNAK_FIND").ok() else {
+    let Some(name) = std::env::var(SNAK_FIND).ok() else {
         return println!("set SNAK_FIND to the name to look for");
     };
     let name = name.to_lowercase();
-    if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
+    if std::env::var(SNAK_STORE).as_deref() == Ok("file") {
         snak_teams::store::use_storage_without_moving(snak_teams::store::Storage::File);
     }
     let backend: Arc<dyn ChatBackend> = match TeamsConnector::new().restore().await {

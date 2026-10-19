@@ -297,7 +297,7 @@ fn translate(event: PushEvent, names: &HashMap<String, String>) -> Vec<Event> {
             .iter()
             .map(|p| Event::PresenceChanged {
                 user: name(&p.mri).cloned().unwrap_or_default(),
-                presence: p.availability.clone().unwrap_or("Offline".into()),
+                presence: p.availability.clone().unwrap_or_else(|| "Offline".into()),
                 activity: p.activity.clone(),
                 last_online: p.last_active_time.clone(),
             })

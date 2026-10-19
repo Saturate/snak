@@ -114,7 +114,7 @@ fn window_size() -> Size<Pixels> {
             };
             Some(size(px(side(w)?), px(side(h)?)))
         })
-        .unwrap_or(size(px(1280.), px(820.)))
+        .unwrap_or_else(|| size(px(1280.), px(820.)))
 }
 
 fn main() {

@@ -385,9 +385,11 @@ fn chat_conversations(
 ) -> Vec<Conversation> {
     chats
         .iter()
-        .filter(|chat| chat.hidden != Some(true) && chat.is_conversation_deleted != Some(true))
+        .filter(|chat| chat.is_conversation_deleted != Some(true))
         // Meeting chats belong with the meeting in Teams; they crowd out real DMs.
         .filter(|chat| chat.chat_type.as_deref() != Some("meeting"))
+        // Teams hides chats you closed in its own list, but they still open and
+        // receive messages, so they list like any other chat.
         .map(|chat| {
             let others: Vec<String> = chat
                 .members
@@ -1462,6 +1464,23 @@ mod tests {
             list[1].last_activity.is_none(),
             "small IDs are not timestamps"
         );
+    }
+
+    #[test]
+    fn closed_and_hidden_chats_stay_listed() {
+        let chats: Vec<Chat> = serde_json::from_value(serde_json::json!([
+            { "id": "19:a@thread.tacv2", "members": [], "isOneOnOne": true,
+              "lastMessage": { "from": "x", "originalArrivalTime": "2026-10-15T10:00:00Z" } },
+            { "id": "19:b@thread.tacv2", "members": [], "hidden": true, "isOneOnOne": true,
+              "lastMessage": { "from": "x", "originalArrivalTime": "2026-10-15T10:00:00Z" } },
+            { "id": "19:c@thread.tacv2", "members": [], "hidden": true,
+              "isConversationDeleted": true },
+            { "id": "19:d@thread.tacv2", "members": [], "chatType": "meeting" }
+        ]))
+        .expect("valid chats");
+        let list = chat_conversations(&chats, "", &HashMap::new(), &mut HashMap::new());
+        let ids: Vec<&str> = list.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["19:a@thread.tacv2", "19:b@thread.tacv2"]);
     }
 
     #[test]

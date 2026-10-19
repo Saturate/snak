@@ -404,7 +404,9 @@ impl TeamsClient {
                     json!({
                         "id": i.to_string(),
                         "method": "GET",
-                        "url": format!("/users/{id}?$select=id,displayName,userPrincipalName"),
+                        "url": format!(
+                        "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone"
+                    ),
                     })
                 })
                 .collect();
@@ -417,11 +419,23 @@ impl TeamsClient {
             for response in body["responses"].as_array().into_iter().flatten() {
                 let user = &response["body"];
                 if let Some(id) = user["id"].as_str() {
+                    let mut phones = user["businessPhones"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect::<Vec<_>>();
+                    if let Some(mobile) = user["mobilePhone"].as_str() {
+                        phones.push(mobile.to_string());
+                    }
                     people.insert(
                         id.to_string(),
                         Person {
                             display_name: user["displayName"].as_str().map(str::to_string),
                             upn: user["userPrincipalName"].as_str().map(str::to_string),
+                            mail: user["mail"].as_str().map(str::to_string),
+                            job_title: user["jobTitle"].as_str().map(str::to_string),
+                            phones,
                         },
                     );
                 }

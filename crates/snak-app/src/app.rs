@@ -26,7 +26,7 @@ use gpui_kit::*;
 use crate::code_blocks;
 use snak_chat::{
     Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, ConversationKind, Event,
-    Group, ImageRef, LoginPrompt, Message, MessageId,
+    Group, ImageRef, LoginPrompt, Message, MessageId, Profile,
 };
 
 use crate::prefs::{Placement, Prefs, group_key, team_key};
@@ -116,6 +116,7 @@ type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
 
 /// Opens the thread panel for a channel post.
 type OnThread = Rc<dyn Fn(MessageId, &mut Window, &mut App)>;
+type OpenProfile = Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>;
 
 enum Screen {
     Starting,
@@ -179,6 +180,12 @@ pub struct Snak {
     thread_scroller: Entity<MessageScrollerState>,
     thread_composer: Entity<TextareaState>,
 
+    /// The profile panel's person, when one is open.
+    profile: Option<Profile>,
+    /// Their DM's messages, listed under the profile.
+    profile_rows: Rc<Vec<Message>>,
+    profile_scroller: Entity<MessageScrollerState>,
+
     auth_task: Option<Task<()>>,
     sidebar_task: Option<Task<()>>,
     conversation_task: Option<Task<()>>,
@@ -204,6 +211,7 @@ impl Snak {
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let thread_scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        let profile_scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
 
         let subscriptions = vec![
             cx.observe_window_appearance(window, |this, window, cx| {
@@ -211,6 +219,7 @@ impl Snak {
             }),
             cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.observe(&thread_scroller, |_, _, cx| cx.notify()),
+            cx.observe(&profile_scroller, |_, _, cx| cx.notify()),
             cx.subscribe_in(&jump, window, |this, _, event, window, cx| match event {
                 InputEvent::Change => cx.notify(),
                 InputEvent::PressEnter { .. } => this.open_first_match(window, cx),
@@ -271,6 +280,9 @@ impl Snak {
             thread_rows: Rc::default(),
             thread_scroller,
             thread_composer,
+            profile: None,
+            profile_rows: Rc::default(),
+            profile_scroller,
             auth_task: None,
             sidebar_task: None,
             conversation_task: None,
@@ -489,6 +501,12 @@ impl Snak {
                 self.typing.remove(&id);
                 if self.selected.as_ref() == Some(&id) && !self.showing_unreads {
                     self.refetch_soon(cx);
+                }
+                // Messages arriving in the profile panel's DM belong to it.
+                if let Some(dm) = self.profile.as_ref().and_then(|p| p.dm.clone())
+                    && dm == id
+                {
+                    self.open_profile(dm.0.clone(), cx);
                 }
             }
             Event::ConversationsChanged => self.load_conversations(cx),
@@ -1038,6 +1056,51 @@ impl Snak {
         cx.notify();
     }
 
+    /// Opens the profile panel for whoever `key` names: a DM conversation, a
+    /// member id, a mention link.
+    fn open_profile(&mut self, key: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let key = key.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = io(async move {
+                let Some(person) = backend.person(&key).await.ok().flatten() else {
+                    return Ok(None);
+                };
+                let rows = match person.dm.as_ref() {
+                    Some(dm) => backend.messages(dm).await.ok().unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                Ok(Some((person, rows)))
+            })
+            .await;
+            this.update(cx, |this, cx| match result.ok().flatten() {
+                Some((person, rows)) => {
+                    sync_scroller(&this.profile_scroller, &this.profile_rows, &rows, cx);
+                    this.profile = Some(person);
+                    this.profile_rows = Rc::new(rows);
+                    cx.notify();
+                }
+                None => {
+                    tracing::debug!("profile panel found nobody");
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile.is_none() {
+            return;
+        }
+        self.profile = None;
+        self.profile_rows = Rc::default();
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.showing_unreads = true;
         if self.thread_root.is_some() {
@@ -1523,15 +1586,14 @@ fn render_images(
     Some(list.into_any_element())
 }
 
-fn message_text(view: TextView, dark: bool) -> TextView {
+fn message_text(view: TextView, dark: bool, open_profile: OpenProfile) -> TextView {
     // Message HTML is written by other people; a click must not open file:,
     // smb: or some app's custom scheme.
-    view.on_link_click(|url, _, _, cx| {
-        // Mentions are drawn as links but go nowhere yet.
-        if url.starts_with("snak-mention:") {
-            return;
-        }
-        if is_safe_link(url) {
+    view.on_link_click(move |url, _, window, cx| {
+        // Mentions open the person's profile panel.
+        if let Some(key) = url.strip_prefix("snak-mention:") {
+            open_profile(key.to_string(), window, cx);
+        } else if is_safe_link(url) {
             cx.open_url(url);
         } else {
             tracing::warn!(scheme = url.split(':').next().unwrap_or(""), "blocked link");
@@ -1551,10 +1613,12 @@ fn message_text(view: TextView, dark: bool) -> TextView {
     .selectable(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     row: &Message,
     previous: Option<&Message>,
     on_thread: Option<OnThread>,
+    open_profile: OpenProfile,
     index: usize,
     images: &ImageCache,
     gif_toggles: &GifToggles,
@@ -1574,15 +1638,18 @@ fn render_row(
                 .children(segments.into_iter().enumerate().map(|(i, segment)| {
                     let id = ElementId::Name(format!("msg-{}-{i}", row.id.0).into());
                     match segment {
-                        code_blocks::Segment::Html(html) => {
-                            message_text(TextView::html(id, SharedString::from(html)), dark)
-                        }
+                        code_blocks::Segment::Html(html) => message_text(
+                            TextView::html(id, SharedString::from(html)),
+                            dark,
+                            open_profile.clone(),
+                        ),
                         code_blocks::Segment::Code { lang, code } => message_text(
                             TextView::markdown(
                                 id,
                                 SharedString::from(code_blocks::fenced(lang.as_deref(), &code)),
                             ),
                             dark,
+                            open_profile.clone(),
                         ),
                     }
                 }))
@@ -1701,9 +1768,18 @@ fn render_row(
                         .items_baseline()
                         .child(
                             div()
+                                .id(("author-link", index))
+                                .cursor_pointer()
                                 .text_sm()
                                 .font_weight(FontWeight::BOLD)
-                                .child(row.author.clone()),
+                                .child(row.author.clone())
+                                // The name opens the person's profile panel.
+                                .when_some(row.author_id.clone(), |el, author_id| {
+                                    let open_profile = open_profile.clone();
+                                    el.on_click(move |_, window, cx| {
+                                        open_profile(author_id.clone(), window, cx)
+                                    })
+                                }),
                         )
                         .child(
                             div()
@@ -1807,6 +1883,8 @@ impl Snak {
         let theme = cx.theme();
         let key = entry.id.0.clone();
         let active = !self.showing_unreads && self.selected.as_ref() == Some(&entry.id);
+        // A DM entry opens its partner's profile panel instead of the pane.
+        let panel = matches!(entry.kind, ConversationKind::Direct);
         let muted = self.is_muted(entry);
         let hidden = self.prefs.hidden.contains(&key);
         // Muted entries never shout; that is the point of muting.
@@ -1903,9 +1981,14 @@ impl Snak {
                         .bg(theme.primary),
                 )
             })
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.select(clicked.clone(), window, cx)),
-            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if panel {
+                    // A DM opens its partner's profile panel, not the pane.
+                    this.open_profile(clicked.0.clone(), cx);
+                } else {
+                    this.select(clicked.clone(), window, cx);
+                }
+            }))
             .context_menu(move |menu, window, _| {
                 let item = |label: String, key: &str, f: fn(&mut Prefs, &str)| {
                     let key = key.to_string();
@@ -2357,6 +2440,7 @@ impl Snak {
         scroller: &Entity<MessageScrollerState>,
         rows: Rc<Vec<Message>>,
         on_thread: Option<OnThread>,
+        open_profile: OpenProfile,
         images: ImageCache,
         gif_toggles: GifToggles,
     ) -> impl IntoElement {
@@ -2369,6 +2453,7 @@ impl Snak {
                 row,
                 previous,
                 on_thread.clone(),
+                open_profile.clone(),
                 index,
                 &images,
                 &gif_toggles,
@@ -2504,6 +2589,12 @@ impl Snak {
                     .ok();
             }) as OnThread
         });
+        let open_profile: OpenProfile = {
+            let weak = cx.entity().downgrade();
+            Arc::new(move |key: String, _: &mut Window, cx: &mut App| {
+                weak.update(cx, |this, cx| this.open_profile(key, cx)).ok();
+            }) as OpenProfile
+        };
 
         v_flex()
             .flex_1()
@@ -2547,6 +2638,7 @@ impl Snak {
                 &self.scroller,
                 self.rows.clone(),
                 on_thread,
+                open_profile.clone(),
                 self.images.clone(),
                 self.gif_toggles.clone(),
             )))
@@ -2567,7 +2659,7 @@ impl Snak {
             .into_any_element()
     }
 
-    fn render_thread(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_thread(&self, open_profile: OpenProfile, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
             .flex_none()
@@ -2600,6 +2692,7 @@ impl Snak {
                 &self.thread_scroller,
                 self.thread_rows.clone(),
                 None,
+                open_profile.clone(),
                 self.images.clone(),
                 self.gif_toggles.clone(),
             )))
@@ -2611,6 +2704,100 @@ impl Snak {
                     .pt_1()
                     .child(Textarea::new(&self.thread_composer)),
             )
+    }
+
+    /// The profile side panel: a person's own details over their DM.
+    fn render_profile(
+        &self,
+        open_profile: OpenProfile,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let Some(person) = self.profile.as_ref() else {
+            return div().into_any_element();
+        };
+        let presence_dot = self
+            .presences
+            .get(&person.display_name)
+            .map(|presence| Self::presence_color(presence, theme));
+        let mail = person.mail.clone();
+        let call_url = person
+            .dm
+            .as_ref()
+            .and_then(|dm| self.backend.as_ref().and_then(|b| b.call_url(dm)));
+        v_flex()
+            .flex_none()
+            .w(px(THREAD_WIDTH))
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(48.))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .child(person.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .when_some(person.job_title.clone(), |el, title| {
+                                el.child(div().text_xs().child(title))
+                            }),
+                    )
+                    .when_some(presence_dot, |el, dot| {
+                        el.child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+                    })
+                    .when_some(mail.clone(), |el, mail| {
+                        el.child(
+                            Button::new("profile-email")
+                                .small()
+                                .ghost()
+                                .label("Email")
+                                .on_click(move |_, _, cx| {
+                                    let mailto = format!("mailto:{mail}");
+                                    cx.open_url(&mailto)
+                                }),
+                        )
+                    })
+                    .when_some(call_url.clone(), |el, url| {
+                        el.child(
+                            Button::new("profile-call")
+                                .small()
+                                .ghost()
+                                .label("Call")
+                                .on_click(move |_, _, cx| {
+                                    let url = url.clone();
+                                    cx.open_url(&url)
+                                }),
+                        )
+                    })
+                    .child(
+                        Button::new("close-profile")
+                            .small()
+                            .ghost()
+                            .label("Close")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_profile(window, cx)),
+                            ),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(Self::render_timeline(
+                "profile",
+                &self.profile_scroller,
+                self.profile_rows.clone(),
+                None,
+                open_profile,
+                self.images.clone(),
+                self.gif_toggles.clone(),
+            )))
+            .into_any_element()
     }
 }
 
@@ -2815,6 +3002,13 @@ impl Render for Snak {
             .bg(theme.background)
             .text_color(theme.foreground);
 
+        let open_profile: OpenProfile = {
+            let weak = cx.entity().downgrade();
+            Arc::new(move |key: String, _: &mut Window, cx: &mut App| {
+                weak.update(cx, |this, cx| this.open_profile(key, cx)).ok();
+            }) as OpenProfile
+        };
+
         match self.screen {
             Screen::Starting => root
                 .child(
@@ -2846,7 +3040,10 @@ impl Render for Snak {
                                 .child(self.render_sidebar(cx))
                                 .child(self.render_conversation(cx))
                                 .when(self.thread_root.is_some(), |el| {
-                                    el.child(self.render_thread(cx))
+                                    el.child(self.render_thread(open_profile.clone(), cx))
+                                })
+                                .when(self.profile.is_some(), |el| {
+                                    el.child(self.render_profile(open_profile.clone(), cx))
                                 }),
                         )
                         .child(self.render_status_bar(cx)),

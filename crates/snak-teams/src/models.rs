@@ -291,6 +291,9 @@ pub struct Me {
 pub struct Person {
     pub display_name: Option<String>,
     pub upn: Option<String>,
+    pub mail: Option<String>,
+    pub job_title: Option<String>,
+    pub phones: Vec<String>,
 }
 
 #[cfg(test)]

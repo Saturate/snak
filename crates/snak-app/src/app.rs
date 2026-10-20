@@ -118,6 +118,8 @@ type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
 /// Opens the thread panel for a channel post.
 type OnThread = Rc<dyn Fn(MessageId, &mut Window, &mut App)>;
 type OpenProfile = Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>;
+/// Opens the image viewer over a message's images, starting at `index`.
+type OpenImageViewer = Arc<dyn Fn(Vec<ImageRef>, usize, &mut Window, &mut App) + Send + Sync>;
 
 enum Screen {
     Starting,
@@ -186,7 +188,8 @@ pub struct Snak {
     thread_scroller: Entity<MessageScrollerState>,
     thread_composer: Entity<TextareaState>,
 
-    /// The profile panel's person, when one is open.
+    /// The image viewer panel, when one is open.
+    image_viewer: Option<ImageViewer>,
     profile: Option<Profile>,
     /// Their DM's messages, listed under the profile.
     profile_rows: Rc<Vec<Message>>,
@@ -281,6 +284,7 @@ impl Snak {
             sidebar_dirty: false,
             drafts: HashMap::new(),
             presences: HashMap::new(),
+            image_viewer: None,
             avatars: HashMap::new(),
             avatar_pending: HashSet::new(),
             typing: HashMap::new(),
@@ -1175,6 +1179,26 @@ impl Snak {
         .detach();
     }
 
+    fn open_image_viewer(&mut self, images: Vec<ImageRef>, index: usize) {
+        if images.is_empty() {
+            return;
+        }
+        let count = images.len();
+        self.image_viewer = Some(ImageViewer {
+            images,
+            index: index.min(count - 1),
+        });
+    }
+
+    fn close_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.image_viewer.is_none() {
+            return;
+        }
+        self.image_viewer = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     fn close_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.profile.is_none() {
             return;
@@ -1529,6 +1553,12 @@ fn is_safe_link(url: &str) -> bool {
 
 /// One person's live state, kept under their display name.
 #[derive(Clone)]
+/// The image viewer panel: one message's images, the one clicked shown large.
+struct ImageViewer {
+    images: Vec<ImageRef>,
+    index: usize,
+}
+
 struct PresenceInfo {
     availability: String,
     activity: Option<String>,
@@ -1612,6 +1642,23 @@ fn image_size(image: &ImageRef, actual: Option<(u32, u32)>) -> (f32, f32) {
     (w * scale, h * scale)
 }
 
+/// The viewer panel has the whole pane to fill, not the timeline's row budget.
+fn viewer_image_size(image: &ImageRef, actual: Option<(u32, u32)>) -> (f32, f32) {
+    const MAX_W: f32 = 384.;
+    const MAX_H: f32 = 448.;
+    let reported = match (image.width, image.height) {
+        (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0. && h > 0. => Some((w, h)),
+        _ => None,
+    };
+    let (w, h) = actual
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| (w as f32, h as f32))
+        .or(reported)
+        .unwrap_or((240., 160.));
+    let scale = (MAX_W / w).min(MAX_H / h).min(1.);
+    (w * scale, h * scale)
+}
+
 fn return_image(frame: Div, data: Arc<Image>) -> AnyElement {
     frame
         .child(
@@ -1626,6 +1673,7 @@ fn render_images(
     row: &Message,
     images: &ImageCache,
     gif_toggles: &GifToggles,
+    open_image_viewer: OpenImageViewer,
     cx: &App,
 ) -> Option<AnyElement> {
     if row.images.is_empty() {
@@ -1634,7 +1682,7 @@ fn render_images(
     let theme = cx.theme();
     let cache = images.borrow();
     let mut list = h_flex().flex_wrap().gap_2().pt_1();
-    for image in &row.images {
+    for (position, image) in row.images.iter().enumerate() {
         let state = cache.get(&image.url);
         let actual = match state {
             Some(ImageState::Ready(loaded)) => loaded.size,
@@ -1645,7 +1693,21 @@ fn render_images(
         let frame = div().w(px(w)).h(px(h)).rounded_md().overflow_hidden();
         list = list.child(match state {
             Some(ImageState::Ready(loaded)) if loaded.still.is_none() => {
-                return_image(frame, loaded.data.clone())
+                let open_image_viewer = open_image_viewer.clone();
+                let images: Vec<ImageRef> = row.images.to_vec();
+                let index = position;
+                frame
+                    .id(ElementId::Name(format!("image-{}", image.url).into()))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        open_image_viewer(images.clone(), index, window, cx)
+                    })
+                    .child(
+                        img(ImageSource::Image(loaded.data.clone()))
+                            .size_full()
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
             }
             Some(ImageState::Ready(loaded)) => {
                 let still = loaded.still.clone().unwrap_or_else(|| loaded.data.clone());
@@ -1748,6 +1810,7 @@ fn render_row(
     images: &ImageCache,
     gif_toggles: &GifToggles,
     avatars: &HashMap<String, Arc<Image>>,
+    open_image_viewer: OpenImageViewer,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -1844,7 +1907,13 @@ fn render_row(
         .gap_0p5()
         .when(row.pending, |el| el.opacity(0.55))
         .child(body)
-        .children(render_images(row, images, gif_toggles, cx))
+        .children(render_images(
+            row,
+            images,
+            gif_toggles,
+            open_image_viewer,
+            cx,
+        ))
         .child(footer);
 
     if continues {
@@ -2582,6 +2651,7 @@ impl Snak {
         images: ImageCache,
         gif_toggles: GifToggles,
         avatars: HashMap<String, Arc<Image>>,
+        open_image_viewer: OpenImageViewer,
     ) -> impl IntoElement {
         MessageScroller::new(id, scroller.clone(), move |index, _, cx| {
             let Some(row) = rows.get(index) else {
@@ -2597,6 +2667,7 @@ impl Snak {
                 &images,
                 &gif_toggles,
                 &avatars,
+                open_image_viewer.clone(),
                 cx,
             )
         })
@@ -2735,6 +2806,15 @@ impl Snak {
                 weak.update(cx, |this, cx| this.open_profile(key, cx)).ok();
             }) as OpenProfile
         };
+        let open_image_viewer: OpenImageViewer = {
+            let weak = cx.entity().downgrade();
+            Arc::new(
+                move |images: Vec<ImageRef>, index: usize, _: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, _cx| this.open_image_viewer(images, index))
+                        .ok();
+                },
+            ) as OpenImageViewer
+        };
 
         v_flex()
             .flex_1()
@@ -2782,6 +2862,7 @@ impl Snak {
                 self.images.clone(),
                 self.gif_toggles.clone(),
                 self.avatars.clone(),
+                open_image_viewer.clone(),
             )))
             .child(
                 div()
@@ -2800,7 +2881,12 @@ impl Snak {
             .into_any_element()
     }
 
-    fn render_thread(&self, open_profile: OpenProfile, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_thread(
+        &self,
+        open_profile: OpenProfile,
+        open_image_viewer: OpenImageViewer,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
             .flex_none()
@@ -2837,6 +2923,7 @@ impl Snak {
                 self.images.clone(),
                 self.gif_toggles.clone(),
                 self.avatars.clone(),
+                open_image_viewer.clone(),
             )))
             .child(
                 div()
@@ -2848,10 +2935,64 @@ impl Snak {
             )
     }
 
+    fn render_image_viewer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let Some(viewer) = self.image_viewer.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(image_ref) = viewer.images.get(viewer.index) else {
+            return div().into_any_element();
+        };
+        let image = self
+            .images
+            .borrow()
+            .get(&image_ref.url)
+            .and_then(|state| match state {
+                ImageState::Ready(loaded) => Some((loaded.data.clone(), loaded.size)),
+                _ => None,
+            });
+        v_flex()
+            .flex_none()
+            .w(px(THREAD_WIDTH))
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(48.))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().font_weight(FontWeight::BOLD).child("Image"))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("close-image-viewer")
+                            .small()
+                            .ghost()
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_image_viewer(window, cx)
+                            })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(match image {
+                Some((data, actual)) => {
+                    let (w, h) = viewer_image_size(image_ref, actual);
+                    return_image(div().w(px(w)).h(px(h)).rounded_md().overflow_hidden(), data)
+                        .into_any_element()
+                }
+                _ => div().bg(theme.muted).child("Loading").into_any_element(),
+            }))
+            .into_any_element()
+    }
+
     /// The profile side panel: a person's own details over their DM.
     fn render_profile(
         &self,
         open_profile: OpenProfile,
+        open_image_viewer: OpenImageViewer,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -2985,6 +3126,7 @@ impl Snak {
                 self.images.clone(),
                 self.gif_toggles.clone(),
                 self.avatars.clone(),
+                open_image_viewer.clone(),
             )))
             .into_any_element()
     }
@@ -3197,6 +3339,15 @@ impl Render for Snak {
                 weak.update(cx, |this, cx| this.open_profile(key, cx)).ok();
             }) as OpenProfile
         };
+        let open_image_viewer: OpenImageViewer = {
+            let weak = cx.entity().downgrade();
+            Arc::new(
+                move |images: Vec<ImageRef>, index: usize, _: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, _cx| this.open_image_viewer(images, index))
+                        .ok();
+                },
+            ) as OpenImageViewer
+        };
 
         match self.screen {
             Screen::Starting => root
@@ -3229,10 +3380,21 @@ impl Render for Snak {
                                 .child(self.render_sidebar(cx))
                                 .child(self.render_conversation(cx))
                                 .when(self.thread_root.is_some(), |el| {
-                                    el.child(self.render_thread(open_profile.clone(), cx))
+                                    el.child(self.render_thread(
+                                        open_profile.clone(),
+                                        open_image_viewer.clone(),
+                                        cx,
+                                    ))
                                 })
                                 .when(self.profile.is_some(), |el| {
-                                    el.child(self.render_profile(open_profile.clone(), cx))
+                                    el.child(self.render_profile(
+                                        open_profile.clone(),
+                                        open_image_viewer.clone(),
+                                        cx,
+                                    ))
+                                })
+                                .when(self.image_viewer.is_some(), |el| {
+                                    el.child(self.render_image_viewer(cx))
                                 }),
                         )
                         .child(self.render_status_bar(cx)),

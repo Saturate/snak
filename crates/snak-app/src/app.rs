@@ -1737,6 +1737,7 @@ fn render_row(
     index: usize,
     images: &ImageCache,
     gif_toggles: &GifToggles,
+    avatars: &HashMap<String, Arc<Image>>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -1860,18 +1861,30 @@ fn render_row(
         .hover(|s| s.bg(theme.muted))
         .when(row.mentions_me, |el| mentioned(el, cx))
         .child(
-            div()
-                .flex_none()
-                .size(px(32.))
-                .rounded_md()
-                .bg(avatar_color(&row.author))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(white())
-                .child(initials(&row.author)),
+            avatars
+                .get(&row.author)
+                .map(|avatar| {
+                    Avatar::new()
+                        .src(avatar.clone())
+                        .name(row.author.clone())
+                        .small()
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| {
+                    div()
+                        .flex_none()
+                        .size(px(32.))
+                        .rounded_md()
+                        .bg(avatar_color(&row.author))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(white())
+                        .child(initials(&row.author))
+                        .into_any_element()
+                }),
         )
         .child(
             v_flex()
@@ -1998,8 +2011,6 @@ impl Snak {
         let theme = cx.theme();
         let key = entry.id.0.clone();
         let active = !self.showing_unreads && self.selected.as_ref() == Some(&entry.id);
-        // A DM entry opens its partner's profile panel instead of the pane.
-        let panel = matches!(entry.kind, ConversationKind::Direct);
         let muted = self.is_muted(entry);
         let hidden = self.prefs.hidden.contains(&key);
         // Muted entries never shout; that is the point of muting.
@@ -2102,14 +2113,9 @@ impl Snak {
                         .bg(theme.primary),
                 )
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if panel {
-                    // A DM opens its partner's profile panel, not the pane.
-                    this.open_profile(clicked.0.clone(), cx);
-                } else {
-                    this.select(clicked.clone(), window, cx);
-                }
-            }))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.select(clicked.clone(), window, cx)),
+            )
             .context_menu(move |menu, window, _| {
                 let item = |label: String, key: &str, f: fn(&mut Prefs, &str)| {
                     let key = key.to_string();
@@ -2556,6 +2562,7 @@ impl Snak {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_timeline(
         id: &'static str,
         scroller: &Entity<MessageScrollerState>,
@@ -2564,6 +2571,7 @@ impl Snak {
         open_profile: OpenProfile,
         images: ImageCache,
         gif_toggles: GifToggles,
+        avatars: HashMap<String, Arc<Image>>,
     ) -> impl IntoElement {
         MessageScroller::new(id, scroller.clone(), move |index, _, cx| {
             let Some(row) = rows.get(index) else {
@@ -2578,6 +2586,7 @@ impl Snak {
                 index,
                 &images,
                 &gif_toggles,
+                &avatars,
                 cx,
             )
         })
@@ -2762,6 +2771,7 @@ impl Snak {
                 open_profile.clone(),
                 self.images.clone(),
                 self.gif_toggles.clone(),
+                self.avatars.clone(),
             )))
             .child(
                 div()
@@ -2816,6 +2826,7 @@ impl Snak {
                 open_profile.clone(),
                 self.images.clone(),
                 self.gif_toggles.clone(),
+                self.avatars.clone(),
             )))
             .child(
                 div()
@@ -2963,6 +2974,7 @@ impl Snak {
                 open_profile,
                 self.images.clone(),
                 self.gif_toggles.clone(),
+                self.avatars.clone(),
             )))
             .into_any_element()
     }

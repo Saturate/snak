@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4"
+snak-mcp = { path = "../snak-mcp" }
 # Grammars for highlighting code blocks in messages; the common chat languages
 # rather than all of them, since each one adds to the binary.
 gpui-kit = { workspace = true, features = [

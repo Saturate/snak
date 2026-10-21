@@ -317,7 +317,7 @@ fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> 
             .iter()
             .map(|p| Event::PresenceChanged {
                 user: name(&p.mri).cloned().unwrap_or_default(),
-                presence: p.availability.clone().unwrap_or("Offline".into()),
+                presence: p.availability.clone().unwrap_or_else(|| "Offline".into()),
             })
             .collect(),
     }

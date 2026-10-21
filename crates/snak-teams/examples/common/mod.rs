@@ -6,7 +6,7 @@
 /// in URLs after `?`, `#` or `&`: keep the first line, up to the first of
 /// those, and at most 300 characters.
 pub fn redact(error: &str) -> String {
-    let line = error.lines().next().unwrap_or("");
-    let end = line.find(['?', '#', '&']).unwrap_or(line.len());
-    line[..end].chars().take(300).collect()
+    let line = error.lines().next().unwrap_or_default();
+    let line = line.split(['?', '#', '&']).next().unwrap_or_default();
+    line.chars().take(300).collect()
 }

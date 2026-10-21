@@ -39,12 +39,19 @@ struct Directory {
     addresses: HashMap<ConversationId, Address>,
     names: HashMap<String, String>,
     upns: HashMap<String, String>,
+    /// Member MRI by object id, to subscribe presence for DM partners.
+    mris: HashMap<String, String>,
+    /// MRIs subscribed on the current push session.
+    subscribed: std::collections::HashSet<String>,
 }
 
 pub struct TeamsBackend {
     client: Arc<TeamsClient>,
     me: Me,
     directory: Mutex<Directory>,
+    /// The live push session, so DM partners found after it connected can
+    /// still be subscribed to presence.
+    push_session: Mutex<Option<crate::trouter::PushSession>>,
 }
 
 impl TeamsBackend {
@@ -57,6 +64,7 @@ impl TeamsBackend {
             client: Arc::new(client),
             me,
             directory: Mutex::new(Directory::default()),
+            push_session: Mutex::new(None),
         }
     }
 
@@ -94,16 +102,61 @@ impl TeamsBackend {
             }
         }
 
-        let mut directory = self.directory();
-        let mut list = channel_conversations(&details.teams, &mut directory.addresses);
-        let names = directory.names.clone();
-        list.extend(chat_conversations(
-            &details.chats,
-            &self.me.id,
-            &names,
-            &mut directory.addresses,
-        ));
+        let names = self.directory().names.clone();
+        let list = {
+            let mut directory = self.directory();
+            let mut list = channel_conversations(&details.teams, &mut directory.addresses);
+            list.extend(chat_conversations(
+                &details.chats,
+                &self.me.id,
+                &names,
+                &mut directory,
+            ));
+            list
+        };
+        self.subscribe_new_presences().await;
         Ok(list)
+    }
+
+    /// Subscribes presence for DM partners the live push session doesn't
+    /// cover yet. Push often connects before the first conversation load
+    /// fills `mris`, and new DMs turn up later, so this runs after both.
+    async fn subscribe_new_presences(&self) {
+        let session = self
+            .push_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(session) = session else {
+            return;
+        };
+        let new: Vec<String> = {
+            let directory = self.directory();
+            directory
+                .mris
+                .values()
+                .filter(|mri| !directory.subscribed.contains(*mri))
+                .cloned()
+                .collect()
+        };
+        if new.is_empty() {
+            return;
+        }
+        match self.client.subscribe_presence(&session, &new).await {
+            // A reconnect during the request means it went to the old session.
+            Ok(())
+                if self
+                    .push_session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    == Some(&session) =>
+            {
+                self.directory().subscribed.extend(new)
+            }
+            Ok(()) => {}
+            Err(e) => tracing::warn!(error = %e, "presence subscription failed"),
+        }
     }
 }
 
@@ -242,8 +295,20 @@ impl ChatBackend for TeamsBackend {
                     event = push.recv() => event,
                     _ = tx.closed() => return,
                 };
-                let Some(event) = event else { return };
-                for event in translate(event) {
+                let Some(event) = event else {
+                    // Push is gone for good; later loads mustn't post to it.
+                    *self.push_session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    return;
+                };
+                if let PushEvent::Connected(session) = &event {
+                    // A reconnect is a new session that knows no subscriptions.
+                    *self.push_session.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(session.clone());
+                    self.directory().subscribed.clear();
+                    self.subscribe_new_presences().await;
+                }
+                let names = self.directory().names.clone();
+                for event in translate(event, &names, &self.me.id) {
                     if tx.send(event).await.is_err() {
                         return;
                     }
@@ -254,9 +319,11 @@ impl ChatBackend for TeamsBackend {
     }
 }
 
-fn translate(event: PushEvent) -> Vec<Event> {
+fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> Vec<Event> {
     // Channel replies arrive addressed as `<channel>;messageid=<root>`.
     let conversation = |id: &str| ConversationId(id.split(';').next().unwrap_or(id).to_string());
+    // MRIs end in the object id: `8:orgid:<object id>`.
+    let name = |mri: &str| names.get(mri.rsplit(':').next().unwrap_or(mri));
     match event {
         PushEvent::Connected(_) => vec![Event::Connected],
         PushEvent::Reconnecting { .. } => vec![Event::Reconnecting],
@@ -271,7 +338,26 @@ fn translate(event: PushEvent) -> Vec<Event> {
             Event::ConversationsChanged,
         ],
         PushEvent::ConversationUpdated { .. } => vec![Event::ConversationsChanged],
-        PushEvent::Typing { .. } | PushEvent::Presence(_) => Vec::new(),
+        // Our own typing on another device echoes back; it's not news.
+        PushEvent::Typing { user_mri, .. } if user_mri.rsplit(':').next() == Some(me_id) => {
+            Vec::new()
+        }
+        PushEvent::Typing {
+            conversation_id,
+            user_mri,
+            stopped,
+        } => vec![Event::Typing {
+            conversation: conversation(&conversation_id),
+            user: name(&user_mri).cloned().unwrap_or_default(),
+            stopped,
+        }],
+        PushEvent::Presence(presences) => presences
+            .iter()
+            .map(|p| Event::PresenceChanged {
+                user: name(&p.mri).cloned().unwrap_or_default(),
+                presence: p.availability.clone().unwrap_or_else(|| "Offline".into()),
+            })
+            .collect(),
     }
 }
 
@@ -419,13 +505,15 @@ fn chat_conversations(
     chats: &[Chat],
     me_id: &str,
     names: &HashMap<String, String>,
-    addresses: &mut HashMap<ConversationId, Address>,
+    directory: &mut Directory,
 ) -> Vec<Conversation> {
     chats
         .iter()
-        .filter(|chat| chat.hidden != Some(true) && chat.is_conversation_deleted != Some(true))
+        .filter(|chat| chat.is_conversation_deleted != Some(true))
         // Meeting chats belong with the meeting in Teams; they crowd out real DMs.
         .filter(|chat| chat.chat_type.as_deref() != Some("meeting"))
+        // Teams hides chats you closed in its own list, but they still open and
+        // receive messages, so they list like any other chat.
         .map(|chat| {
             let others: Vec<String> = chat
                 .members
@@ -434,13 +522,26 @@ fn chat_conversations(
                 .filter(|id| id != me_id)
                 .collect();
             let id = ConversationId(chat.id.clone());
-            addresses.insert(
+            directory.addresses.insert(
                 id.clone(),
                 Address::Chat {
                     id: chat.id.clone(),
                     others: others.clone(),
                 },
             );
+            // Presence only matters for the people you DM directly.
+            if chat.is_one_on_one == Some(true) {
+                for member in chat.members.iter() {
+                    if let (Some(object_id), member_mri) =
+                        (member.object_id.as_ref(), member.mri.as_str())
+                        && object_id != me_id
+                    {
+                        directory
+                            .mris
+                            .insert(object_id.clone(), member_mri.to_string());
+                    }
+                }
+            }
             let title = chat
                 .title
                 .clone()
@@ -1503,16 +1604,104 @@ mod tests {
     }
 
     #[test]
+    fn closed_and_hidden_chats_stay_listed() {
+        let chats: Vec<Chat> = serde_json::from_value(serde_json::json!([
+            { "id": "19:a@thread.tacv2", "members": [], "isOneOnOne": true,
+              "lastMessage": { "from": "x", "originalArrivalTime": "2026-10-15T10:00:00Z" } },
+            { "id": "19:b@thread.tacv2", "members": [], "hidden": true, "isOneOnOne": true,
+              "lastMessage": { "from": "x", "originalArrivalTime": "2026-10-15T10:00:00Z" } },
+            { "id": "19:c@thread.tacv2", "members": [], "hidden": true,
+              "isConversationDeleted": true },
+            { "id": "19:d@thread.tacv2", "members": [], "chatType": "meeting" }
+        ]))
+        .expect("valid chats");
+        let list = chat_conversations(&chats, "", &HashMap::new(), &mut Directory::default());
+        let ids: Vec<&str> = list.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["19:a@thread.tacv2", "19:b@thread.tacv2"]);
+    }
+
+    #[test]
+    fn typing_and_presence_translate_with_names() {
+        let mut names = HashMap::new();
+        names.insert("a".to_string(), "Maja".to_string());
+        let events = translate(
+            PushEvent::Typing {
+                conversation_id: "19:a@thread.tacv2".into(),
+                user_mri: "8:orgid:a".into(),
+                stopped: false,
+            },
+            &names,
+            "me",
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Typing { conversation, user, stopped: false }]
+                if conversation.0 == "19:a@thread.tacv2" && user == "Maja"
+        ));
+        let mine = translate(
+            PushEvent::Typing {
+                conversation_id: "19:a@thread.tacv2".into(),
+                user_mri: "8:orgid:me".into(),
+                stopped: false,
+            },
+            &names,
+            "me",
+        );
+        assert!(mine.is_empty());
+        let events = translate(
+            PushEvent::Presence(vec![crate::trouter::Presence {
+                mri: "8:orgid:a".into(),
+                availability: Some("Available".into()),
+                activity: None,
+                last_active_time: None,
+                out_of_office: false,
+            }]),
+            &names,
+            "me",
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [Event::PresenceChanged { user, presence }]
+                if user == "Maja" && presence == "Available"
+        ));
+    }
+
+    #[test]
+    fn dm_partners_subscribe_presence_by_mri() {
+        let chats: Vec<Chat> = serde_json::from_value(serde_json::json!([
+            { "id": "19:a@thread.tacv2", "isOneOnOne": true,
+              "members": [ { "mri": "8:orgid:x", "objectId": "x" },
+                            { "mri": "8:orgid:y", "objectId": "y" } ] },
+            { "id": "19:b@thread.tacv2", "isOneOnOne": false,
+              "members": [ { "mri": "8:orgid:z", "objectId": "z" } ] }
+        ]))
+        .expect("valid chats");
+        let mut directory = Directory::default();
+        chat_conversations(&chats, "x", &HashMap::new(), &mut directory);
+        let mut mris: Vec<&str> = directory.mris.values().map(String::as_str).collect();
+        mris.sort();
+        assert_eq!(mris, ["8:orgid:y"]);
+    }
+
+    #[test]
     fn channel_reply_pushes_map_to_the_channel() {
-        let events = translate(PushEvent::ConversationUpdated {
-            conversation_id: "19:a@thread.tacv2".into(),
-        });
+        let events = translate(
+            PushEvent::ConversationUpdated {
+                conversation_id: "19:a@thread.tacv2".into(),
+            },
+            &HashMap::new(),
+            "me",
+        );
         assert!(matches!(events.as_slice(), [Event::ConversationsChanged]));
         let message = message("9", "a", "2026-10-15T10:00:00Z", "Text", "x");
-        let events = translate(PushEvent::NewMessage {
-            conversation_id: "19:a@thread.tacv2;messageid=123".into(),
-            message,
-        });
+        let events = translate(
+            PushEvent::NewMessage {
+                conversation_id: "19:a@thread.tacv2;messageid=123".into(),
+                message,
+            },
+            &HashMap::new(),
+            "me",
+        );
         assert!(matches!(&events[0], Event::MessagesChanged(id) if id.0 == "19:a@thread.tacv2"));
     }
 }

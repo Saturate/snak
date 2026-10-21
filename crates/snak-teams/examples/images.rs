@@ -8,12 +8,14 @@
 
 use std::collections::BTreeMap;
 
+const SNAK_STORE: &str = "SNAK_STORE";
+
 use snak_teams::{TeamsClient, store};
 
 #[tokio::main]
 async fn main() {
     // Without moving: a probe must never relocate the app's login.
-    if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
+    if std::env::var(SNAK_STORE).as_deref() == Ok("file") {
         store::use_storage_without_moving(store::Storage::File);
     }
     let Some(login) = store::load().await.ok().flatten() else {

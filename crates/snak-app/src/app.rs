@@ -25,8 +25,8 @@ use gpui_kit::*;
 
 use crate::code_blocks;
 use snak_chat::{
-    Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, Event, Group, ImageRef,
-    LoginPrompt, Message, MessageId, MessagesPage,
+    Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, ConversationKind, Event,
+    Group, ImageRef, LoginPrompt, Message, MessageId, MessagesPage,
 };
 
 use crate::prefs::{Placement, Prefs, group_key, team_key};
@@ -37,6 +37,9 @@ use crate::*;
 
 // Push is the main update path; polling is the fallback when push is down
 // or a backend doesn't have it.
+/// How long a typing indicator lives without a fresh "typing" from Teams,
+/// which repeats it every few seconds while someone types (Squads uses 4).
+const TYPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 272.;
 const THREAD_WIDTH: f32 = 400.;
@@ -174,6 +177,10 @@ pub struct Snak {
     sidebar_dirty: bool,
     /// Unsent composer text per conversation.
     drafts: HashMap<ConversationId, String>,
+    /// Presence by person, from push; the service's own word for it.
+    presences: HashMap<String, String>,
+    /// Who is typing where, and until when: a "stopped" doesn't always arrive.
+    typing: HashMap<ConversationId, (String, std::time::Instant)>,
     thread_root: Option<MessageId>,
     thread_rows: Rc<Vec<Message>>,
     thread_scroller: Entity<MessageScrollerState>,
@@ -275,6 +282,8 @@ impl Snak {
             sidebar_loading: false,
             sidebar_dirty: false,
             drafts: HashMap::new(),
+            presences: HashMap::new(),
+            typing: HashMap::new(),
             thread_root: None,
             thread_rows: Rc::default(),
             thread_scroller,
@@ -429,6 +438,8 @@ impl Snak {
         self.selected = None;
         self.showing_unreads = true;
         self.thread_root = None;
+        self.presences.clear();
+        self.typing.clear();
         self.pending.clear();
         self.error = None;
         self.set_rows(Vec::new(), cx);
@@ -498,11 +509,49 @@ impl Snak {
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::MessagesChanged(id) => {
+                // A message arriving ends any typing indicator for it.
+                self.typing.remove(&id);
                 if self.selected.as_ref() == Some(&id) && !self.showing_unreads {
                     self.refetch_soon(cx);
                 }
             }
             Event::ConversationsChanged => self.load_conversations(cx),
+            Event::Typing {
+                conversation,
+                user,
+                stopped: true,
+            } => {
+                if self
+                    .typing
+                    .get(&conversation)
+                    .is_some_and(|(who, _)| *who == user)
+                {
+                    self.typing.remove(&conversation);
+                    cx.notify();
+                }
+            }
+            Event::Typing {
+                conversation,
+                user,
+                stopped: false,
+            } => {
+                self.typing.insert(
+                    conversation,
+                    (user, std::time::Instant::now() + TYPING_TIMEOUT),
+                );
+                cx.notify();
+                // Repaint once it has expired, or the label stays until
+                // something unrelated redraws.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TYPING_TIMEOUT).await;
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                })
+                .detach();
+            }
+            Event::PresenceChanged { user, presence } => {
+                self.presences.insert(user, presence);
+                cx.notify();
+            }
             Event::Connected => {
                 // Anything that happened while disconnected was missed.
                 self.live = true;
@@ -716,6 +765,24 @@ impl Snak {
     /// works on something muted in Teams.
     fn is_muted(&self, conversation: &Conversation) -> bool {
         conversation.muted != self.prefs.muted.contains(&conversation.id.0)
+    }
+
+    /// Teams' availability words map to Slack-style dot colors; anything
+    /// unknown gets the grey of Offline rather than nothing, so a status
+    /// is never silently missing.
+    fn presence_color(presence: &str, theme: &gpui_kit::component::Theme) -> Hsla {
+        match presence {
+            "Available" => theme.success,
+            "Busy" | "DoNotDisturb" => theme.danger,
+            "Away" | "BeRightBack" => theme.warning,
+            _ => theme.muted_foreground,
+        }
+    }
+
+    /// Who is typing in a conversation, if their indicator is still live.
+    fn typing_in(&self, id: &ConversationId) -> Option<String> {
+        let (user, until) = self.typing.get(id)?;
+        (*until > std::time::Instant::now()).then(|| user.clone())
     }
 
     fn selected_conversation(&self) -> Option<&Conversation> {
@@ -1874,6 +1941,14 @@ impl Snak {
         let hidden = self.prefs.hidden.contains(&key);
         // Muted entries never shout; that is the point of muting.
         let unread = entry.unread && !muted;
+        // Presence dots only make sense on a DM: a group has no one status.
+        let presence_dot = if matches!(entry.kind, ConversationKind::Direct) {
+            self.presences
+                .get(&entry.title)
+                .map(|presence| Self::presence_color(presence, theme))
+        } else {
+            None
+        };
         let prefix = if entry.is_channel() {
             div().child("#").into_any_element()
         } else if matches!(entry.kind, snak_chat::ConversationKind::Group) {
@@ -1919,6 +1994,9 @@ impl Snak {
             })
             .when(muted || hidden, |el| el.opacity(0.55))
             .when(unread, |el| el.font_weight(FontWeight::BOLD))
+            .when_some(presence_dot, |el, dot| {
+                el.child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+            })
             .child(div().flex_none().w(px(12.)).child(prefix))
             .child(
                 div()
@@ -2619,6 +2697,22 @@ impl Snak {
                     .pt_1()
                     .child(Textarea::new(&self.composer)),
             )
+            .when_some(self.typing_in(&selected.id), |el, user| {
+                // Unknown people still type; they just go without a name.
+                let who = if user.is_empty() {
+                    "Someone".to_string()
+                } else {
+                    user
+                };
+                el.child(
+                    div()
+                        .flex_none()
+                        .pt_0()
+                        .px_1()
+                        .text_sm()
+                        .child(format!("{who} is typing…")),
+                )
+            })
             .into_any_element()
     }
 

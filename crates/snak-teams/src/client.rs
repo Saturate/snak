@@ -305,7 +305,7 @@ impl TeamsClient {
             return Err(CoreError::Http {
                 status: status.as_u16(),
                 url: url.path().to_string(),
-                body: String::new(),
+                body: String::default(),
             });
         }
         // Capped while streaming, not after: the server picks the body size.
@@ -354,6 +354,37 @@ impl TeamsClient {
             url,
             field: "Location",
         })
+    }
+
+    /// A person's profile photo, as raw image bytes. People without a photo
+    /// get a 404, which is a person, not a failure.
+    pub async fn photo(&self, object_id: &str) -> Result<Option<Vec<u8>>> {
+        const MAX_BYTES: usize = 1024 * 1024;
+        let url = format!("https://graph.microsoft.com/v1.0/users/{object_id}/photo/$value");
+        let mut res = self
+            .call_response(scope::GRAPH, |http, token| {
+                http.get(&url).bearer_auth(token)
+            })
+            .await?;
+        let status = res.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(CoreError::Http {
+                status: status.as_u16(),
+                url: url.clone(),
+                body: String::default(),
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = res.chunk().await? {
+            if bytes.len() + chunk.len() > MAX_BYTES {
+                return Err(CoreError::Push("photo too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes))
     }
 
     /// Moves the read marker to now, which clears unread in every Teams client.
@@ -448,7 +479,10 @@ impl TeamsClient {
                 http.get(url)
                     .query(&[
                         ("$search", search.as_str()),
-                        ("$select", "id,displayName,userPrincipalName,mail,jobTitle"),
+                        (
+                            "$select",
+                            "id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone",
+                        ),
                         ("$top", top.as_str()),
                     ])
                     // $search on directory objects is refused without it.
@@ -477,7 +511,7 @@ impl TeamsClient {
                         "id": i.to_string(),
                         "method": "GET",
                         "url": format!(
-                            "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle"
+                            "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone"
                         ),
                     })
                 })
@@ -509,6 +543,15 @@ fn graph_person(user: &Value) -> Person {
             .map(str::to_string),
         job_title: user["jobTitle"].as_str().map(str::to_string),
         upn: user["userPrincipalName"].as_str().map(str::to_string),
+        phones: user["businessPhones"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .chain(user["mobilePhone"].as_str())
+            .map(str::to_string)
+            .collect(),
+        photo: None,
     }
 }
 

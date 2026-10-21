@@ -293,6 +293,9 @@ pub struct Person {
     pub mail: Option<String>,
     pub job_title: Option<String>,
     pub upn: Option<String>,
+    pub phones: Vec<String>,
+    /// Profile photo bytes, when the person set one.
+    pub photo: Option<Vec<u8>>,
 }
 
 #[cfg(test)]

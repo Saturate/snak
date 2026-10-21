@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+const SNAK_STORE: &str = "SNAK_STORE";
+
 use snak_chat::{Body, ChatBackend, Connector, Event};
 use snak_teams::TeamsConnector;
 
@@ -18,7 +20,7 @@ async fn main() {
     let connector = TeamsConnector::new();
     // Use the same place the app keeps the login: SNAK_STORE=file|keychain.
     // Without moving: a probe must never relocate the app's login.
-    if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
+    if std::env::var(SNAK_STORE).as_deref() == Ok("file") {
         snak_teams::store::use_storage_without_moving(snak_teams::store::Storage::File);
     }
     let backend: Arc<dyn ChatBackend> = match connector.restore().await {
@@ -134,6 +136,10 @@ async fn main() {
                 Some(Event::SessionExpired) => break println!("push: session expired"),
                 Some(Event::MessagesChanged(_)) => println!("push: messages changed"),
                 Some(Event::ConversationsChanged) => println!("push: conversations changed"),
+                Some(Event::Typing { user, .. }) => {
+                    println!("push: typing (named: {})", !user.is_empty())
+                }
+                Some(Event::PresenceChanged { presence, .. }) => println!("push: presence {presence}"),
                 None => break println!("push: channel closed"),
             },
         }

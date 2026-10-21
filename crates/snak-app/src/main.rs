@@ -1,3 +1,8 @@
+// No `windows_subsystem = "windows"`: the same binary runs `snak --stdio` as an
+// MCP server, which has to behave as a console program on Windows (the shell
+// waits for it, stdio reaches the terminal). The cost is a console window next
+// to the app when it's launched from Explorer.
+
 mod app;
 mod code_blocks;
 mod log;

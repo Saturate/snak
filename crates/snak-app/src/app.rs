@@ -190,6 +190,18 @@ pub struct Snak {
     profile: Option<Profile>,
     /// Their DM's messages, listed under the profile.
     profile_rows: Rc<Vec<Message>>,
+    /// The fetch for the panel; replacing or dropping it cancels a stale one,
+    /// so a slow answer can't reopen a closed panel or override a newer click.
+    profile_task: Option<Task<()>>,
+    /// Refetches the open profile's DM when a message lands there. Kept apart
+    /// from `profile_task` so it never cancels a click on someone else.
+    profile_refetch_task: Option<Task<()>>,
+    /// Counts opens and closes; a fetch only lands if none happened since it
+    /// started, so a refetch for the old person can't override a newer click.
+    profile_opened: u64,
+    /// The `profile_opened` the shown profile was fetched under. A DM refetch
+    /// carries this, not the latest count, so it loses to a pending click.
+    profile_shown: u64,
     profile_scroller: Entity<MessageScrollerState>,
 
     auth_task: Option<Task<()>>,
@@ -290,6 +302,10 @@ impl Snak {
             thread_composer,
             profile: None,
             profile_rows: Rc::default(),
+            profile_task: None,
+            profile_refetch_task: None,
+            profile_opened: 0,
+            profile_shown: 0,
             profile_scroller,
             auth_task: None,
             sidebar_task: None,
@@ -436,6 +452,11 @@ impl Snak {
         self.selected = None;
         self.showing_unreads = true;
         self.thread_root = None;
+        self.profile = None;
+        self.profile_rows = Rc::default();
+        self.profile_task = None;
+        self.profile_refetch_task = None;
+        self.profile_opened += 1;
         self.pending.clear();
         self.error = None;
         self.set_rows(Vec::new(), cx);
@@ -514,7 +535,8 @@ impl Snak {
                 if let Some(dm) = self.profile.as_ref().and_then(|p| p.dm.clone())
                     && dm == id
                 {
-                    self.open_profile(dm.0.clone(), cx);
+                    let shown = self.profile_shown;
+                    self.profile_refetch_task = self.fetch_profile(dm.0.clone(), shown, cx);
                 }
             }
             Event::ConversationsChanged => self.load_conversations(cx),
@@ -1071,6 +1093,7 @@ impl Snak {
         // Escape reaches here from the main composer too; with no thread
         // open there's nothing to close and focus must stay put.
         if self.thread_root.is_none() {
+            self.close_profile(window, cx);
             return;
         }
         self.put_away_thread_draft(window, cx);
@@ -1127,10 +1150,19 @@ impl Snak {
     }
 
     fn open_profile(&mut self, key: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
+        self.profile_opened += 1;
+        let opened = self.profile_opened;
+        self.profile_task = self.fetch_profile(key, opened, cx);
+    }
+
+    fn fetch_profile(
+        &mut self,
+        key: String,
+        opened: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        let backend = self.backend.clone()?;
+        Some(cx.spawn(async move |this, cx| {
             let result = io(async move {
                 // A fetch that failed is not the same as nobody: log it so a
                 // token refresh race or a blip isn't silent.
@@ -1150,6 +1182,7 @@ impl Snak {
             })
             .await;
             this.update(cx, |this, cx| match result.ok().flatten() {
+                _ if this.profile_opened != opened => {}
                 Some((person, rows)) => {
                     sync_scroller(&this.profile_scroller, &this.profile_rows, &rows, cx);
                     if let Some(photo) = person
@@ -1164,22 +1197,27 @@ impl Snak {
                     }
                     this.profile = Some(person);
                     this.profile_rows = Rc::new(rows);
+                    this.profile_shown = opened;
                     cx.notify();
                 }
                 None => {
+                    // The shown profile stays; let its DM refetches land again.
+                    this.profile_shown = opened;
                     tracing::debug!("profile panel found nobody");
                 }
             })
             .ok();
-        })
-        .detach();
+        }))
     }
 
     fn close_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.profile.is_none() {
+        // A first open still loading counts too: closing must stop it landing.
+        self.profile_opened += 1;
+        self.profile_task = None;
+        self.profile_refetch_task = None;
+        if self.profile.take().is_none() {
             return;
         }
-        self.profile = None;
         self.profile_rows = Rc::default();
         window.focus(&self.focus, cx);
         cx.notify();
@@ -2884,88 +2922,14 @@ impl Snak {
             .border_color(theme.border)
             .bg(theme.background)
             .child(
-                // The about block: photo and name on top, then a line each for
-                // title, online state, mail and call, stacked like a card.
-                v_flex()
+                h_flex()
                     .flex_none()
-                    .h(px(96.))
+                    .h(px(48.))
                     .px_4()
-                    .gap_0()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .h(px(48.))
-                            .gap_1p5()
-                            .child(
-                                Avatar::new()
-                                    .name(person.display_name.clone())
-                                    .when_some(avatar.clone(), |el, avatar| el.src(avatar)),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(person.display_name.clone()),
-                            ),
-                    )
-                    .when_some(person.job_title.clone(), |el, title| {
-                        el.child(div().flex_none().h(px(16.)).text_sm().child(title))
-                    })
-                    .when_some(presence_dot, |el, dot| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .h(px(16.))
-                                .text_sm()
-                                .child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
-                                .when_some(availability.clone(), |el, word| {
-                                    el.child(div().child(word))
-                                })
-                                .when_some(activity, |el, activity| el.child(div().child(activity)))
-                                .when_some(last_online, |el, last| el.child(div().child(last))),
-                        )
-                    })
-                    .when_some(mail.clone(), |el, mail| {
-                        let copy = mail.clone();
-                        let open = mail.clone();
-                        el.child(
-                            div()
-                                .flex_none()
-                                .h(px(16.))
-                                .id("profile-email")
-                                .cursor_pointer()
-                                .text_sm()
-                                .text_color(theme.link)
-                                .child(format!("Mail: {mail}"))
-                                .child(
-                                    div()
-                                        .id("profile-email-copy")
-                                        .child(Icon::new(IconName::Copy).xsmall())
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                copy.clone(),
-                                            ))
-                                        }),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    let mailto = format!("mailto:{open}");
-                                    cx.open_url(&mailto)
-                                }),
-                        )
-                    })
-                    .when_some(call_url.clone(), |el, url| {
-                        el.child(
-                            Button::new("profile-call")
-                                .small()
-                                .ghost()
-                                .icon(Icon::new(gpui_kit::assets::IconName::Phone))
-                                .on_click(move |_, _, cx| {
-                                    let url = url.clone();
-                                    cx.open_url(&url)
-                                }),
-                        )
-                    })
+                    .child(div().font_weight(FontWeight::BOLD).child("Profile"))
+                    .child(div().flex_1())
                     .child(
                         Button::new("close-profile")
                             .small()
@@ -2975,6 +2939,122 @@ impl Snak {
                                 cx.listener(|this, _, window, cx| this.close_profile(window, cx)),
                             ),
                     ),
+            )
+            .child(
+                v_flex()
+                    .flex_none()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                div().flex_none().child(
+                                    Avatar::new()
+                                        .name(person.display_name.clone())
+                                        .when_some(avatar.clone(), |el, avatar| el.src(avatar))
+                                        .large(),
+                                ),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(person.display_name.clone()),
+                                    )
+                                    .when_some(person.job_title.clone(), |el, title| {
+                                        el.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(theme.muted_foreground)
+                                                .child(title),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .when_some(presence_dot, |el, dot| {
+                        let detail: Vec<String> =
+                            [activity, last_online].into_iter().flatten().collect();
+                        el.child(
+                            h_flex()
+                                .gap_1p5()
+                                .text_sm()
+                                .child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+                                .when_some(availability.clone(), |el, word| {
+                                    el.child(div().child(word))
+                                })
+                                .when(!detail.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .text_color(theme.muted_foreground)
+                                            .child(detail.join(" · ")),
+                                    )
+                                }),
+                        )
+                    })
+                    .when_some(mail.clone(), |el, mail| {
+                        let copy = mail.clone();
+                        // Guests have only their UPN, whose `#EXT#` is no
+                        // mailbox; show it but don't offer to mail it.
+                        let mailto = (!mail.contains("#EXT#")).then(|| format!("mailto:{mail}"));
+                        el.child(
+                            h_flex()
+                                .gap_1()
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .id("profile-email")
+                                        .min_w_0()
+                                        .truncate()
+                                        .when_some(mailto, |el, mailto| {
+                                            el.cursor_pointer()
+                                                .text_color(theme.link)
+                                                .on_click(move |_, _, cx| cx.open_url(&mailto))
+                                        })
+                                        .child(mail),
+                                )
+                                .child(
+                                    div().flex_none().child(
+                                        Button::new("profile-email-copy")
+                                            .xsmall()
+                                            .ghost()
+                                            .icon(Icon::new(IconName::Copy))
+                                            .tooltip("Copy address")
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    copy.clone(),
+                                                ))
+                                            }),
+                                    ),
+                                ),
+                        )
+                    })
+                    .children(person.phones.iter().map(|phone| {
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(phone.clone())
+                    }))
+                    .when_some(call_url.clone(), |el, url| {
+                        el.child(
+                            h_flex().child(
+                                Button::new("profile-call")
+                                    .small()
+                                    .outline()
+                                    .icon(Icon::new(gpui_kit::assets::IconName::Phone))
+                                    .label("Call")
+                                    .on_click(move |_, _, cx| {
+                                        let url = url.clone();
+                                        cx.open_url(&url)
+                                    }),
+                            ),
+                        )
+                    }),
             )
             .child(div().flex_1().min_h_0().child(Self::render_timeline(
                 "profile",

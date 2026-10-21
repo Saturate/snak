@@ -8,11 +8,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, Profile, Reaction,
+    ConversationKind, Event, Group, ImageRef, LoginPrompt, Me, Message, MessageId, Profile,
+    Reaction,
 };
 use tokio::sync::mpsc;
 
 const ME_ID: &str = "me";
+/// One picture in Maja's DM, so the image viewer can be tried offline.
+const BOARD_URL: &str = "demo:board";
+const BOARD: &[u8] = include_bytes!("../assets/board.jpg");
 const ACTIVITY_EVERY: Duration = Duration::from_secs(40);
 
 struct Person {
@@ -206,8 +210,12 @@ impl ChatBackend for DemoBackend {
         Box::pin(async { Ok(()) })
     }
 
-    fn image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Vec<u8>> {
-        Box::pin(async { Err(ChatError::Other("the demo has no images".into())) })
+    fn image<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Vec<u8>> {
+        let result = match url {
+            BOARD_URL => Ok(BOARD.to_vec()),
+            _ => Err(ChatError::Other(format!("the demo has no image {url}"))),
+        };
+        Box::pin(async move { result })
     }
 
     fn person(&self, key: &str) -> BoxFuture<'_, Option<Profile>> {
@@ -532,6 +540,19 @@ fn seed(now: DateTime<Utc>) -> State {
                     "<p>I think we're low on testing hours.</p>",
                 ),
                 message(id(), ME_ID, ago(20), "<p>Agreed, let's add a week.</p>"),
+                Message {
+                    images: vec![ImageRef {
+                        url: BOARD_URL.into(),
+                        width: Some(960.),
+                        height: Some(673.),
+                    }],
+                    ..message(
+                        id(),
+                        "maja",
+                        ago(15),
+                        "<p>Here's where the board is at.</p>",
+                    )
+                },
             ],
         },
         Thread {

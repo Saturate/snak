@@ -419,7 +419,10 @@ fn chat_conversations(
 ) -> Vec<Conversation> {
     chats
         .iter()
-        .filter(|chat| chat.hidden != Some(true) && chat.is_conversation_deleted != Some(true))
+        // Not `hidden`: Teams sets it on most chats without recent activity
+        // (all 37 DMs on one tenant), yet they are still live. Recency
+        // ordering and the sidebar's DM limit keep old ones out of the way.
+        .filter(|chat| chat.is_conversation_deleted != Some(true))
         // Meeting chats belong with the meeting in Teams; they crowd out real DMs.
         .filter(|chat| chat.chat_type.as_deref() != Some("meeting"))
         .map(|chat| {

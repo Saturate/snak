@@ -188,10 +188,20 @@ impl TeamsClient {
         url: &str,
         build: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder,
     ) -> Result<T> {
+        let res = self.call_response(scope, build).await?;
+        decode(res, url).await
+    }
+
+    /// [`Self::call`] without decoding, for callers that need the headers.
+    async fn call_response(
+        &self,
+        scope: &'static str,
+        build: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let token = self.token(scope).await?;
-        let res = build(&self.http, token.clone()).send().await?;
+        let res = send_throttled(|| build(&self.http, token.clone())).await?;
         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
-            return decode(res, url).await;
+            return Ok(res);
         }
         tracing::info!(scope, "access token rejected; getting a new one");
         {
@@ -203,8 +213,7 @@ impl TeamsClient {
             }
         }
         let token = self.token(scope).await?;
-        let res = build(&self.http, token).send().await?;
-        decode(res, url).await
+        send_throttled(|| build(&self.http, token.clone())).await
     }
 
     /// All joined teams with their channels, plus all chats.
@@ -439,6 +448,47 @@ impl TeamsClient {
     }
 }
 
+// Two retries ride out Graph's short per-app bursts; a longer block (minutes)
+// should surface as an error rather than freeze the UI or a tool call.
+const THROTTLE_RETRIES: u32 = 2;
+const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(30);
+
+/// Sends, waiting out a 429 the way Microsoft asks with Retry-After. Only
+/// 429: it means the request was not processed, whereas a 503 on a send
+/// may have posted the message, and retrying it would post it twice.
+async fn send_throttled(build: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    for attempt in 0..THROTTLE_RETRIES {
+        let res = build().send().await?;
+        if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(res);
+        }
+        let wait = retry_after(&res)
+            .unwrap_or(Duration::from_secs(2 << attempt))
+            .min(MAX_THROTTLE_WAIT);
+        let path = res.url().path().to_string();
+        tracing::info!(
+            url = path,
+            wait_secs = wait.as_secs(),
+            "throttled; retrying"
+        );
+        tokio::time::sleep(wait).await;
+    }
+    Ok(build().send().await?)
+}
+
+/// Retry-After in its seconds form; the HTTP-date form falls back to backoff.
+fn retry_after(res: &reqwest::Response) -> Option<Duration> {
+    let secs = res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs))
+}
+
 pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &str) -> Result<T> {
     let status = res.status();
     let body = res.text().await?;
@@ -489,4 +539,46 @@ fn urlencode(id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    /// Answers each connection with the next canned response, then stops.
+    fn serve(responses: &'static [&'static str]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_429_is_retried_after_the_wait_it_asks_for() {
+        let url = serve(&[
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        ]);
+        let http = reqwest::Client::new();
+        let res = send_throttled(|| http.get(&url)).await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_503_is_not_retried() {
+        let url = serve(&[
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let http = reqwest::Client::new();
+        let res = send_throttled(|| http.get(&url)).await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

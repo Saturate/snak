@@ -261,7 +261,7 @@ impl ChatBackend for TeamsBackend {
             Ok(Some(Profile {
                 display_name: person.display_name.clone().unwrap_or_default(),
                 // Graph's `mail` is missing for guests; the UPN still works.
-                mail: person.mail.clone().or(person.upn.clone()),
+                mail: person.mail.clone().or_else(|| person.upn.clone()),
                 job_title: person.job_title.clone(),
                 phones: person.phones.clone(),
                 photo,
@@ -455,15 +455,14 @@ fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> 
     }
 }
 
+#[derive(Default)]
 pub struct TeamsConnector {
     http: reqwest::Client,
 }
 
 impl TeamsConnector {
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
+        Self::default()
     }
 
     async fn connect(&self, login: StoredLogin) -> Result<Arc<dyn ChatBackend>, ChatError> {
@@ -473,12 +472,6 @@ impl TeamsConnector {
         tracing::info!(region = client.region(), "connected to Teams");
         let backend: Arc<dyn ChatBackend> = Arc::new(TeamsBackend::new(client));
         Ok(backend)
-    }
-}
-
-impl Default for TeamsConnector {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -517,7 +510,7 @@ impl Connector for TeamsConnector {
                 verification_url: prompt.url.clone(),
                 expires_in: prompt.expires_in_secs,
                 interval: prompt.poll_interval_secs,
-                message: String::new(),
+                message: String::default(),
             };
             let login = auth::complete_device_login(&self.http, &code).await?;
             self.connect(login).await
@@ -1007,7 +1000,7 @@ fn blank_block(html: &str) -> Option<usize> {
     if inner.contains("<p") || inner.contains("<div") {
         return None;
     }
-    let mut text = String::new();
+    let mut text = String::default();
     let mut in_tag = false;
     for c in inner.chars() {
         match c {
@@ -1120,7 +1113,7 @@ fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[Str
             let next = end + gap;
             let same_person = lower[next..].starts_with("<span")
                 && lower[next..].find('>').is_some_and(|next_len| {
-                    let next_tag = &html[next..next + next_len + 1];
+                    let next_tag = &html[next..=next + next_len];
                     next_tag.to_ascii_lowercase().contains(MARKER)
                         && attribute(next_tag, "itemid")
                             .is_some_and(|next_item| person(&next_item) == person(&item))
@@ -1198,7 +1191,7 @@ fn reaction_glyph(key: &str) -> String {
     let Some(mut glyph) = code_point_glyph(base).or_else(|| named_glyph(base).map(String::from))
     else {
         // Other people pick the key, so only plain characters, and not many.
-        let name: String = key.chars().filter(|&c| !invisible(c)).take(32).collect();
+        let name: String = key.matches(|c| !invisible(c)).take(32).collect();
         return format!(":{name}:");
     };
     if let Some(tone) = tone {
@@ -1279,44 +1272,50 @@ fn invisible(c: char) -> bool {
         || (c as u32 & 0xfffe) == 0xfffe
 }
 
+/// Teams' reaction names, with the aliases other clients send, and the
+/// emoji each one shows as.
+const NAMED_GLYPHS: &[(&[&str], &str)] = &[
+    (&["like", "yes", "thumbsup"], "👍"),
+    (&["no", "thumbsdown"], "👎"),
+    (&["heart"], "❤️"),
+    (&["laugh"], "😆"),
+    (&["surprised"], "😮"),
+    (&["sad", "cry"], "😢"),
+    (&["angry"], "😠"),
+    (&["clappinghands", "clap"], "👏"),
+    (&["handsinair"], "🙌"),
+    (&["fire"], "🔥"),
+    (&["muscle"], "💪"),
+    (&["fistbump"], "👊"),
+    (&["cool"], "😎"),
+    (&["launch", "rocket"], "🚀"),
+    (&["salute"], "🫡"),
+    (&["penguin"], "🐧"),
+    (&["eyes"], "👀"),
+    (&["party", "partypopper"], "🎉"),
+    (&["pray", "prayinghands"], "🙏"),
+    (&["ok", "okhand"], "👌"),
+    (&["victory"], "✌️"),
+    (&["wave", "hi"], "👋"),
+    (&["smile"], "🙂"),
+    (&["wink"], "😉"),
+    (&["hug"], "🤗"),
+    (&["rofl"], "🤣"),
+    (&["thinking"], "🤔"),
+    (&["facepalm"], "🤦"),
+    (&["shrug"], "🤷"),
+    (&["100"], "💯"),
+    (&["star"], "⭐"),
+    (&["coffee"], "☕"),
+    (&["cake"], "🍰"),
+    (&["check", "checkmark"], "✅"),
+];
+
 fn named_glyph(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "like" | "yes" | "thumbsup" => "👍",
-        "no" | "thumbsdown" => "👎",
-        "heart" => "❤️",
-        "laugh" => "😆",
-        "surprised" => "😮",
-        "sad" | "cry" => "😢",
-        "angry" => "😠",
-        "clappinghands" | "clap" => "👏",
-        "handsinair" => "🙌",
-        "fire" => "🔥",
-        "muscle" => "💪",
-        "fistbump" => "👊",
-        "cool" => "😎",
-        "launch" | "rocket" => "🚀",
-        "salute" => "🫡",
-        "penguin" => "🐧",
-        "eyes" => "👀",
-        "party" | "partypopper" => "🎉",
-        "pray" | "prayinghands" => "🙏",
-        "ok" | "okhand" => "👌",
-        "victory" => "✌️",
-        "wave" | "hi" => "👋",
-        "smile" => "🙂",
-        "wink" => "😉",
-        "hug" => "🤗",
-        "rofl" => "🤣",
-        "thinking" => "🤔",
-        "facepalm" => "🤦",
-        "shrug" => "🤷",
-        "100" => "💯",
-        "star" => "⭐",
-        "coffee" => "☕",
-        "cake" => "🍰",
-        "check" | "checkmark" => "✅",
-        _ => return None,
-    })
+    NAMED_GLYPHS
+        .iter()
+        .find(|(names, _)| names.contains(&name))
+        .map(|(_, glyph)| *glyph)
 }
 
 /// Chat pages arrive newest first; the timeline wants oldest first.
@@ -1353,6 +1352,15 @@ fn channel_messages(chains: &[ReplyChain], me_id: &str) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaction_names_and_their_aliases_find_a_glyph() {
+        assert_eq!(named_glyph("like"), Some("👍"));
+        assert_eq!(named_glyph("thumbsup"), Some("👍"));
+        assert_eq!(named_glyph("checkmark"), Some("✅"));
+        assert_eq!(named_glyph("100"), Some("💯"));
+        assert_eq!(named_glyph("unicorn"), None);
+    }
 
     fn message(id: &str, from: &str, time: &str, kind: &str, content: &str) -> models::Message {
         serde_json::from_value(serde_json::json!({

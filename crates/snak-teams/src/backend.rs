@@ -179,14 +179,14 @@ impl ChatBackend for TeamsBackend {
                     let page = self.client.channel_posts(&team_id, &channel_id).await?;
                     MessagesPage {
                         messages: channel_messages(&page.reply_chains, &self.me.id),
-                        older: page.continuation_token.filter(|_| page.has_more).clone(),
+                        older: page.continuation_token.filter(|_| page.has_more),
                     }
                 }
                 Address::Chat { id, .. } => {
                     let page = self.client.chat_messages(&id).await?;
                     MessagesPage {
                         messages: chat_messages(&page.messages, &self.me.id),
-                        older: page.sync_state.clone(),
+                        older: page.sync_state,
                     }
                 }
             })
@@ -210,14 +210,14 @@ impl ChatBackend for TeamsBackend {
                         .await?;
                     MessagesPage {
                         messages: channel_messages(&page.reply_chains, &self.me.id),
-                        older: page.continuation_token.filter(|_| page.has_more).clone(),
+                        older: page.continuation_token.filter(|_| page.has_more),
                     }
                 }
                 Address::Chat { id, .. } => {
                     let page = self.client.chat_messages_before(&id, older).await?;
                     MessagesPage {
                         messages: chat_messages(&page.messages, &self.me.id),
-                        older: page.sync_state.clone(),
+                        older: page.sync_state,
                     }
                 }
             })
@@ -1096,7 +1096,7 @@ fn reaction_glyph(key: &str) -> String {
         Some((base, n)) => (base, n.parse::<u32>().ok().filter(|n| (1..=5).contains(n))),
         None => (key, None),
     };
-    let Some(mut glyph) = code_point_glyph(base).or_else(|| named_glyph(base).map(str::to_owned))
+    let Some(mut glyph) = code_point_glyph(base).or_else(|| named_glyph(base).map(String::from))
     else {
         // Other people pick the key, so only plain characters, and not many.
         let name: String = key.chars().filter(|&c| !invisible(c)).take(32).collect();

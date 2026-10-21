@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
     ConversationKind, CredentialStorage, Event, Group, ImageRef, LoginPrompt, Me, Message,
-    MessageId, Profile, Reaction,
+    MessageId, MessagesPage, Profile, Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -274,18 +274,56 @@ impl ChatBackend for TeamsBackend {
         Box::pin(self.load_conversations())
     }
 
-    fn messages<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, Vec<Message>> {
+    fn messages<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, MessagesPage> {
         Box::pin(async move {
             Ok(match self.address(id)? {
                 Address::Channel {
                     team_id,
                     channel_id,
-                } => channel_messages(
-                    &self.client.channel_posts(&team_id, &channel_id).await?,
-                    &self.me.id,
-                ),
+                } => {
+                    let page = self.client.channel_posts(&team_id, &channel_id).await?;
+                    MessagesPage {
+                        messages: channel_messages(&page.reply_chains, &self.me.id),
+                        older: page.continuation_token.filter(|_| page.has_more),
+                    }
+                }
                 Address::Chat { id, .. } => {
-                    chat_messages(&self.client.chat_messages(&id).await?.messages, &self.me.id)
+                    let page = self.client.chat_messages(&id).await?;
+                    MessagesPage {
+                        messages: chat_messages(&page.messages, &self.me.id),
+                        older: page.metadata.backward_link,
+                    }
+                }
+            })
+        })
+    }
+
+    fn older_messages<'a>(
+        &'a self,
+        id: &'a ConversationId,
+        older: &'a str,
+    ) -> BoxFuture<'a, MessagesPage> {
+        Box::pin(async move {
+            Ok(match self.address(id)? {
+                Address::Channel {
+                    team_id,
+                    channel_id,
+                } => {
+                    let page = self
+                        .client
+                        .channel_posts_before(&team_id, &channel_id, older)
+                        .await?;
+                    MessagesPage {
+                        messages: channel_messages(&page.reply_chains, &self.me.id),
+                        older: page.continuation_token.filter(|_| page.has_more),
+                    }
+                }
+                Address::Chat { .. } => {
+                    let page = self.client.chat_messages_before(older).await?;
+                    MessagesPage {
+                        messages: chat_messages(&page.messages, &self.me.id),
+                        older: page.metadata.backward_link,
+                    }
                 }
             })
         })

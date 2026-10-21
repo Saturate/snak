@@ -324,15 +324,40 @@ impl Mcp {
         &self,
         params: Parameters<MessagesParams>,
     ) -> Result<Json<MessagesOut>, String> {
-        let rows = match self
+        let limit = params.0.limit.clamp(1, 200);
+        let id = snak_chat::ConversationId(params.0.conversation_id.clone());
+        let page = self
             .backend
-            .messages(&snak_chat::ConversationId(params.0.conversation_id.clone()))
+            .messages(&id)
             .await
-        {
-            Ok(rows) => rows,
-            Err(e) => return Err(e.to_string()),
-        };
-        let skip = rows.len().saturating_sub(params.0.limit.clamp(1, 200));
+            .map_err(|e| e.to_string())?;
+        let mut rows = page.messages;
+        let mut older = page.older;
+        // Channel pages are short; follow a few back to reach the limit, but
+        // never walk a whole history for one call.
+        for _ in 0..4 {
+            let Some(cursor) = older.take().filter(|_| rows.len() < limit) else {
+                break;
+            };
+            let page = self
+                .backend
+                .older_messages(&id, &cursor)
+                .await
+                .map_err(|e| e.to_string())?;
+            let seen: std::collections::HashSet<&str> =
+                rows.iter().map(|m| m.id.0.as_str()).collect();
+            let earlier: Vec<_> = page
+                .messages
+                .into_iter()
+                .filter(|m| !seen.contains(m.id.0.as_str()))
+                .collect();
+            if earlier.is_empty() {
+                break;
+            }
+            rows.splice(0..0, earlier);
+            older = page.older;
+        }
+        let skip = rows.len().saturating_sub(limit);
         let out = rows[skip..].iter().map(message_out).collect();
         Ok(Json(MessagesOut { messages: out }))
     }

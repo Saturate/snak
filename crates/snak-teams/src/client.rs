@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::{self, AccessToken, scope};
 use crate::error::{CoreError, Result};
-use crate::models::{ChannelPage, Me, MessagePage, Person, ReplyChain, UserDetails};
+use crate::models::{ChannelPage, Me, MessagePage, Person, UserDetails};
 use crate::store::StoredLogin;
 
 const TEAMS: &str = "https://teams.microsoft.com";
@@ -260,16 +260,45 @@ impl TeamsClient {
         self.get_json(scope::CHAT, &url).await
     }
 
-    /// Recent channel posts, each with its replies.
-    pub async fn channel_posts(&self, team_id: &str, channel_id: &str) -> Result<Vec<ReplyChain>> {
+    /// The page of a chat's messages behind `backward_link`, the link an
+    /// earlier [`Self::chat_messages`] or `chat_messages_before` page gave.
+    pub async fn chat_messages_before(&self, backward_link: &str) -> Result<MessagePage> {
+        // The link comes out of a response body; the bearer token only goes
+        // where chat_messages itself would send it.
+        let Some(link) = chat_link(backward_link, &self.region) else {
+            return Err(CoreError::UntrustedLink);
+        };
+        self.get_json(scope::CHAT, link.as_str()).await
+    }
+
+    /// Recent channel posts, each with its replies, with where the next,
+    /// older page keeps going.
+    pub async fn channel_posts(&self, team_id: &str, channel_id: &str) -> Result<ChannelPage> {
         let url = format!(
             "{TEAMS}/api/csa/{}/api/v2/teams/{}/channels/{}",
             self.region,
             urlencode(team_id),
             urlencode(channel_id)
         );
-        let page: ChannelPage = self.get_json(scope::CHAT_AGGREGATOR, &url).await?;
-        Ok(page.reply_chains)
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
+    }
+
+    /// The channel posts older than `continuation_token`, a cursor from an
+    /// earlier [`Self::channel_posts`] or `channel_posts_before` response.
+    pub async fn channel_posts_before(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        continuation_token: &str,
+    ) -> Result<ChannelPage> {
+        let url = format!(
+            "{TEAMS}/api/csa/{}/api/v2/teams/{}/channels/{}?continuationToken={}",
+            self.region,
+            urlencode(team_id),
+            urlencode(channel_id),
+            urlencode(continuation_token)
+        );
+        self.get_json(scope::CHAT_AGGREGATOR, &url).await
     }
 
     /// Bytes of an image embedded in a message. Only Microsoft's own media
@@ -644,6 +673,19 @@ pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &st
     })
 }
 
+/// The link as it will be requested, if that's under this region's chatsvc
+/// conversations. The check runs on the parsed form because the parser
+/// drops tabs and newlines and resolves `..`, `%2e` and `\` before the
+/// request goes out, so the raw text can look inside and land outside.
+fn chat_link(link: &str, region: &str) -> Option<url::Url> {
+    if region.is_empty() || link.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let url = url::Url::parse(link).ok()?;
+    let prefix = format!("{TEAMS}/api/chatsvc/{region}/v1/users/ME/conversations/");
+    url.as_str().starts_with(&prefix).then_some(url)
+}
+
 // Conversation IDs look like `19:abc@thread.v2`; Teams expects them unescaped
 // apart from characters that would break the path.
 fn urlencode(id: &str) -> String {
@@ -727,5 +769,40 @@ mod tests {
         let http = reqwest::Client::new();
         let res = send_throttled(|| http.get(&url)).await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn is_chat_link(link: &str, region: &str) -> bool {
+        chat_link(link, region).is_some()
+    }
+
+    #[test]
+    fn only_chatsvc_links_in_our_region_get_the_token() {
+        let ok = "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/19:a@thread.v2/messages?startTime=1&syncState=x&pageSize=200";
+        assert!(is_chat_link(ok, "emea"));
+        assert!(!is_chat_link(ok, "amer"));
+        assert!(!is_chat_link(ok, ""));
+        // Parsing only tidies it; it still lands in the same place.
+        assert!(is_chat_link(
+            "HTTPS://TEAMS.MICROSOFT.COM/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
+            "emea"
+        ));
+        for bad in [
+            "https://evil.example/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
+            "https://teams.microsoft.com.evil.example/api/chatsvc/emea/v1/users/ME/conversations/c",
+            "http://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/properties",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/../../../x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c\\..\\..\\x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/.\t./.\t./x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/.\n./.\r./x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c /messages",
+            "https://teams.microsoft.com:444/api/chatsvc/emea/v1/users/ME/conversations/c",
+            "https://user@teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c",
+            "HTTPS://TEAMS.MICROSOFT.COM/api/chatsvc/emea/v1/users/ME/conversations/%2e%2e/%2e%2e/x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/%2E%2e/%2e./x",
+            "",
+        ] {
+            assert!(!is_chat_link(bad, "emea"), "{bad}");
+        }
     }
 }

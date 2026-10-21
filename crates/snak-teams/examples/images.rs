@@ -61,8 +61,8 @@ async fn main() {
     }
     for team in details.teams.iter().take(6) {
         for channel in team.channels.iter().take(4) {
-            if let Ok(chains) = client.channel_posts(&team.id, &channel.id).await {
-                chains
+            if let Ok(page) = client.channel_posts(&team.id, &channel.id).await {
+                page.reply_chains
                     .iter()
                     .flat_map(|c| c.messages.iter())
                     .filter_map(|m| m.content.as_deref())

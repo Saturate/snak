@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn opening_a_conversation_marks_it_read() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let id = ConversationId("eng-backend".into());
         let before = block_on(backend.conversations()).expect("list");
         assert!(before.iter().any(|c| c.id == id && c.unread));
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn only_the_newest_page_is_loaded() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let id = ConversationId("eng-general".into());
         let page = block_on(backend.messages(&id)).expect("messages");
         assert_eq!(page.messages.len(), PAGE);
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn older_pages_run_out() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let id = ConversationId("eng-general".into());
         let first = block_on(backend.messages(&id)).expect("messages");
         assert_eq!(first.messages.len(), PAGE);
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn replies_land_under_their_post() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let id = ConversationId("eng-backend".into());
         let posts = block_on(backend.messages(&id)).expect("messages");
         let count = posts.messages.len();
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn sent_text_is_escaped() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let id = ConversationId("dm-jonas".into());
         block_on(backend.send(&id, None, "<b>hi</b>")).expect("send");
         let messages = block_on(backend.messages(&id)).expect("messages");
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn activity_plays_once() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let landed = std::iter::from_fn(|| backend.simulate_activity())
             .take(10)
             .count();
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn activity_marks_target_unread() {
-        let backend = DemoBackend::new();
+        let backend = DemoBackend::default();
         let changed = backend.simulate_activity().expect("lands");
         let list = block_on(backend.conversations()).expect("list");
         assert!(list.iter().any(|c| c.id == changed && c.unread));

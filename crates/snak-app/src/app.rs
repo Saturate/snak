@@ -2255,6 +2255,9 @@ impl Snak {
     }
 
     /// The sidebar as display rows, shared by rendering and Option+arrow navigation.
+    // One pass in display order on purpose: split up, the rules for which
+    // section a row lands in would be spread over several functions.
+    // skipcq: RS-R1000
     fn sidebar_rows(&self, query: &str, cx: &App) -> Vec<SidebarRow> {
         let settings = Settings::get(cx);
         let dm_limit = settings.dm_limit.max(1.) as usize;

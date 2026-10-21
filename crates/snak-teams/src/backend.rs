@@ -1183,44 +1183,50 @@ fn invisible(c: char) -> bool {
         || (c as u32 & 0xfffe) == 0xfffe
 }
 
+/// Teams' reaction names, with the aliases other clients send, and the
+/// emoji each one shows as.
+const NAMED_GLYPHS: &[(&[&str], &str)] = &[
+    (&["like", "yes", "thumbsup"], "👍"),
+    (&["no", "thumbsdown"], "👎"),
+    (&["heart"], "❤️"),
+    (&["laugh"], "😆"),
+    (&["surprised"], "😮"),
+    (&["sad", "cry"], "😢"),
+    (&["angry"], "😠"),
+    (&["clappinghands", "clap"], "👏"),
+    (&["handsinair"], "🙌"),
+    (&["fire"], "🔥"),
+    (&["muscle"], "💪"),
+    (&["fistbump"], "👊"),
+    (&["cool"], "😎"),
+    (&["launch", "rocket"], "🚀"),
+    (&["salute"], "🫡"),
+    (&["penguin"], "🐧"),
+    (&["eyes"], "👀"),
+    (&["party", "partypopper"], "🎉"),
+    (&["pray", "prayinghands"], "🙏"),
+    (&["ok", "okhand"], "👌"),
+    (&["victory"], "✌️"),
+    (&["wave", "hi"], "👋"),
+    (&["smile"], "🙂"),
+    (&["wink"], "😉"),
+    (&["hug"], "🤗"),
+    (&["rofl"], "🤣"),
+    (&["thinking"], "🤔"),
+    (&["facepalm"], "🤦"),
+    (&["shrug"], "🤷"),
+    (&["100"], "💯"),
+    (&["star"], "⭐"),
+    (&["coffee"], "☕"),
+    (&["cake"], "🍰"),
+    (&["check", "checkmark"], "✅"),
+];
+
 fn named_glyph(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "like" | "yes" | "thumbsup" => "👍",
-        "no" | "thumbsdown" => "👎",
-        "heart" => "❤️",
-        "laugh" => "😆",
-        "surprised" => "😮",
-        "sad" | "cry" => "😢",
-        "angry" => "😠",
-        "clappinghands" | "clap" => "👏",
-        "handsinair" => "🙌",
-        "fire" => "🔥",
-        "muscle" => "💪",
-        "fistbump" => "👊",
-        "cool" => "😎",
-        "launch" | "rocket" => "🚀",
-        "salute" => "🫡",
-        "penguin" => "🐧",
-        "eyes" => "👀",
-        "party" | "partypopper" => "🎉",
-        "pray" | "prayinghands" => "🙏",
-        "ok" | "okhand" => "👌",
-        "victory" => "✌️",
-        "wave" | "hi" => "👋",
-        "smile" => "🙂",
-        "wink" => "😉",
-        "hug" => "🤗",
-        "rofl" => "🤣",
-        "thinking" => "🤔",
-        "facepalm" => "🤦",
-        "shrug" => "🤷",
-        "100" => "💯",
-        "star" => "⭐",
-        "coffee" => "☕",
-        "cake" => "🍰",
-        "check" | "checkmark" => "✅",
-        _ => return None,
-    })
+    NAMED_GLYPHS
+        .iter()
+        .find(|(names, _)| names.contains(&name))
+        .map(|(_, glyph)| *glyph)
 }
 
 /// Chat pages arrive newest first; the timeline wants oldest first.
@@ -1257,6 +1263,15 @@ fn channel_messages(chains: &[ReplyChain], me_id: &str) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaction_names_and_their_aliases_find_a_glyph() {
+        assert_eq!(named_glyph("like"), Some("👍"));
+        assert_eq!(named_glyph("thumbsup"), Some("👍"));
+        assert_eq!(named_glyph("checkmark"), Some("✅"));
+        assert_eq!(named_glyph("100"), Some("💯"));
+        assert_eq!(named_glyph("unicorn"), None);
+    }
 
     fn message(id: &str, from: &str, time: &str, kind: &str, content: &str) -> models::Message {
         serde_json::from_value(serde_json::json!({

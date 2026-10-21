@@ -191,8 +191,9 @@ pub struct Snak {
     thread_scroller: Entity<MessageScrollerState>,
     thread_composer: Entity<TextareaState>,
 
-    /// The image viewer panel, when one is open.
+    /// The image viewer, when one is open.
     image_viewer: Option<ImageViewer>,
+    /// The profile panel's person, when one is open.
     profile: Option<Profile>,
     /// Their DM's messages, listed under the profile.
     profile_rows: Rc<Vec<Message>>,
@@ -1615,14 +1616,14 @@ fn is_safe_link(url: &str) -> bool {
     matches!(scheme.as_str(), "https" | "http" | "mailto" | "msteams")
 }
 
-/// One person's live state, kept under their display name.
-#[derive(Clone)]
-/// The image viewer panel: one message's images, the one clicked shown large.
+/// The image viewer: one message's images, the one clicked shown large.
 struct ImageViewer {
     images: Vec<ImageRef>,
     index: usize,
 }
 
+/// One person's live state, kept under their display name.
+#[derive(Clone)]
 struct PresenceInfo {
     availability: String,
     activity: Option<String>,

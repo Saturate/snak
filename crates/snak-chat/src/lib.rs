@@ -171,12 +171,14 @@ pub enum Event {
     Reconnecting,
     /// Push stopped because credentials expired; the user has to sign in again.
     SessionExpired,
-    /// Someone is typing in this conversation. Services send no "stopped",
-    /// so expire it after a few seconds.
+    /// Someone is typing in this conversation, or stopped. A stop doesn't
+    /// always arrive (closed laptop, lost connection), so a started
+    /// indicator also expires on its own after a few seconds.
     Typing {
         conversation: ConversationId,
         /// Display name, empty when unknown.
         user: String,
+        stopped: bool,
     },
     /// Someone's presence changed; `presence` is the service's own word for
     /// it, e.g. Teams' `Available`, `Away` or `Offline`. `activity` is what

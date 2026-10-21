@@ -8,7 +8,7 @@ let args = CommandLine.arguments
 switch args.count > 1 ? args[1] : "" {
 case "find":
     guard args.count > 2, let pid = Int(args[2]) else {
-        FileHandle.standardError.write("usage: window.swift find <pid>\n".data(using: .utf8)!)
+        FileHandle.standardError.write(Data("usage: window.swift find <pid>\n".utf8))
         exit(2)
     }
     let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -24,7 +24,7 @@ case "park":
         let x = Double(args[2]),
         let y = Double(args[3])
     else {
-        FileHandle.standardError.write("usage: window.swift park <x> <y>\n".data(using: .utf8)!)
+        FileHandle.standardError.write(Data("usage: window.swift park <x> <y>\n".utf8))
         exit(2)
     }
     CGEvent(
@@ -34,6 +34,6 @@ case "park":
         mouseButton: .left
     )?.post(tap: .cghidEventTap)
 default:
-    FileHandle.standardError.write("usage: window.swift find <pid> | park <x> <y>\n".data(using: .utf8)!)
+    FileHandle.standardError.write(Data("usage: window.swift find <pid> | park <x> <y>\n".utf8))
     exit(2)
 }

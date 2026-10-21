@@ -95,12 +95,12 @@ async fn main() {
         let Ok(page) = client.raw_channel_posts(t, c).await else {
             continue;
         };
-        let chains = page["replyChains"].as_array().map(Vec::len).unwrap_or(0);
+        let chains = page["replyChains"].as_array().map_or(0, Vec::len);
         let max_msgs = page["replyChains"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|r| r["messages"].as_array().map(Vec::len).unwrap_or(0))
+            .map(|r| r["messages"].as_array().map_or(0, Vec::len))
             .max()
             .unwrap_or(0);
         println!("channel #{i}: {chains} reply chains, largest has {max_msgs} messages");

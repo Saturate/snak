@@ -366,15 +366,14 @@ fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> 
     }
 }
 
+#[derive(Default)]
 pub struct TeamsConnector {
     http: reqwest::Client,
 }
 
 impl TeamsConnector {
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
+        Self::default()
     }
 
     async fn connect(&self, login: StoredLogin) -> Result<Arc<dyn ChatBackend>, ChatError> {
@@ -384,12 +383,6 @@ impl TeamsConnector {
         tracing::info!(region = client.region(), "connected to Teams");
         let backend: Arc<dyn ChatBackend> = Arc::new(TeamsBackend::new(client));
         Ok(backend)
-    }
-}
-
-impl Default for TeamsConnector {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -428,7 +421,7 @@ impl Connector for TeamsConnector {
                 verification_url: prompt.url.clone(),
                 expires_in: prompt.expires_in_secs,
                 interval: prompt.poll_interval_secs,
-                message: String::new(),
+                message: String::default(),
             };
             let login = auth::complete_device_login(&self.http, &code).await?;
             self.connect(login).await
@@ -918,7 +911,7 @@ fn blank_block(html: &str) -> Option<usize> {
     if inner.contains("<p") || inner.contains("<div") {
         return None;
     }
-    let mut text = String::new();
+    let mut text = String::default();
     let mut in_tag = false;
     for c in inner.chars() {
         match c {
@@ -1031,7 +1024,7 @@ fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[Str
             let next = end + gap;
             let same_person = lower[next..].starts_with("<span")
                 && lower[next..].find('>').is_some_and(|next_len| {
-                    let next_tag = &html[next..next + next_len + 1];
+                    let next_tag = &html[next..=next + next_len];
                     next_tag.to_ascii_lowercase().contains(MARKER)
                         && attribute(next_tag, "itemid")
                             .is_some_and(|next_item| person(&next_item) == person(&item))
@@ -1109,7 +1102,7 @@ fn reaction_glyph(key: &str) -> String {
     let Some(mut glyph) = code_point_glyph(base).or_else(|| named_glyph(base).map(String::from))
     else {
         // Other people pick the key, so only plain characters, and not many.
-        let name: String = key.chars().filter(|&c| !invisible(c)).take(32).collect();
+        let name: String = key.matches(|c| !invisible(c)).take(32).collect();
         return format!(":{name}:");
     };
     if let Some(tone) = tone {

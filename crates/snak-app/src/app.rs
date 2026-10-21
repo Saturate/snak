@@ -400,7 +400,7 @@ impl Snak {
 
     fn show_error(&mut self, error: ChatError, cx: &mut Context<Self>) {
         tracing::error!(error = %error, "shown to user");
-        if let ChatError::SessionExpired(_) = error {
+        if matches!(error, ChatError::SessionExpired(_)) {
             self.session_expired(cx);
             return;
         }
@@ -876,7 +876,7 @@ impl Snak {
             }
             if self.thread_root.is_some() {
                 // `selected` is already taken above, so restore it briefly.
-                self.selected = previous_for_thread.clone();
+                self.selected = previous_for_thread;
                 self.put_away_thread_draft(window, cx);
                 self.selected = None;
             }
@@ -1423,7 +1423,7 @@ struct Pending {
 /// same author, same text, sent within a couple of minutes.
 #[cfg(test)]
 fn arrived(rows: &[Message], pending: &Pending) -> bool {
-    arrival(rows, pending, &Default::default()).is_some()
+    arrival(rows, pending, &std::collections::HashSet::default()).is_some()
 }
 
 /// The service's copy of `pending` in `rows`, if any, skipping copies another
@@ -2235,7 +2235,7 @@ impl Snak {
                         }),
                     ));
                 }
-                if let Placement::Section(_) = placement {
+                if matches!(placement, Placement::Section(_)) {
                     menu = menu.item(item(
                         "Remove from section".into(),
                         &key,
@@ -2494,7 +2494,7 @@ impl Snak {
                         }),
                     ));
                 }
-                if let Some(Placement::Section(_)) = team_placement {
+                if matches!(team_placement, Some(Placement::Section(_))) {
                     let key = key.clone();
                     menu = menu.item(PopupMenuItem::new("Remove team from section").on_click(
                         window.listener_for(&view, move |this, _, _, cx| {
@@ -3393,7 +3393,7 @@ mod tests {
             conversation: ConversationId("c".into()),
             reply_to: None,
             message: message("pending-1", "me", Body::Text("ok".into()), true),
-            seen: Default::default(),
+            seen: std::collections::HashSet::default(),
         };
         let second = Pending {
             message: message("pending-2", "me", Body::Text("ok".into()), true),
@@ -3476,7 +3476,7 @@ mod tests {
             conversation: ConversationId("c".into()),
             reply_to: Some(MessageId("root".into())),
             message: message("pending-1", "me", Body::Text("a & b\nnext".into()), true),
-            seen: Default::default(),
+            seen: std::collections::HashSet::default(),
         };
         let mut root = message("root", "other", Body::Text("post".into()), false);
         assert!(!arrived(std::slice::from_ref(&root), &local));
@@ -3514,7 +3514,7 @@ mod tests {
     #[test]
     fn real_size_beats_reported_size_and_keeps_aspect() {
         let reported = ImageRef {
-            url: String::new(),
+            url: String::default(),
             width: Some(717.),
             height: Some(146.),
         };

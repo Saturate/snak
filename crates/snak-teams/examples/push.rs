@@ -48,6 +48,9 @@ async fn main() {
             Event::SessionExpired => return println!("{elapsed:?}: session expired"),
             Event::ConversationsChanged => println!("{elapsed:?}: conversations changed"),
             Event::MessagesChanged(id) => println!("{elapsed:?}: messages changed: {}", id.0),
+            // Names and presence words identify people; the kind is enough.
+            Event::Typing { stopped, .. } => println!("{elapsed:?}: typing stopped={stopped}"),
+            Event::PresenceChanged { .. } => println!("{elapsed:?}: presence changed"),
         }
         total += 1;
     }

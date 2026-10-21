@@ -60,8 +60,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Check
-        run: cargo check --workspace --all-targets
+      - name: Build
+        run: cargo build --workspace --all-targets
 
   audit:
     runs-on: ubuntu-latest
@@ -76,9 +76,9 @@ jobs:
 
   # The release workflow only builds after a version is cut, so these jobs
   # are what keeps Windows and Linux compiling between releases.
-  # Windows stays at `cargo check`: it links against the Windows SDK that ships
-  # on the runner, so a link step adds codegen time without catching much.
-  check-windows:
+  # Both build and link rather than check: a missing system library or a
+  # link error only shows up at link time, and should fail here, not mid-release.
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -92,8 +92,6 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets
 
-  # Linux builds and links rather than checks: a missing or renamed system
-  # library only shows up at link time, and should fail here, not mid-release.
   build-linux:
     runs-on: ubuntu-latest
     steps:

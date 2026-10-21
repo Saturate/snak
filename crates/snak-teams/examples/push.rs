@@ -9,17 +9,23 @@
 //!
 //! cargo run -p snak-teams --example push
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::redact;
 use snak_chat::{ChatBackend, Connector, Event};
 use snak_teams::TeamsConnector;
+
+const SNAK_LOG: &str = "SNAK_LOG";
+const SNAK_STORE: &str = "SNAK_STORE";
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("SNAK_LOG")
+            tracing_subscriber::EnvFilter::try_from_env(SNAK_LOG)
                 .unwrap_or_else(|_| "snak_teams=debug,info".into()),
         )
         .with_target(true)
@@ -28,7 +34,7 @@ async fn main() {
     let connector = TeamsConnector::new();
     // Use the same place the app keeps the login: SNAK_STORE=file|keychain.
     // Without moving: a probe must never relocate the app's login.
-    if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
+    if std::env::var(SNAK_STORE).as_deref() == Ok("file") {
         snak_teams::store::use_storage_without_moving(snak_teams::store::Storage::File);
     }
     let backend: Arc<dyn ChatBackend> = match connector.restore().await {
@@ -55,15 +61,4 @@ async fn main() {
         total += 1;
     }
     println!("channel closed after {total} events")
-}
-
-fn redact(text: &str) -> String {
-    // Tokens and signatures arrive in URLs after `?`, `#` or `&`.
-    let mut out = text.to_string();
-    for sep in ['?', '#', '&'] {
-        if let Some(i) = out.find(sep) {
-            out.truncate(i);
-        }
-    }
-    out
 }

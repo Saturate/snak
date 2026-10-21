@@ -2,51 +2,42 @@
 // License, v. 2.0. A copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Posts a message to your own self-chat (the "Chat" with yourself) using
-//! the stored login, to to stir the push channel while watching frames.
+//! Posts a probe message to the conversation named by SNAK_SEND_TO using
+//! the stored login, to stir the push channel while watching frames.
 //! Prints only counts, never message text, names or tokens.
 //!
-//! cargo run -p snak-teams --example send
+//! SNAK_SEND_TO="48:notes" cargo run -p snak-teams --example send
+
+mod common;
 
 use std::sync::Arc;
 
+use common::redact;
 use snak_chat::{ChatBackend, Connector, ConversationId};
 use snak_teams::TeamsConnector;
 
+const SNAK_STORE: &str = "SNAK_STORE";
+const SNAK_SEND_TO: &str = "SNAK_SEND_TO";
+
 #[tokio::main]
 async fn main() {
-    let connector = TeamsConnector::new();
-    if std::env::var("SNAK_STORE").as_deref() == Ok("file") {
+    // No default target: the first chat in the list is usually a real
+    // person, and a probe must never message someone by accident.
+    let Some(id) = std::env::var(SNAK_SEND_TO).ok().filter(|id| !id.is_empty()) else {
+        return println!("set {SNAK_SEND_TO} to the conversation id to post the probe in");
+    };
+    let id = ConversationId(id);
+    if std::env::var(SNAK_STORE).as_deref() == Ok("file") {
         snak_teams::store::use_storage_without_moving(snak_teams::store::Storage::File);
     }
-    let backend: Arc<dyn ChatBackend> = match connector.restore().await {
+    let backend: Arc<dyn ChatBackend> = match TeamsConnector::new().restore().await {
         Ok(Some(backend)) => backend,
         Ok(None) => return println!("no stored login; sign in through the app first"),
         Err(e) => return println!("connect failed: {}", redact(&e.to_string())),
     };
 
-    let list = match backend.conversations().await {
-        Ok(list) => list,
-        Err(e) => return println!("conversations failed: {}", redact(&e.to_string())),
-    };
-    let Some(self_chat) = list.iter().find(|c| !c.is_channel()) else {
-        return println!("no chats");
-    };
-    let id = ConversationId(self_chat.id.0.clone());
-    let count = list.len();
-
     match backend.send(&id, None, "Snak push probe").await {
-        Ok(()) => println!("sent to self chat ({count} conversations)"),
+        Ok(()) => println!("sent"),
         Err(e) => println!("send failed: {}", redact(&e.to_string())),
     }
-}
-
-fn redact(text: &str) -> String {
-    let mut out = text.to_string();
-    for sep in ['?', '#', '&'] {
-        if let Some(i) = out.find(sep) {
-            out.truncate(i);
-        }
-    }
-    out
 }

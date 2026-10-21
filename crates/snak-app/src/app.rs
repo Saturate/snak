@@ -3819,7 +3819,7 @@ mod tests {
     #[test]
     fn viewer_fills_the_window_without_upscaling() {
         let image = ImageRef {
-            url: String::new(),
+            url: String::default(),
             width: None,
             height: None,
         };

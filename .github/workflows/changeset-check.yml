@@ -19,3 +19,7 @@ jobs:
         with:
           # Fork PRs get a read-only token, so commenting would fail the check.
           comment: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      # `check` only looks for a changeset; a malformed one still passes it and
+      # then breaks the release job on main. `status` parses every pending one.
+      - name: Changesets parse
+        run: changesetter status

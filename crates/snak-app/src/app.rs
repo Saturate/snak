@@ -1806,6 +1806,44 @@ fn render_images(
                 let playing = Settings::get(cx).autoplay_gifs != toggled;
                 let url = image.url.clone();
                 let toggles = gif_toggles.clone();
+                let open_image_viewer = open_image_viewer.clone();
+                let images: Vec<ImageRef> = row.images.to_vec();
+                let index = position;
+                // A click opens the viewer like any image; the badge keeps the
+                // in-place play and pause, so a looping GIF can still be stopped
+                // without leaving the chat.
+                let badge = div()
+                    .id(ElementId::Name(format!("gif-toggle-{}", image.url).into()))
+                    .absolute()
+                    .left_2()
+                    .bottom_2()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(hsla(0., 0., 0., 0.6))
+                    .text_color(white())
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(if playing {
+                            IconName::Pause
+                        } else {
+                            IconName::Play
+                        })
+                        .xsmall(),
+                    )
+                    .child("GIF")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        let mut toggles = toggles.borrow_mut();
+                        if !toggles.remove(&url) {
+                            toggles.insert(url.clone());
+                        }
+                        window.refresh();
+                    });
                 frame
                     .id(ElementId::Name(format!("gif-{}", image.url).into()))
                     .relative()
@@ -1821,31 +1859,9 @@ fn render_images(
                         .size_full()
                         .object_fit(ObjectFit::Cover),
                     )
-                    .when(!playing, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .left_2()
-                                .bottom_2()
-                                .px_1p5()
-                                .rounded_sm()
-                                .bg(hsla(0., 0., 0., 0.6))
-                                .text_color(white())
-                                .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .flex()
-                                .items_center()
-                                .gap_0p5()
-                                .child(Icon::new(IconName::Play).xsmall())
-                                .child("GIF"),
-                        )
-                    })
-                    .on_click(move |_, window, _| {
-                        let mut toggles = toggles.borrow_mut();
-                        if !toggles.remove(&url) {
-                            toggles.insert(url.clone());
-                        }
-                        window.refresh();
+                    .child(badge)
+                    .on_click(move |_, window, cx| {
+                        open_image_viewer(images.clone(), index, window, cx)
                     })
                     .into_any_element()
             }

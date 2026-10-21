@@ -7,6 +7,9 @@
 //!
 //! cargo run -p snak-teams --example probe
 
+mod common;
+
+use common::redact;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,15 +147,4 @@ async fn main() {
             },
         }
     }
-}
-
-// Error bodies can echo request details; keep the status and the first line only.
-fn redact(error: &str) -> String {
-    error
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(300)
-        .collect()
 }

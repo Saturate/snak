@@ -12,8 +12,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Snak targets macOS first; GPUI's Linux build needs a pile of X11/Wayland
-  # system packages that the app doesn't support yet.
+  # lint, test and msrv run on macOS, Snak's main platform. Windows and Linux
+  # get their own jobs below.
   lint:
     runs-on: macos-latest
     steps:
@@ -60,8 +60,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Check
-        run: cargo check --workspace --all-targets
+      - name: Build
+        run: cargo build --workspace --all-targets
 
   audit:
     runs-on: ubuntu-latest
@@ -73,3 +73,38 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+  # The release workflow only builds after a version is cut, so these jobs
+  # are what keeps Windows and Linux compiling between releases.
+  # Both build and link rather than check: a missing system library or a
+  # link error only shows up at link time, and should fail here, not mid-release.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Check
+        run: cargo check --workspace --all-targets
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.97"
+
+      - name: Install Linux system libraries
+        run: ./scripts/linux-deps.sh
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets

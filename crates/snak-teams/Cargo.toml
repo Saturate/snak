@@ -24,5 +24,7 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

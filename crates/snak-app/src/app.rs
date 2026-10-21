@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _,
     avatar::Avatar,
     button::{Button, ButtonVariants as _},
     command::CommandState,
@@ -125,6 +125,8 @@ type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
 /// Opens the thread panel for a channel post.
 type OnThread = Rc<dyn Fn(MessageId, &mut Window, &mut App)>;
 type OpenProfile = Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>;
+/// Opens the image viewer over a message's images, starting at `index`.
+type OpenImageViewer = Arc<dyn Fn(Vec<ImageRef>, usize, &mut Window, &mut App) + Send + Sync>;
 
 enum Screen {
     Starting,
@@ -193,6 +195,8 @@ pub struct Snak {
     thread_scroller: Entity<MessageScrollerState>,
     thread_composer: Entity<TextareaState>,
 
+    /// The image viewer, when one is open.
+    image_viewer: Option<ImageViewer>,
     /// The profile panel's person, when one is open.
     profile: Option<Profile>,
     /// Their DM's messages, listed under the profile.
@@ -310,6 +314,7 @@ impl Snak {
             sidebar_dirty: false,
             drafts: HashMap::new(),
             presences: HashMap::new(),
+            image_viewer: None,
             avatars: HashMap::new(),
             avatar_pending: HashSet::new(),
             typing: HashMap::new(),
@@ -474,6 +479,7 @@ impl Snak {
         self.selected = None;
         self.showing_unreads = true;
         self.thread_root = None;
+        self.image_viewer = None;
         self.profile = None;
         self.profile_rows = Rc::default();
         self.profile_task = None;
@@ -906,6 +912,7 @@ impl Snak {
             self.thread_root = None;
             self.older = None;
             self.older_task = None;
+            self.image_viewer = None;
             self.set_rows(Vec::new(), cx);
         }
         self.composer
@@ -1238,6 +1245,12 @@ impl Snak {
     // Removing the focused composer would leave key presses with no target
     // under this view, which silently disables every shortcut.
     fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape closes the topmost thing first, and the viewer sits over
+        // every panel.
+        if self.image_viewer.is_some() {
+            self.close_image_viewer(window, cx);
+            return;
+        }
         // Escape reaches here from the main composer too; with no thread
         // open there's nothing to close and focus must stay put.
         if self.thread_root.is_none() {
@@ -1360,6 +1373,48 @@ impl Snak {
             })
             .ok();
         }))
+    }
+
+    fn open_image_viewer(
+        &mut self,
+        images: Vec<ImageRef>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+        let count = images.len();
+        self.image_viewer = Some(ImageViewer {
+            images,
+            index: index.min(count - 1),
+        });
+        // A focused composer would keep the keys meant for the viewer.
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn step_image(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(viewer) = self.image_viewer.as_mut() else {
+            return;
+        };
+        let Some(next) = viewer.index.checked_add_signed(delta) else {
+            return;
+        };
+        if next < viewer.images.len() {
+            viewer.index = next;
+            cx.notify();
+        }
+    }
+
+    fn close_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.image_viewer.is_none() {
+            return;
+        }
+        self.image_viewer = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     fn close_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1746,6 +1801,12 @@ fn is_safe_link(url: &str) -> bool {
     matches!(scheme.as_str(), "https" | "http" | "mailto" | "msteams")
 }
 
+/// The image viewer: one message's images, the one clicked shown large.
+struct ImageViewer {
+    images: Vec<ImageRef>,
+    index: usize,
+}
+
 /// One person's live state, kept under their display name.
 #[derive(Clone)]
 struct PresenceInfo {
@@ -1831,20 +1892,34 @@ fn image_size(image: &ImageRef, actual: Option<(u32, u32)>) -> (f32, f32) {
     (w * scale, h * scale)
 }
 
-fn return_image(frame: Div, data: Arc<Image>) -> AnyElement {
-    frame
-        .child(
-            img(ImageSource::Image(data))
-                .size_full()
-                .object_fit(ObjectFit::Cover),
-        )
-        .into_any_element()
+/// Fits the image into the viewer's `max_w` by `max_h`, the window less its
+/// margins. Never scaled up: a small image blown up only shows its pixels.
+fn viewer_image_size(
+    image: &ImageRef,
+    actual: Option<(u32, u32)>,
+    max_w: f32,
+    max_h: f32,
+) -> (f32, f32) {
+    // A tiny window must not turn into a zero or negative size.
+    let (max_w, max_h) = (max_w.max(64.), max_h.max(64.));
+    let reported = match (image.width, image.height) {
+        (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0. && h > 0. => Some((w, h)),
+        _ => None,
+    };
+    let (w, h) = actual
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| (w as f32, h as f32))
+        .or(reported)
+        .unwrap_or((240., 160.));
+    let scale = (max_w / w).min(max_h / h).min(1.);
+    (w * scale, h * scale)
 }
 
 fn render_images(
     row: &Message,
     images: &ImageCache,
     gif_toggles: &GifToggles,
+    open_image_viewer: OpenImageViewer,
     cx: &App,
 ) -> Option<AnyElement> {
     if row.images.is_empty() {
@@ -1853,7 +1928,7 @@ fn render_images(
     let theme = cx.theme();
     let cache = images.borrow();
     let mut list = h_flex().flex_wrap().gap_2().pt_1();
-    for image in &row.images {
+    for (position, image) in row.images.iter().enumerate() {
         let state = cache.get(&image.url);
         let actual = match state {
             Some(ImageState::Ready(loaded)) => loaded.size,
@@ -1864,7 +1939,21 @@ fn render_images(
         let frame = div().w(px(w)).h(px(h)).rounded_md().overflow_hidden();
         list = list.child(match state {
             Some(ImageState::Ready(loaded)) if loaded.still.is_none() => {
-                return_image(frame, loaded.data.clone())
+                let open_image_viewer = open_image_viewer.clone();
+                let images: Vec<ImageRef> = row.images.to_vec();
+                let index = position;
+                frame
+                    .id(ElementId::Name(format!("image-{}", image.url).into()))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        open_image_viewer(images.clone(), index, window, cx)
+                    })
+                    .child(
+                        img(ImageSource::Image(loaded.data.clone()))
+                            .size_full()
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
             }
             Some(ImageState::Ready(loaded)) => {
                 let still = loaded.still.clone().unwrap_or_else(|| loaded.data.clone());
@@ -1872,6 +1961,44 @@ fn render_images(
                 let playing = Settings::get(cx).autoplay_gifs != toggled;
                 let url = image.url.clone();
                 let toggles = gif_toggles.clone();
+                let open_image_viewer = open_image_viewer.clone();
+                let images: Vec<ImageRef> = row.images.to_vec();
+                let index = position;
+                // A click opens the viewer like any image; the badge keeps the
+                // in-place play and pause, so a looping GIF can still be stopped
+                // without leaving the chat.
+                let badge = div()
+                    .id(ElementId::Name(format!("gif-toggle-{}", image.url).into()))
+                    .absolute()
+                    .left_2()
+                    .bottom_2()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(hsla(0., 0., 0., 0.6))
+                    .text_color(white())
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(if playing {
+                            IconName::Pause
+                        } else {
+                            IconName::Play
+                        })
+                        .xsmall(),
+                    )
+                    .child("GIF")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        let mut toggles = toggles.borrow_mut();
+                        if !toggles.remove(&url) {
+                            toggles.insert(url.clone());
+                        }
+                        window.refresh();
+                    });
                 frame
                     .id(ElementId::Name(format!("gif-{}", image.url).into()))
                     .relative()
@@ -1887,31 +2014,9 @@ fn render_images(
                         .size_full()
                         .object_fit(ObjectFit::Cover),
                     )
-                    .when(!playing, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .left_2()
-                                .bottom_2()
-                                .px_1p5()
-                                .rounded_sm()
-                                .bg(hsla(0., 0., 0., 0.6))
-                                .text_color(white())
-                                .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .flex()
-                                .items_center()
-                                .gap_0p5()
-                                .child(Icon::new(IconName::Play).xsmall())
-                                .child("GIF"),
-                        )
-                    })
-                    .on_click(move |_, window, _| {
-                        let mut toggles = toggles.borrow_mut();
-                        if !toggles.remove(&url) {
-                            toggles.insert(url.clone());
-                        }
-                        window.refresh();
+                    .child(badge)
+                    .on_click(move |_, window, cx| {
+                        open_image_viewer(images.clone(), index, window, cx)
                     })
                     .into_any_element()
             }
@@ -1967,6 +2072,7 @@ fn render_row(
     images: &ImageCache,
     gif_toggles: &GifToggles,
     avatars: &HashMap<String, Arc<Image>>,
+    open_image_viewer: OpenImageViewer,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -2063,7 +2169,13 @@ fn render_row(
         .gap_0p5()
         .when(row.pending, |el| el.opacity(0.55))
         .child(body)
-        .children(render_images(row, images, gif_toggles, cx))
+        .children(render_images(
+            row,
+            images,
+            gif_toggles,
+            open_image_viewer,
+            cx,
+        ))
         .child(footer);
 
     if continues {
@@ -2803,6 +2915,7 @@ impl Snak {
         gif_toggles: GifToggles,
         top_seen: Option<TopSeen>,
         avatars: HashMap<String, Arc<Image>>,
+        open_image_viewer: OpenImageViewer,
     ) -> impl IntoElement {
         MessageScroller::new(id, scroller.clone(), move |index, _, cx| {
             // A row 0 on screen is the top of what's loaded; only the main
@@ -2825,6 +2938,7 @@ impl Snak {
                 &images,
                 &gif_toggles,
                 &avatars,
+                open_image_viewer.clone(),
                 cx,
             )
         })
@@ -2963,6 +3077,17 @@ impl Snak {
                 weak.update(cx, |this, cx| this.open_profile(key, cx)).ok();
             }) as OpenProfile
         };
+        let open_image_viewer: OpenImageViewer = {
+            let weak = cx.entity().downgrade();
+            Arc::new(
+                move |images: Vec<ImageRef>, index: usize, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| {
+                        this.open_image_viewer(images, index, window, cx)
+                    })
+                    .ok();
+                },
+            ) as OpenImageViewer
+        };
 
         v_flex()
             .flex_1()
@@ -3011,6 +3136,7 @@ impl Snak {
                 self.gif_toggles.clone(),
                 Some(self.top_seen.clone()),
                 self.avatars.clone(),
+                open_image_viewer.clone(),
             )))
             .child(
                 div()
@@ -3039,7 +3165,12 @@ impl Snak {
             .into_any_element()
     }
 
-    fn render_thread(&self, open_profile: OpenProfile, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_thread(
+        &self,
+        open_profile: OpenProfile,
+        open_image_viewer: OpenImageViewer,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
             .flex_none()
@@ -3077,6 +3208,7 @@ impl Snak {
                 self.gif_toggles.clone(),
                 None,
                 self.avatars.clone(),
+                open_image_viewer.clone(),
             )))
             .child(
                 div()
@@ -3088,10 +3220,133 @@ impl Snak {
             )
     }
 
+    /// The image viewer, over the whole window; a click anywhere but the
+    /// image or its buttons closes it.
+    fn render_image_viewer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        const HEADER: f32 = 48.;
+        const MARGIN: f32 = 32.;
+        let theme = cx.theme();
+        let Some(viewer) = self.image_viewer.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(image_ref) = viewer.images.get(viewer.index) else {
+            return div().into_any_element();
+        };
+        let state = self.images.borrow().get(&image_ref.url).cloned();
+        let actual = match &state {
+            Some(ImageState::Ready(loaded)) => loaded.size,
+            _ => None,
+        };
+        let viewport = window.viewport_size();
+        let (w, h) = viewer_image_size(
+            image_ref,
+            actual,
+            f32::from(viewport.width) - 2. * MARGIN,
+            f32::from(viewport.height) - HEADER - 2. * MARGIN,
+        );
+        let count = viewer.images.len();
+        let index = viewer.index;
+        let frame = div()
+            .w(px(w))
+            .h(px(h))
+            .rounded_md()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let body = match state {
+            // The full GIF, not the still: opening it is asking to see it move.
+            Some(ImageState::Ready(loaded)) => frame
+                .child(
+                    img(ImageSource::Image(loaded.data))
+                        .id(ElementId::Name(format!("viewer-{}", image_ref.url).into()))
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+            Some(ImageState::Failed(_)) => frame
+                .bg(theme.muted)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .child("Image unavailable")
+                .into_any_element(),
+            _ => frame
+                .bg(theme.muted)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .child("Loading…")
+                .into_any_element(),
+        };
+        let buttons = h_flex()
+            .gap_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(count > 1, |el| {
+                el.child(
+                    Button::new("image-viewer-previous")
+                        .small()
+                        .ghost()
+                        .icon(IconName::ChevronLeft)
+                        .disabled(index == 0)
+                        .on_click(cx.listener(|this, _, _, cx| this.step_image(-1, cx))),
+                )
+                .child(
+                    Button::new("image-viewer-next")
+                        .small()
+                        .ghost()
+                        .icon(IconName::ChevronRight)
+                        .disabled(index + 1 >= count)
+                        .on_click(cx.listener(|this, _, _, cx| this.step_image(1, cx))),
+                )
+            })
+            .child(
+                Button::new("close-image-viewer")
+                    .small()
+                    .ghost()
+                    .label("Close")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.close_image_viewer(window, cx)),
+                    ),
+            );
+        v_flex()
+            .id("image-viewer")
+            .absolute()
+            .inset_0()
+            // Nothing under the viewer should react to the pointer or scroll.
+            .occlude()
+            .bg(theme.background.opacity(0.94))
+            .on_click(cx.listener(|this, _, window, cx| this.close_image_viewer(window, cx)))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(HEADER))
+                    .px_4()
+                    .child(div().font_weight(FontWeight::BOLD).child(if count > 1 {
+                        format!("Image {} of {count}", index + 1)
+                    } else {
+                        "Image".to_string()
+                    }))
+                    .child(div().flex_1())
+                    .child(buttons),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
     /// The profile side panel: a person's own details over their DM.
     fn render_profile(
         &self,
         open_profile: OpenProfile,
+        open_image_viewer: OpenImageViewer,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -3269,6 +3524,7 @@ impl Snak {
                 // The DM under a profile shows the newest page only.
                 None,
                 self.avatars.clone(),
+                open_image_viewer.clone(),
             )))
             .into_any_element()
     }
@@ -3472,6 +3728,16 @@ impl Render for Snak {
                 cx.listener(|this, _: &CycleTheme, window, cx| this.cycle_appearance(window, cx)),
             )
             .on_action(cx.listener(|this, _: &SignOut, _, cx| this.sign_out(cx)))
+            .when(self.image_viewer.is_some(), |el| {
+                el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    match event.keystroke.key.as_str() {
+                        "left" => this.step_image(-1, cx),
+                        "right" => this.step_image(1, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }))
+            })
             .bg(theme.background)
             .text_color(theme.foreground);
 
@@ -3480,6 +3746,17 @@ impl Render for Snak {
             Arc::new(move |key: String, _: &mut Window, cx: &mut App| {
                 weak.update(cx, |this, cx| this.open_profile(key, cx)).ok();
             }) as OpenProfile
+        };
+        let open_image_viewer: OpenImageViewer = {
+            let weak = cx.entity().downgrade();
+            Arc::new(
+                move |images: Vec<ImageRef>, index: usize, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| {
+                        this.open_image_viewer(images, index, window, cx)
+                    })
+                    .ok();
+                },
+            ) as OpenImageViewer
         };
 
         match self.screen {
@@ -3513,14 +3790,25 @@ impl Render for Snak {
                                 .child(self.render_sidebar(cx))
                                 .child(self.render_conversation(cx))
                                 .when(self.thread_root.is_some(), |el| {
-                                    el.child(self.render_thread(open_profile.clone(), cx))
+                                    el.child(self.render_thread(
+                                        open_profile.clone(),
+                                        open_image_viewer.clone(),
+                                        cx,
+                                    ))
                                 })
                                 .when(self.profile.is_some(), |el| {
-                                    el.child(self.render_profile(open_profile.clone(), cx))
+                                    el.child(self.render_profile(
+                                        open_profile.clone(),
+                                        open_image_viewer.clone(),
+                                        cx,
+                                    ))
                                 }),
                         )
                         .child(self.render_status_bar(cx)),
                 )
+                .when(self.image_viewer.is_some(), |el| {
+                    el.relative().child(self.render_image_viewer(window, cx))
+                })
                 .into_any_element(),
         }
     }
@@ -3532,7 +3820,7 @@ mod tests {
     use super::{
         Body, ConversationId, ImageFormat, ImageRef, Message, MessageId, Pending, arrived,
         first_frame_png, image_format, image_size, join_drafts, keep_older_rows,
-        older_after_prepend, older_after_refetch,
+        older_after_prepend, older_after_refetch, viewer_image_size,
     };
 
     fn at(mut m: Message, seconds_ago: i64) -> Message {
@@ -3813,5 +4101,26 @@ mod tests {
         assert!((h - 146. * 360. / 717.).abs() < 0.01);
         let (w, h) = image_size(&reported, Some((1000, 1000)));
         assert_eq!((w, h), (300., 300.));
+    }
+
+    #[test]
+    fn viewer_fills_the_window_without_upscaling() {
+        let image = ImageRef {
+            url: String::default(),
+            width: None,
+            height: None,
+        };
+        assert_eq!(
+            viewer_image_size(&image, Some((4000, 2000)), 1200., 700.),
+            (1200., 600.)
+        );
+        assert_eq!(
+            viewer_image_size(&image, Some((300, 200)), 1200., 700.),
+            (300., 200.)
+        );
+        assert_eq!(
+            viewer_image_size(&image, Some((100, 100)), -50., 0.),
+            (64., 64.)
+        );
     }
 }

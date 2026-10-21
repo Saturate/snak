@@ -8,12 +8,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, MessagesPage, Profile,
-    Reaction,
+    ConversationKind, Event, Group, ImageRef, LoginPrompt, Me, Message, MessageId, MessagesPage,
+    Profile, Reaction,
 };
 use tokio::sync::mpsc;
 
 const ME_ID: &str = "me";
+/// One picture in Maja's DM, so the image viewer can be tried offline.
+const BOARD_URL: &str = "demo:board";
+const BOARD: &[u8] = include_bytes!("../assets/board.jpg");
 const ACTIVITY_EVERY: Duration = Duration::from_secs(40);
 /// The demo pages like a real service, so scrolling up has history to load.
 const PAGE: usize = 20;
@@ -88,13 +91,7 @@ pub struct DemoBackend {
 
 impl DemoBackend {
     pub fn new() -> Self {
-        Self {
-            me: Me {
-                id: ME_ID.into(),
-                display_name: "Demo User".into(),
-            },
-            state: Mutex::new(seed(Utc::now())),
-        }
+        Self::default()
     }
 
     // A poisoned lock only means a panic elsewhere; the data is still usable.
@@ -139,7 +136,13 @@ impl DemoBackend {
 
 impl Default for DemoBackend {
     fn default() -> Self {
-        Self::new()
+        Self {
+            me: Me {
+                id: ME_ID.into(),
+                display_name: "Demo User".into(),
+            },
+            state: Mutex::new(seed(Utc::now())),
+        }
     }
 }
 
@@ -237,8 +240,12 @@ impl ChatBackend for DemoBackend {
         Box::pin(async { Ok(()) })
     }
 
-    fn image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Vec<u8>> {
-        Box::pin(async { Err(ChatError::Other("the demo has no images".into())) })
+    fn image<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Vec<u8>> {
+        let result = match url {
+            BOARD_URL => Ok(BOARD.to_vec()),
+            _ => Err(ChatError::Other(format!("the demo has no image {url}"))),
+        };
+        Box::pin(async move { result })
     }
 
     fn person(&self, key: &str) -> BoxFuture<'_, Option<Profile>> {
@@ -306,7 +313,7 @@ impl Connector for DemoConnector {
 
     fn restore(&self) -> BoxFuture<'_, Option<Arc<dyn ChatBackend>>> {
         Box::pin(async {
-            let backend: Arc<dyn ChatBackend> = Arc::new(DemoBackend::new());
+            let backend: Arc<dyn ChatBackend> = Arc::new(DemoBackend::default());
             Ok(Some(backend))
         })
     }
@@ -316,7 +323,7 @@ impl Connector for DemoConnector {
             Ok(LoginPrompt {
                 code: "DEMO".into(),
                 url: "https://example.com".into(),
-                handle: String::new(),
+                handle: String::default(),
                 expires_in_secs: 600,
                 poll_interval_secs: 1,
             })
@@ -325,7 +332,7 @@ impl Connector for DemoConnector {
 
     fn finish_login<'a>(&'a self, _: &'a LoginPrompt) -> BoxFuture<'a, Arc<dyn ChatBackend>> {
         Box::pin(async {
-            let backend: Arc<dyn ChatBackend> = Arc::new(DemoBackend::new());
+            let backend: Arc<dyn ChatBackend> = Arc::new(DemoBackend::default());
             Ok(backend)
         })
     }
@@ -353,7 +360,7 @@ fn escape(text: &str) -> String {
 }
 
 fn preview(author: &str, html: &str) -> String {
-    let mut text = String::new();
+    let mut text = String::default();
     let mut tag: Option<String> = None;
     for c in html.chars() {
         match (c, tag.as_mut()) {
@@ -586,6 +593,19 @@ fn seed(now: DateTime<Utc>) -> State {
                     "<p>I think we're low on testing hours.</p>",
                 ),
                 message(id(), ME_ID, ago(20), "<p>Agreed, let's add a week.</p>"),
+                Message {
+                    images: vec![ImageRef {
+                        url: BOARD_URL.into(),
+                        width: Some(960.),
+                        height: Some(673.),
+                    }],
+                    ..message(
+                        id(),
+                        "maja",
+                        ago(15),
+                        "<p>Here's where the board is at.</p>",
+                    )
+                },
             ],
         },
         Thread {

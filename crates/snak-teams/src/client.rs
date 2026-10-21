@@ -188,10 +188,20 @@ impl TeamsClient {
         url: &str,
         build: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder,
     ) -> Result<T> {
+        let res = self.call_response(scope, build).await?;
+        decode(res, url).await
+    }
+
+    /// [`Self::call`] without decoding, for callers that need the headers.
+    async fn call_response(
+        &self,
+        scope: &'static str,
+        build: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let token = self.token(scope).await?;
-        let res = build(&self.http, token.clone()).send().await?;
+        let res = send_throttled(|| build(&self.http, token.clone())).await?;
         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
-            return decode(res, url).await;
+            return Ok(res);
         }
         tracing::info!(scope, "access token rejected; getting a new one");
         {
@@ -203,8 +213,7 @@ impl TeamsClient {
             }
         }
         let token = self.token(scope).await?;
-        let res = build(&self.http, token).send().await?;
-        decode(res, url).await
+        send_throttled(|| build(&self.http, token.clone())).await
     }
 
     /// All joined teams with their channels, plus all chats.
@@ -313,19 +322,49 @@ impl TeamsClient {
         Ok(bytes)
     }
 
+    /// Creates the one-on-one chat with a user by object id and returns its
+    /// conversation id. A unique-roster thread is idempotent: when the chat
+    /// already exists, Teams hands back the existing one.
+    pub async fn create_direct_chat(&self, person_id: &str) -> Result<String> {
+        let url = format!("{TEAMS}/api/chatsvc/{}/v1/threads", self.region);
+        let body = json!({
+            "members": [
+                { "id": format!("8:orgid:{}", self.me.id), "role": "Admin" },
+                { "id": format!("8:orgid:{person_id}"), "role": "Admin" },
+            ],
+            "properties": {
+                "threadType": "chat",
+                "fixedRoster": "true",
+                "uniquerosterthread": "true",
+            },
+        });
+        let res = self
+            .call_response(scope::CHAT, |http, token| {
+                http.post(&url).bearer_auth(token).json(&body)
+            })
+            .await?;
+        let location = res
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .and_then(thread_id_from_location);
+        let _: Value = decode(res, &url).await?;
+        location.ok_or(CoreError::MissingField {
+            url,
+            field: "Location",
+        })
+    }
+
     /// A person's profile photo, as raw image bytes. People without a photo
     /// get a 404, which is a person, not a failure.
     pub async fn photo(&self, object_id: &str) -> Result<Option<Vec<u8>>> {
         const MAX_BYTES: usize = 1024 * 1024;
         let url = format!("https://graph.microsoft.com/v1.0/users/{object_id}/photo/$value");
-        let token = self.token(scope::GRAPH).await?;
-        let request = |url: &str, token: String| self.http.get(url).bearer_auth(token);
-        let mut res = request(&url, token).send().await?;
-        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            res = request(&url, self.token(scope::GRAPH).await?)
-                .send()
-                .await?;
-        }
+        let mut res = self
+            .call_response(scope::GRAPH, |http, token| {
+                http.get(&url).bearer_auth(token)
+            })
+            .await?;
         let status = res.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -426,6 +465,38 @@ impl TeamsClient {
         Ok(())
     }
 
+    /// Directory users whose name or mail matches `query`, keyed by object id.
+    pub async fn search_people(&self, query: &str, limit: usize) -> Result<Vec<(String, Person)>> {
+        // Graph's $search grammar quotes each clause; a stray quote or
+        // backslash would end the clause early and fail the whole request.
+        let query: String = query.matches(|c| !matches!(c, '"' | '\\')).collect();
+        let search = format!("\"displayName:{query}\" OR \"mail:{query}\"");
+        let top = limit.to_string();
+        let url = "https://graph.microsoft.com/v1.0/users";
+        let body: Value = self
+            .call(scope::GRAPH, url, |http, token| {
+                http.get(url)
+                    .query(&[
+                        ("$search", search.as_str()),
+                        (
+                            "$select",
+                            "id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone",
+                        ),
+                        ("$top", top.as_str()),
+                    ])
+                    // $search on directory objects is refused without it.
+                    .header("ConsistencyLevel", "eventual")
+                    .bearer_auth(token)
+            })
+            .await?;
+        Ok(body["value"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|user| Some((user["id"].as_str()?.to_string(), graph_person(user))))
+            .collect())
+    }
+
     /// Names and UPNs for user object IDs, via Graph batch requests.
     pub async fn people(&self, ids: &[String]) -> Result<HashMap<String, Person>> {
         let mut people = HashMap::new();
@@ -439,8 +510,8 @@ impl TeamsClient {
                         "id": i.to_string(),
                         "method": "GET",
                         "url": format!(
-                        "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone"
-                    ),
+                            "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone"
+                        ),
                     })
                 })
                 .collect();
@@ -453,31 +524,96 @@ impl TeamsClient {
             for response in body["responses"].as_array().into_iter().flatten() {
                 let user = &response["body"];
                 if let Some(id) = user["id"].as_str() {
-                    let mut phones = user["businessPhones"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|p| p.as_str().map(str::to_string))
-                        .collect::<Vec<_>>();
-                    if let Some(mobile) = user["mobilePhone"].as_str() {
-                        phones.push(mobile.to_string());
-                    }
-                    people.insert(
-                        id.to_string(),
-                        Person {
-                            display_name: user["displayName"].as_str().map(str::to_string),
-                            upn: user["userPrincipalName"].as_str().map(str::to_string),
-                            mail: user["mail"].as_str().map(str::to_string),
-                            job_title: user["jobTitle"].as_str().map(str::to_string),
-                            phones,
-                            photo: None,
-                        },
-                    );
+                    people.insert(id.to_string(), graph_person(user));
                 }
             }
         }
         Ok(people)
     }
+}
+
+fn graph_person(user: &Value) -> Person {
+    Person {
+        display_name: user["displayName"].as_str().map(str::to_string),
+        // Graph's `mail` is missing for guests; the UPN still works.
+        mail: user["mail"]
+            .as_str()
+            .or(user["userPrincipalName"].as_str())
+            .map(str::to_string),
+        job_title: user["jobTitle"].as_str().map(str::to_string),
+        upn: user["userPrincipalName"].as_str().map(str::to_string),
+        phones: user["businessPhones"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .chain(user["mobilePhone"].as_str())
+            .map(str::to_string)
+            .collect(),
+        photo: None,
+    }
+}
+
+/// The conversation id at the end of a thread's Location, decoded, since
+/// `urlencode` encodes it again on every later call.
+fn thread_id_from_location(location: &str) -> Option<String> {
+    let path = location.split(['?', '#']).next()?;
+    let raw = path.rsplit('/').next()?.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            let hex = std::str::from_utf8(raw.get(i + 1..i + 3)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    let id = String::from_utf8(bytes).ok()?;
+    id.starts_with("19:").then_some(id)
+}
+
+// Two retries ride out Graph's short per-app bursts; a longer block (minutes)
+// should surface as an error rather than freeze the UI or a tool call.
+const THROTTLE_RETRIES: u32 = 2;
+const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(30);
+
+/// Sends, waiting out a 429 the way Microsoft asks with Retry-After. Only
+/// 429: it means the request was not processed, whereas a 503 on a send
+/// may have posted the message, and retrying it would post it twice.
+async fn send_throttled(build: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    for attempt in 0..THROTTLE_RETRIES {
+        let res = build().send().await?;
+        if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(res);
+        }
+        let wait = retry_after(&res)
+            .unwrap_or_else(|| Duration::from_secs(2 << attempt))
+            .min(MAX_THROTTLE_WAIT);
+        let path = res.url().path().to_string();
+        tracing::info!(
+            url = path,
+            wait_secs = wait.as_secs(),
+            "throttled; retrying"
+        );
+        tokio::time::sleep(wait).await;
+    }
+    Ok(build().send().await?)
+}
+
+/// Retry-After in its seconds form; the HTTP-date form falls back to backoff.
+fn retry_after(res: &reqwest::Response) -> Option<Duration> {
+    let secs = res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs))
 }
 
 pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &str) -> Result<T> {
@@ -530,4 +666,66 @@ fn urlencode(id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn thread_location_gives_the_bare_conversation_id() {
+        let id = "19:a_b@unq.gbl.spaces";
+        let base = "https://teams.microsoft.com/api/chatsvc/emea/v1/threads/";
+        assert_eq!(
+            thread_id_from_location(&format!("{base}{id}")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            thread_id_from_location(&format!("{base}19%3Aa_b%40unq.gbl.spaces?x=1#f")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            thread_id_from_location(base),
+            None,
+            "a trailing slash names nothing"
+        );
+        assert_eq!(thread_id_from_location(&format!("{base}19%3")), None);
+    }
+
+    /// Answers each connection with the next canned response, then stops.
+    fn serve(responses: &'static [&'static str]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_429_is_retried_after_the_wait_it_asks_for() {
+        let url = serve(&[
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        ]);
+        let http = reqwest::Client::new();
+        let res = send_throttled(|| http.get(&url)).await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_503_is_not_retried() {
+        let url = serve(&[
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let http = reqwest::Client::new();
+        let res = send_throttled(|| http.get(&url)).await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

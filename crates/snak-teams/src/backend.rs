@@ -75,6 +75,81 @@ impl TeamsBackend {
         self.directory.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// One person's directory details by any profile key; the cheap half of
+    /// [`ChatBackend::person`], without the photo and DM lookups.
+    pub async fn lookup_person(
+        &self,
+        key: &str,
+    ) -> snak_chat::Result<Option<crate::models::Person>> {
+        let Some(object_id) = person_object_id(key, &self.directory().addresses) else {
+            return Ok(None);
+        };
+        let mut people = self.client.people(std::slice::from_ref(&object_id)).await?;
+        Ok(people.remove(&object_id))
+    }
+
+    /// Directory users matching a name or mail, as (object id, details).
+    pub async fn search_people(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> snak_chat::Result<Vec<(String, crate::models::Person)>> {
+        Ok(self.client.search_people(query, limit).await?)
+    }
+
+    /// The object id a profile key names: an id, an MRI, a mention link or a
+    /// DM id. None when it names nobody.
+    pub fn person_id(&self, key: &str) -> Option<String> {
+        person_object_id(key, &self.directory().addresses)
+    }
+
+    /// The one-on-one chat with a person, by object id, if one exists.
+    pub async fn direct_chat_with(
+        &self,
+        person_id: &str,
+    ) -> snak_chat::Result<Option<ConversationId>> {
+        let details = self.client.teams_and_chats().await?;
+        // Fetched fresh rather than read from the directory, so a chat started
+        // since the last `conversations` call is found too.
+        let Some(chat) = details.chats.iter().find(|chat| {
+            chat.is_one_on_one == Some(true)
+                && chat.is_conversation_deleted != Some(true)
+                && chat
+                    .members
+                    .iter()
+                    .filter_map(|m| m.object_id.as_deref())
+                    .any(|id| id != self.me.id && id.eq_ignore_ascii_case(person_id))
+        }) else {
+            return Ok(None);
+        };
+        let id = ConversationId(chat.id.clone());
+        self.directory().addresses.insert(
+            id.clone(),
+            Address::Chat {
+                id: chat.id.clone(),
+                others: vec![person_id.to_string()],
+            },
+        );
+        Ok(Some(id))
+    }
+
+    /// The one-on-one chat with a person, created when there is none yet.
+    pub async fn open_direct_chat(&self, person_id: &str) -> snak_chat::Result<ConversationId> {
+        if let Some(id) = self.direct_chat_with(person_id).await? {
+            return Ok(id);
+        }
+        let chat_id = self.client.create_direct_chat(person_id).await?;
+        let id = ConversationId(chat_id.clone());
+        self.directory().addresses.insert(
+            id.clone(),
+            Address::Chat {
+                id: chat_id,
+                others: vec![person_id.to_string()],
+            },
+        );
+        Ok(id)
+    }
+
     fn address(&self, id: &ConversationId) -> Result<Address, ChatError> {
         self.directory()
             .addresses
@@ -173,11 +248,12 @@ impl ChatBackend for TeamsBackend {
         Box::pin(async move {
             // Keys arrive as a DM id, an MRI, a mention link or an author id;
             // all narrow to one object id.
-            let object_id = person_object_id(&key, &self.directory().addresses);
-            let dm = self.directory().dms.get(&object_id).cloned();
-            let Some(people) = client.people(std::slice::from_ref(&object_id)).await.ok() else {
+            let Some(object_id) = person_object_id(&key, &self.directory().addresses) else {
                 return Ok(None);
             };
+            let dm = self.directory().dms.get(&object_id).cloned();
+            // A failed lookup is not "nobody"; pass it up so it gets logged.
+            let people = client.people(std::slice::from_ref(&object_id)).await?;
             let Some(person) = people.get(&object_id) else {
                 return Ok(None);
             };
@@ -312,14 +388,27 @@ impl ChatBackend for TeamsBackend {
 
 /// The one person a profile key names: a DM id, an MRI, a mention link or an
 /// author id all narrow to one object id.
-fn person_object_id(key: &str, addresses: &HashMap<ConversationId, Address>) -> String {
-    match addresses.get(&ConversationId(key.to_string())) {
+/// None when the key doesn't narrow to an object id (e.g. an unresolved
+/// mention), so nothing free-form ends up in a Graph path.
+fn person_object_id(key: &str, addresses: &HashMap<ConversationId, Address>) -> Option<String> {
+    let id = match addresses.get(&ConversationId(key.to_string())) {
         Some(Address::Chat { others, .. }) if !others.is_empty() => others[0].clone(),
         _ => {
+            let key = key.trim();
             let id = key.strip_prefix("snak-mention:").unwrap_or(key);
             id.rsplit(':').next().unwrap_or(id).to_string()
         }
-    }
+    };
+    is_object_id(&id).then_some(id)
+}
+
+/// Entra object ids are GUIDs: 8-4-4-4-12 hex digits.
+fn is_object_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> Vec<Event> {
@@ -1699,34 +1788,39 @@ mod tests {
 
     #[test]
     fn profile_keys_narrow_to_one_object_id() {
+        const B: &str = "0b0b0b0b-0000-4000-8000-00000000000b";
+        const C: &str = "0c0c0c0c-0000-4000-8000-00000000000c";
         let mut addresses = HashMap::new();
         addresses.insert(
             ConversationId("19:a@thread.tacv2".into()),
             Address::Chat {
                 id: "19:a@thread.tacv2".into(),
-                others: vec!["b".into()],
+                others: vec![B.into()],
             },
         );
+        let id = |key: &str| person_object_id(key, &addresses);
         assert_eq!(
-            person_object_id("19:a@thread.tacv2", &addresses),
-            "b",
+            id("19:a@thread.tacv2").as_deref(),
+            Some(B),
             "a DM names its other member"
         );
         assert_eq!(
-            person_object_id("8:orgid:c", &addresses),
-            "c",
+            id(&format!("8:orgid:{C}")).as_deref(),
+            Some(C),
             "an MRI names its object id"
         );
         assert_eq!(
-            person_object_id("snak-mention:8:orgid:c", &addresses),
-            "c",
+            id(&format!("snak-mention:8:orgid:{C}")).as_deref(),
+            Some(C),
             "a mention link names its MRI"
         );
+        assert_eq!(id(C).as_deref(), Some(C), "an author id names itself");
         assert_eq!(
-            person_object_id("d", &addresses),
-            "d",
-            "an author id names itself"
+            id("snak-mention:0"),
+            None,
+            "an unresolved mention names nobody"
         );
+        assert_eq!(id("../me"), None, "nothing free-form reaches a Graph path");
     }
 
     #[test]

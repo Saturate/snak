@@ -119,6 +119,13 @@ fn window_size() -> Size<Pixels> {
 
 fn main() {
     log::init();
+    if std::env::args().any(|arg| arg == "--stdio") {
+        if let Err(e) = snak_mcp::run() {
+            eprintln!("snak: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let connector = connector();
     gpui_kit::application()
         .with_assets(SnakAssets)

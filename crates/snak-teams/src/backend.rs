@@ -99,6 +99,62 @@ impl TeamsBackend {
         }))
     }
 
+    /// Directory users matching a name or mail, as (object id, details).
+    pub async fn search_people(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> snak_chat::Result<Vec<(String, crate::models::Person)>> {
+        Ok(self.client.search_people(query, limit).await?)
+    }
+
+    /// The one-on-one chat with a person, by object id, if one exists.
+    pub async fn direct_chat_with(
+        &self,
+        person_id: &str,
+    ) -> snak_chat::Result<Option<ConversationId>> {
+        let details = self.client.teams_and_chats().await?;
+        // Fetched fresh rather than read from the directory, so a chat started
+        // since the last `conversations` call is found too.
+        let Some(chat) = details.chats.iter().find(|chat| {
+            chat.is_one_on_one == Some(true)
+                && chat.is_conversation_deleted != Some(true)
+                && chat
+                    .members
+                    .iter()
+                    .filter_map(|m| m.object_id.as_deref())
+                    .any(|id| id != self.me.id && id.eq_ignore_ascii_case(person_id))
+        }) else {
+            return Ok(None);
+        };
+        let id = ConversationId(chat.id.clone());
+        self.directory().addresses.insert(
+            id.clone(),
+            Address::Chat {
+                id: chat.id.clone(),
+                others: vec![person_id.to_string()],
+            },
+        );
+        Ok(Some(id))
+    }
+
+    /// The one-on-one chat with a person, created when there is none yet.
+    pub async fn open_direct_chat(&self, person_id: &str) -> snak_chat::Result<ConversationId> {
+        if let Some(id) = self.direct_chat_with(person_id).await? {
+            return Ok(id);
+        }
+        let chat_id = self.client.create_direct_chat(person_id).await?;
+        let id = ConversationId(chat_id.clone());
+        self.directory().addresses.insert(
+            id.clone(),
+            Address::Chat {
+                id: chat_id,
+                others: vec![person_id.to_string()],
+            },
+        );
+        Ok(id)
+    }
+
     fn address(&self, id: &ConversationId) -> Result<Address, ChatError> {
         self.directory()
             .addresses

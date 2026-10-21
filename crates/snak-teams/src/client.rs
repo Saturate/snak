@@ -322,6 +322,40 @@ impl TeamsClient {
         Ok(bytes)
     }
 
+    /// Creates the one-on-one chat with a user by object id and returns its
+    /// conversation id. A unique-roster thread is idempotent: when the chat
+    /// already exists, Teams hands back the existing one.
+    pub async fn create_direct_chat(&self, person_id: &str) -> Result<String> {
+        let url = format!("{TEAMS}/api/chatsvc/{}/v1/threads", self.region);
+        let body = json!({
+            "members": [
+                { "id": format!("8:orgid:{}", self.me.id), "role": "Admin" },
+                { "id": format!("8:orgid:{person_id}"), "role": "Admin" },
+            ],
+            "properties": {
+                "threadType": "chat",
+                "fixedRoster": "true",
+                "uniquerosterthread": "true",
+            },
+        });
+        let res = self
+            .call_response(scope::CHAT, |http, token| {
+                http.post(&url).bearer_auth(token).json(&body)
+            })
+            .await?;
+        let location = res
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .and_then(|l| l.rsplit('/').next())
+            .map(str::to_string);
+        let _: Value = decode(res, &url).await?;
+        location.ok_or(CoreError::MissingField {
+            url,
+            field: "Location",
+        })
+    }
+
     /// Moves the read marker to now, which clears unread in every Teams client.
     pub async fn mark_read(&self, conversation_id: &str) -> Result<()> {
         let url = format!(
@@ -401,6 +435,35 @@ impl TeamsClient {
         Ok(())
     }
 
+    /// Directory users whose name or mail matches `query`, keyed by object id.
+    pub async fn search_people(&self, query: &str, limit: usize) -> Result<Vec<(String, Person)>> {
+        // Graph's $search grammar quotes each clause; a stray quote or
+        // backslash would end the clause early and fail the whole request.
+        let query: String = query.chars().filter(|c| !matches!(c, '"' | '\\')).collect();
+        let search = format!("\"displayName:{query}\" OR \"mail:{query}\"");
+        let top = limit.to_string();
+        let url = "https://graph.microsoft.com/v1.0/users";
+        let body: Value = self
+            .call(scope::GRAPH, url, |http, token| {
+                http.get(url)
+                    .query(&[
+                        ("$search", search.as_str()),
+                        ("$select", "id,displayName,userPrincipalName,mail,jobTitle"),
+                        ("$top", top.as_str()),
+                    ])
+                    // $search on directory objects is refused without it.
+                    .header("ConsistencyLevel", "eventual")
+                    .bearer_auth(token)
+            })
+            .await?;
+        Ok(body["value"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|user| Some((user["id"].as_str()?.to_string(), graph_person(user))))
+            .collect())
+    }
+
     /// Names and UPNs for user object IDs, via Graph batch requests.
     pub async fn people(&self, ids: &[String]) -> Result<HashMap<String, Person>> {
         let mut people = HashMap::new();
@@ -428,23 +491,24 @@ impl TeamsClient {
             for response in body["responses"].as_array().into_iter().flatten() {
                 let user = &response["body"];
                 if let Some(id) = user["id"].as_str() {
-                    people.insert(
-                        id.to_string(),
-                        Person {
-                            display_name: user["displayName"].as_str().map(str::to_string),
-                            // Graph's `mail` is missing for guests; the UPN still works.
-                            mail: user["mail"]
-                                .as_str()
-                                .or(user["userPrincipalName"].as_str())
-                                .map(str::to_string),
-                            job_title: user["jobTitle"].as_str().map(str::to_string),
-                            upn: user["userPrincipalName"].as_str().map(str::to_string),
-                        },
-                    );
+                    people.insert(id.to_string(), graph_person(user));
                 }
             }
         }
         Ok(people)
+    }
+}
+
+fn graph_person(user: &Value) -> Person {
+    Person {
+        display_name: user["displayName"].as_str().map(str::to_string),
+        // Graph's `mail` is missing for guests; the UPN still works.
+        mail: user["mail"]
+            .as_str()
+            .or(user["userPrincipalName"].as_str())
+            .map(str::to_string),
+        job_title: user["jobTitle"].as_str().map(str::to_string),
+        upn: user["userPrincipalName"].as_str().map(str::to_string),
     }
 }
 

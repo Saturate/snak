@@ -393,7 +393,12 @@ impl Link {
             .header("Content-Length", "0")
             .send()
             .await?;
-        decode(res, &url).await
+        let alloc: Allocation = decode(res, &url).await?;
+        // Issue #19: allocation carries the signature parameters whose names
+        // Squads guessed; log the keys that came back, never their values.
+        let keys: Vec<&str> = alloc.connectparams.keys().map(String::as_str).collect();
+        tracing::debug!(has_ccid = alloc.ccid.is_some(), ?keys, "trouter allocation");
+        Ok(alloc)
     }
 
     /// The socket.io handshake answers `<session id>:<heartbeat>:<close>:<transports>`.
@@ -425,10 +430,31 @@ impl Link {
                 body,
             });
         }
-        parse_session_id(&body).ok_or(CoreError::MissingField {
+        let session_id = parse_session_id(&body).ok_or(CoreError::MissingField {
             url: redacted,
             field: "socket.io session id",
-        })
+        })?;
+        // Issue #19: the handshake body says what socket.io dialect Trouter
+        // speaks; log the timeouts and transports to check the `1::`
+        // handshake guess. The session id goes into the socket URL, so it
+        // stays out.
+        let mut parts = body.trim().splitn(4, ':').skip(1);
+        let seconds = |part: Option<&str>| {
+            part.and_then(|p| p.parse::<u32>().ok())
+                .map_or_else(|| "unexpected".to_string(), |n| n.to_string())
+        };
+        let heartbeat = seconds(parts.next());
+        let close = seconds(parts.next());
+        let transports = parts
+            .next()
+            .filter(|t| {
+                t.len() <= 60
+                    && t.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b"-,".contains(&b))
+            })
+            .unwrap_or("unexpected");
+        tracing::debug!(%heartbeat, %close, transports, "trouter handshake");
+        Ok(session_id)
     }
 
     /// Tells the registrar which Trouter path should receive pushes for each app.
@@ -467,7 +493,12 @@ impl Link {
                 .json(&body)
                 .send()
                 .await?;
+            // Issue #19: the templateKey and platformUIVersion are guesses
+            // from Squads; log what each registration returns so a live run
+            // shows whether Teams accepts them or nudges a version.
+            let status = res.status();
             let _: Value = decode(res, REGISTRAR).await?;
+            tracing::debug!(app_id, template_key, %status, "registered with the registrar");
         }
         Ok(())
     }
@@ -533,6 +564,78 @@ fn trusted_url(raw: &str) -> Result<Url> {
         Ok(url)
     } else {
         Err(CoreError::Push(format!("refusing Trouter host {host}")))
+    }
+}
+
+/// Frames carry skype tokens and message text, so a raw frame only reaches
+/// logs as its socket.io kind, byte length and, for a JSON object payload,
+/// the field names from [`field_names`].
+fn frame_shape(text: &str) -> String {
+    let mut parts = text.splitn(4, ':');
+    let kind = parts.next().unwrap_or_default();
+    let kind = if kind.len() == 1 && kind.bytes().all(|b| b.is_ascii_digit()) {
+        kind
+    } else {
+        "?"
+    };
+    let data = parts.nth(2).unwrap_or_default();
+    let fields = match serde_json::from_str::<Value>(data) {
+        Ok(Value::Object(object)) => field_names(&object),
+        Ok(_) => "non object".into(),
+        Err(_) => "not json".into(),
+    };
+    format!("kind={kind} len={} fields={fields}", text.len())
+}
+
+/// Object keys are field names in most payloads, but some key maps by user
+/// id or carry free text; only short identifier-like keys are named, the
+/// rest are counted.
+fn field_names(object: &Map<String, Value>) -> String {
+    // Dashless GUIDs and numeric ids are hex or digit heavy; real field
+    // names in these payloads are short camelCase words.
+    let named = |k: &&String| {
+        let digits = k.bytes().filter(u8::is_ascii_digit).count();
+        k.len() <= 24
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !(k.len() >= 8 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+            && digits < 4
+    };
+    let mut names: Vec<&str> = object.keys().filter(named).map(String::as_str).collect();
+    let other = object.len() - names.len();
+    let other = (other > 0).then(|| format!("+{other} other"));
+    names.extend(other.as_deref());
+    names.join(",")
+}
+
+/// Server-chosen strings such as resourceType, messagetype and event names
+/// are logged only when they look like the type names we expect; anything
+/// else could be an id or text.
+fn label(value: Option<&str>) -> &str {
+    match value {
+        None => "none",
+        Some(v)
+            if v.len() <= 48
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphabetic() || b"/._".contains(&b)) =>
+        {
+            v
+        }
+        Some(_) => "other",
+    }
+}
+
+/// socket.io error frames carry `reason+advice` codes, but the data is
+/// whatever the server sent, and it ends up in the reconnect warning.
+fn error_summary(data: &str) -> String {
+    let code = data.len() <= 16
+        && !data.is_empty()
+        && data
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+_.-".contains(&b));
+    if code {
+        format!("code {data}")
+    } else {
+        format!("{} bytes", data.len())
     }
 }
 
@@ -631,15 +734,34 @@ fn handle_frame(text: &str) -> Handled {
     match parse_frame(text) {
         Frame::Heartbeat => handled.replies.push("2::".into()),
         Frame::Disconnect => handled.close = Some("server disconnected".into()),
-        Frame::Error(reason) => handled.close = Some(format!("server error: {reason}")),
-        Frame::Event { ack_id, .. } => {
+        Frame::Error(data) => {
+            let summary = error_summary(data);
+            tracing::debug!(%summary, "trouter error frame");
+            handled.close = Some(format!("server error ({summary})"));
+        }
+        Frame::Event { ack_id, data } => {
+            // Events Trouter itself sends (`trouter.connected` and friends);
+            // the name is all we log, acked or not.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let name = serde_json::from_str::<Value>(data)
+                    .ok()
+                    .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string));
+                tracing::debug!(event = label(name.as_deref()), "trouter event frame");
+            }
             // Unacked events are redelivered and hold back later ones (per ost).
             if let Some(id) = ack_id {
+                // socket.io ack ids are counters; anything else is not ours to log.
+                let numeric = id.len() <= 10 && id.bytes().all(|b| b.is_ascii_digit());
+                tracing::debug!(
+                    id = if numeric { id } else { "unexpected" },
+                    "acknowledging event"
+                );
                 handled.replies.push(format!("6:{id}::"));
             }
         }
         Frame::Message(data) => {
             let Ok(request) = serde_json::from_str::<Value>(data) else {
+                tracing::debug!(frame = %frame_shape(text), "unreadable push frame");
                 return handled;
             };
             // Each `3:::` frame is an HTTP request relayed from a backend;
@@ -648,13 +770,76 @@ fn handle_frame(text: &str) -> Handled {
                 let response = json!({ "id": id, "status": 200 });
                 handled.replies.push(format!("3:::{response}"));
             }
-            if let Some(event) = request.get("body").and_then(parse_notification) {
+            let body = request.get("body");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                log_push_shape(body.unwrap_or(&request));
+            }
+            if let Some(event) = body.and_then(parse_notification) {
                 handled.events.push(event);
             }
         }
-        Frame::Connect | Frame::Ack | Frame::Noop | Frame::Unknown => {}
+        // Ack frames can carry data; their raw shape is what the guess
+        // verification needs, never their payload.
+        Frame::Ack => {
+            tracing::debug!(frame = %frame_shape(text), "trouter ack frame");
+        }
+        Frame::Connect => tracing::debug!("trouter connect frame"),
+        Frame::Noop => tracing::debug!("trouter noop frame"),
+        Frame::Unknown => {
+            tracing::debug!(frame = %frame_shape(text), "unknown trouter frame");
+        }
     }
     handled
+}
+
+/// Debug-shapes for issue #19: verify the payload guesses against live
+/// traffic by running with `SNAK_LOG=debug` (or the push example) and
+/// reading what resourceTypes and body keys Teams actually sends. Values
+/// are never logged, only field names, so message text stays out of logs.
+fn log_push_shape(body: &Value) {
+    let Some(object) = body.as_object() else {
+        // Bodies arrive both as inline objects and as JSON strings, the
+        // same way `parse_notification` takes them.
+        if let Value::String(raw) = body
+            && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+            && parsed.is_object()
+        {
+            return log_push_shape(&parsed);
+        }
+        tracing::debug!(kind = "non object", "push body ignored");
+        return;
+    };
+    let keys = field_names(object);
+    match body.get("presence") {
+        Some(list) => {
+            let count = list.as_array().map_or(0, Vec::len);
+            tracing::debug!(%keys, count, "presence push");
+        }
+        None => {
+            let raw_type = body.get("resourceType").and_then(Value::as_str);
+            let resource_type = label(raw_type);
+            let Some(resource) = body.get("resource").and_then(Value::as_object) else {
+                // Without a resource the keys are anyone's guess (presence
+                // style maps key by user id), so only their count is safe.
+                let key_count = object.len();
+                tracing::debug!(key_count, resource_type, "push body without resource");
+                return;
+            };
+            let resource_keys = field_names(resource);
+            let message_type = label(resource.get("messagetype").and_then(Value::as_str));
+            // A resourceType outside the handled set says exactly what to add
+            // next; flag it so a shared debug log greps straight to it.
+            let known = matches!(
+                raw_type,
+                Some("NewMessage" | "MessageUpdate" | "ConversationUpdate" | "ThreadUpdate")
+            );
+            if !known {
+                tracing::debug!(%keys, resource_type, %resource_keys, message_type, "UNKNOWN push resource type");
+            } else {
+                tracing::debug!(%keys, resource_type, %resource_keys, message_type, "push notification");
+            }
+        }
+    }
 }
 
 /// Turns the relayed request body into an event. Squads sends it as a JSON
@@ -713,7 +898,10 @@ fn parse_notification(body: &Value) -> Option<PushEvent> {
                     stopped: kind == "Control/ClearTyping",
                 });
             }
-            if kind.starts_with("Control/") {
+            // Live traffic also sends `ThreadActivity/...` markers (read
+            // receipts, consumption horizons) with no message content; they
+            // carry no message.
+            if kind.starts_with("Control/") || kind.starts_with("ThreadActivity/") {
                 return None;
             }
             let changed = resource_type == Some("MessageUpdate")
@@ -943,6 +1131,13 @@ mod tests {
             parse_notification(&clear),
             Some(PushEvent::Typing { stopped: true, .. })
         ));
+
+        let horizon = message_body(
+            "NewMessage",
+            "ThreadActivity/MemberConsumptionHorizonUpdate",
+            json!({}),
+        );
+        assert!(parse_notification(&horizon).is_none());
     }
 
     #[test]
@@ -987,6 +1182,128 @@ mod tests {
         });
         assert!(parse_notification(&body).is_none());
         assert!(parse_notification(&json!({ "nothing": true })).is_none());
+    }
+
+    #[test]
+    fn push_shapes_log_without_panicking() {
+        // Odd bodies must reach the shape log without unwinding; a live day
+        // of traffic sends shapes we have no structs for.
+        for body in [
+            json!("a string"),
+            json!(42),
+            json!({}),
+            json!({ "presence": "not a list" }),
+            json!({ "resourceType": "NewMessage", "resource": "not an object" }),
+            json!({ "resourceType": 7, "resource": { "id": "x" } }),
+            message_body("NewMessage", "RichText/Html", json!({})),
+        ] {
+            log_push_shape(&body);
+        }
+    }
+
+    const TOKEN: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.secret";
+    const BODY: &str = "meet me at the usual place";
+
+    fn frames_with_secrets() -> Vec<String> {
+        let payload = json!({
+            "skypetoken": TOKEN,
+            "8:orgid:00000000-0000-0000-0000-000000000001": BODY,
+            "0123456789abcdef0123456789abcdef": BODY,
+            "content": BODY,
+        });
+        vec![
+            format!("6:::{payload}"),
+            format!("9:::{payload}"),
+            format!("3:::{{not json {TOKEN} {BODY}"),
+            format!("{TOKEN}:{BODY}"),
+            format!(
+                "3:::{}",
+                json!({ "id": 1, "body": { "resourceType": "Odd", "skypetoken": TOKEN, "text": BODY } })
+            ),
+            format!(
+                "3:::{}",
+                json!({ "id": 1, "body": { "x-token": TOKEN, "content": BODY } })
+            ),
+            format!(
+                "3:::{}",
+                json!({ "id": 1, "body": { "resourceType": TOKEN, "resource": { "messagetype": BODY } } })
+            ),
+            format!("7:::{TOKEN} {BODY}"),
+            format!("5:{TOKEN}+::{}", json!({ "name": BODY })),
+        ]
+    }
+
+    #[test]
+    fn frame_shape_names_fields_not_values() {
+        let shape = frame_shape(&frames_with_secrets()[0]);
+        assert!(shape.starts_with("kind=6 len="), "{shape}");
+        // Key order follows serde_json's `preserve_order` feature, which the
+        // workspace may or may not unify in.
+        for part in ["content", "skypetoken", "+2 other"] {
+            assert!(shape.contains(part), "{shape}");
+        }
+        assert_eq!(frame_shape("2::"), "kind=2 len=3 fields=not json");
+        assert_eq!(error_summary("0+1"), "code 0+1");
+        let leaky = format!("{TOKEN} {BODY}");
+        assert_eq!(error_summary(&leaky), format!("{} bytes", leaky.len()));
+        assert_eq!(label(Some("Control/Typing")), "Control/Typing");
+        assert_eq!(label(Some(TOKEN)), "other");
+        assert_eq!(label(None), "none");
+        assert!(frame_shape("€€€:x").starts_with("kind=? len=11"));
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_logs_carry_no_tokens_or_text() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        // With a single live dispatcher, tracing computes a callsite's
+        // interest from whichever thread registers it first, and parallel
+        // tests register these with no subscriber. A second dispatcher makes
+        // registration consult every live one, this capture included.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let mut closes = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            for frame in frames_with_secrets() {
+                closes.extend(handle_frame(&frame).close);
+            }
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("trouter ack frame"), "{log}");
+        assert!(log.contains("unknown trouter frame"), "{log}");
+        assert!(log.contains("unreadable push frame"), "{log}");
+        assert!(log.contains("push body without resource"), "{log}");
+        assert!(log.contains("trouter error frame"), "{log}");
+        assert!(log.contains("acknowledging event"), "{log}");
+        // The close reason reaches the reconnect warning, so it counts as log.
+        assert_eq!(closes.len(), 1);
+        let log = format!("{log}{}", closes.join("\n"));
+        for secret in [
+            TOKEN,
+            BODY,
+            "eyJ0eXAi",
+            "usual place",
+            "00000000-0000",
+            "0123456789abcdef",
+        ] {
+            assert!(!log.contains(secret), "{secret} leaked: {log}");
+        }
     }
 
     #[test]

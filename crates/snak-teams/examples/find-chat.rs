@@ -7,6 +7,9 @@
 //!
 //! SNAK_FIND="name" cargo run -p snak-teams --example find-chat
 
+mod common;
+
+use common::redact;
 use std::sync::Arc;
 
 const SNAK_STORE: &str = "SNAK_STORE";
@@ -51,15 +54,4 @@ async fn main() {
             );
         }
     }
-}
-
-// Error bodies can echo request details; keep the status and the first line only.
-fn redact(error: &str) -> String {
-    error
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(300)
-        .collect()
 }

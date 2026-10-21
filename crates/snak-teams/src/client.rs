@@ -256,10 +256,10 @@ impl TeamsClient {
     pub async fn chat_messages_before(&self, backward_link: &str) -> Result<MessagePage> {
         // The link comes out of a response body; the bearer token only goes
         // where chat_messages itself would send it.
-        if !is_chat_link(backward_link, &self.region) {
+        let Some(link) = chat_link(backward_link, &self.region) else {
             return Err(CoreError::UntrustedLink);
-        }
-        self.get_json(scope::CHAT, backward_link).await
+        };
+        self.get_json(scope::CHAT, link.as_str()).await
     }
 
     /// Recent channel posts, each with its replies, with where the next,
@@ -488,15 +488,17 @@ pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &st
     })
 }
 
-fn is_chat_link(url: &str, region: &str) -> bool {
+/// The link as it will be requested, if that's under this region's chatsvc
+/// conversations. The check runs on the parsed form because the parser
+/// drops tabs and newlines and resolves `..`, `%2e` and `\` before the
+/// request goes out, so the raw text can look inside and land outside.
+fn chat_link(link: &str, region: &str) -> Option<url::Url> {
+    if region.is_empty() || link.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let url = url::Url::parse(link).ok()?;
     let prefix = format!("{TEAMS}/api/chatsvc/{region}/v1/users/ME/conversations/");
-    // `..`, spelled any way the URL parser accepts, would walk out of the
-    // conversations path once the URL is parsed.
-    !region.is_empty()
-        && url.strip_prefix(&prefix).is_some_and(|rest| {
-            let rest = rest.to_ascii_lowercase();
-            !rest.contains("..") && !rest.contains("%2e") && !rest.contains('\\')
-        })
+    url.as_str().starts_with(&prefix).then_some(url)
 }
 
 // Conversation IDs look like `19:abc@thread.v2`; Teams expects them unescaped
@@ -525,7 +527,11 @@ fn urlencode(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_chat_link;
+    use super::chat_link;
+
+    fn is_chat_link(link: &str, region: &str) -> bool {
+        chat_link(link, region).is_some()
+    }
 
     #[test]
     fn only_chatsvc_links_in_our_region_get_the_token() {
@@ -533,13 +539,24 @@ mod tests {
         assert!(is_chat_link(ok, "emea"));
         assert!(!is_chat_link(ok, "amer"));
         assert!(!is_chat_link(ok, ""));
+        // Parsing only tidies it; it still lands in the same place.
+        assert!(is_chat_link(
+            "HTTPS://TEAMS.MICROSOFT.COM/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
+            "emea"
+        ));
         for bad in [
             "https://evil.example/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
             "https://teams.microsoft.com.evil.example/api/chatsvc/emea/v1/users/ME/conversations/c",
             "http://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
             "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/properties",
             "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/../../../x",
-            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c\\..\\x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c\\..\\..\\x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/.\t./.\t./x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/.\n./.\r./x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c /messages",
+            "https://teams.microsoft.com:444/api/chatsvc/emea/v1/users/ME/conversations/c",
+            "https://user@teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c",
+            "HTTPS://TEAMS.MICROSOFT.COM/api/chatsvc/emea/v1/users/ME/conversations/%2e%2e/%2e%2e/x",
             "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/%2E%2e/%2e./x",
             "",
         ] {

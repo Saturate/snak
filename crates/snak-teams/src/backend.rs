@@ -41,12 +41,17 @@ struct Directory {
     upns: HashMap<String, String>,
     /// Member MRI by object id, to subscribe presence for DM partners.
     mris: HashMap<String, String>,
+    /// MRIs subscribed on the current push session.
+    subscribed: std::collections::HashSet<String>,
 }
 
 pub struct TeamsBackend {
     client: Arc<TeamsClient>,
     me: Me,
     directory: Mutex<Directory>,
+    /// The live push session, so DM partners found after it connected can
+    /// still be subscribed to presence.
+    push_session: Mutex<Option<crate::trouter::PushSession>>,
 }
 
 impl TeamsBackend {
@@ -59,6 +64,7 @@ impl TeamsBackend {
             client: Arc::new(client),
             me,
             directory: Mutex::new(Directory::default()),
+            push_session: Mutex::new(None),
         }
     }
 
@@ -97,15 +103,60 @@ impl TeamsBackend {
         }
 
         let names = self.directory().names.clone();
-        let mut directory = self.directory();
-        let mut list = channel_conversations(&details.teams, &mut directory.addresses);
-        list.extend(chat_conversations(
-            &details.chats,
-            &self.me.id,
-            &names,
-            &mut directory,
-        ));
+        let list = {
+            let mut directory = self.directory();
+            let mut list = channel_conversations(&details.teams, &mut directory.addresses);
+            list.extend(chat_conversations(
+                &details.chats,
+                &self.me.id,
+                &names,
+                &mut directory,
+            ));
+            list
+        };
+        self.subscribe_new_presences().await;
         Ok(list)
+    }
+
+    /// Subscribes presence for DM partners the live push session doesn't
+    /// cover yet. Push often connects before the first conversation load
+    /// fills `mris`, and new DMs turn up later, so this runs after both.
+    async fn subscribe_new_presences(&self) {
+        let session = self
+            .push_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(session) = session else {
+            return;
+        };
+        let new: Vec<String> = {
+            let directory = self.directory();
+            directory
+                .mris
+                .values()
+                .filter(|mri| !directory.subscribed.contains(*mri))
+                .cloned()
+                .collect()
+        };
+        if new.is_empty() {
+            return;
+        }
+        match self.client.subscribe_presence(&session, &new).await {
+            // A reconnect during the request means it went to the old session.
+            Ok(())
+                if self
+                    .push_session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    == Some(&session) =>
+            {
+                self.directory().subscribed.extend(new)
+            }
+            Ok(()) => {}
+            Err(e) => tracing::warn!(error = %e, "presence subscription failed"),
+        }
     }
 }
 
@@ -206,16 +257,20 @@ impl ChatBackend for TeamsBackend {
                     event = push.recv() => event,
                     _ = tx.closed() => return,
                 };
-                let Some(event) = event else { return };
-                let names = self.directory().names.clone();
+                let Some(event) = event else {
+                    // Push is gone for good; later loads mustn't post to it.
+                    *self.push_session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    return;
+                };
                 if let PushEvent::Connected(session) = &event {
-                    // Reconnects resend this; resubscribing is idempotent.
-                    let mris: Vec<String> = self.directory().mris.values().cloned().collect();
-                    if let Err(e) = self.client.subscribe_presence(session, &mris).await {
-                        tracing::warn!(error = %e, "presence subscription failed");
-                    }
+                    // A reconnect is a new session that knows no subscriptions.
+                    *self.push_session.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(session.clone());
+                    self.directory().subscribed.clear();
+                    self.subscribe_new_presences().await;
                 }
-                for event in translate(event, &names) {
+                let names = self.directory().names.clone();
+                for event in translate(event, &names, &self.me.id) {
                     if tx.send(event).await.is_err() {
                         return;
                     }
@@ -226,7 +281,7 @@ impl ChatBackend for TeamsBackend {
     }
 }
 
-fn translate(event: PushEvent, names: &HashMap<String, String>) -> Vec<Event> {
+fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> Vec<Event> {
     // Channel replies arrive addressed as `<channel>;messageid=<root>`.
     let conversation = |id: &str| ConversationId(id.split(';').next().unwrap_or(id).to_string());
     // MRIs end in the object id: `8:orgid:<object id>`.
@@ -245,12 +300,18 @@ fn translate(event: PushEvent, names: &HashMap<String, String>) -> Vec<Event> {
             Event::ConversationsChanged,
         ],
         PushEvent::ConversationUpdated { .. } => vec![Event::ConversationsChanged],
+        // Our own typing on another device echoes back; it's not news.
+        PushEvent::Typing { user_mri, .. } if user_mri.rsplit(':').next() == Some(me_id) => {
+            Vec::new()
+        }
         PushEvent::Typing {
             conversation_id,
             user_mri,
+            stopped,
         } => vec![Event::Typing {
             conversation: conversation(&conversation_id),
             user: name(&user_mri).cloned().unwrap_or_default(),
+            stopped,
         }],
         PushEvent::Presence(presences) => presences
             .iter()
@@ -1529,14 +1590,26 @@ mod tests {
             PushEvent::Typing {
                 conversation_id: "19:a@thread.tacv2".into(),
                 user_mri: "8:orgid:a".into(),
+                stopped: false,
             },
             &names,
+            "me",
         );
         assert!(matches!(
             events.as_slice(),
-            [Event::Typing { conversation, user }]
+            [Event::Typing { conversation, user, stopped: false }]
                 if conversation.0 == "19:a@thread.tacv2" && user == "Maja"
         ));
+        let mine = translate(
+            PushEvent::Typing {
+                conversation_id: "19:a@thread.tacv2".into(),
+                user_mri: "8:orgid:me".into(),
+                stopped: false,
+            },
+            &names,
+            "me",
+        );
+        assert!(mine.is_empty());
         let events = translate(
             PushEvent::Presence(vec![crate::trouter::Presence {
                 mri: "8:orgid:a".into(),
@@ -1546,6 +1619,7 @@ mod tests {
                 out_of_office: false,
             }]),
             &names,
+            "me",
         );
         assert!(matches!(
             events.as_slice(),
@@ -1578,6 +1652,7 @@ mod tests {
                 conversation_id: "19:a@thread.tacv2".into(),
             },
             &HashMap::new(),
+            "me",
         );
         assert!(matches!(events.as_slice(), [Event::ConversationsChanged]));
         let message = message("9", "a", "2026-10-15T10:00:00Z", "Text", "x");
@@ -1587,6 +1662,7 @@ mod tests {
                 message,
             },
             &HashMap::new(),
+            "me",
         );
         assert!(matches!(&events[0], Event::MessagesChanged(id) if id.0 == "19:a@thread.tacv2"));
     }

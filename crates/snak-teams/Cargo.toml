@@ -25,5 +25,7 @@ url = "2"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

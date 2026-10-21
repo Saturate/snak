@@ -1,3 +1,8 @@
+// No `windows_subsystem = "windows"`: the same binary runs `snak --stdio` as an
+// MCP server, which has to behave as a console program on Windows (the shell
+// waits for it, stdio reaches the terminal). The cost is a console window next
+// to the app when it's launched from Explorer.
+
 mod app;
 mod code_blocks;
 mod log;
@@ -119,6 +124,13 @@ fn window_size() -> Size<Pixels> {
 
 fn main() {
     log::init();
+    if std::env::args().any(|arg| arg == "--stdio") {
+        if let Err(e) = snak_mcp::run() {
+            eprintln!("snak: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let connector = connector();
     gpui_kit::application()
         .with_assets(SnakAssets)

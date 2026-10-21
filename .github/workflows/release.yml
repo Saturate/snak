@@ -24,6 +24,7 @@ jobs:
     outputs:
       released: ${{ steps.changesetter.outputs.released }}
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
@@ -57,7 +58,10 @@ jobs:
           RELEASES_JSON: ${{ steps.changesetter.outputs.releases }}
         run: |
           VERSION=$(echo "$RELEASES_JSON" | jq -r '.[0].version')
+          # The tag changesetter pushed, so builds don't assume its format.
+          TAG=$(echo "$RELEASES_JSON" | jq -r '.[0].tag // ("v" + .[0].version)')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   build:
     needs: release
@@ -67,13 +71,24 @@ jobs:
       group: build-${{ needs.release.outputs.version }}-${{ matrix.target }}
       cancel-in-progress: false
     strategy:
+      # The release is already tagged; one platform failing shouldn't cancel
+      # the uploads for the others.
+      fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
             archive: Snak-macos-aarch64.zip
-          - target: x86_64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
             archive: Snak-macos-x86_64.zip
-    runs-on: macos-latest
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: Snak-windows-x64.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: Snak-linux-x64.zip
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
@@ -83,25 +98,44 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: v${{ needs.release.outputs.version }}
+          ref: ${{ needs.release.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.97"
           targets: ${{ matrix.target }}
 
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: ./scripts/linux-deps.sh
+
       - name: Build Snak.app
+        if: matrix.os == 'macos-latest'
         run: ./scripts/bundle.sh --release --target ${{ matrix.target }}
+
+      - name: Build binary
+        if: matrix.os != 'macos-latest'
+        run: cargo build --release -p snak-app --target ${{ matrix.target }}
 
       # Not notarized: without a Developer ID, macOS needs right-click → Open
       # the first time. An ad-hoc signature over the whole bundle still keeps
       # Apple Silicon from refusing to launch it.
-      - name: Package
+      - name: Package macOS bundle
+        if: matrix.os == 'macos-latest'
         run: |
           codesign --force --deep --sign - target/Snak.app
           ditto -c -k --keepParent target/Snak.app "${{ matrix.archive }}"
 
+      - name: Package Windows binary
+        if: matrix.os == 'windows-latest'
+        run: pwsh -c 'Compress-Archive -Path target/${{ matrix.target }}/release/snak.exe -DestinationPath ${{ matrix.archive }}'
+
+      - name: Package Linux binary
+        if: matrix.os == 'ubuntu-latest'
+        # -j stores just `snak`, like the Windows archive holds just snak.exe.
+        run: zip -j "${{ matrix.archive }}" "target/${{ matrix.target }}/release/snak"
+
       - name: Upload to release
-        run: gh release upload "v${{ needs.release.outputs.version }}" "${{ matrix.archive }}" --clobber
+        run: gh release upload "${{ needs.release.outputs.tag }}" "${{ matrix.archive }}" --clobber
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}

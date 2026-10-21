@@ -482,7 +482,9 @@ impl Mcp {
         check_setting(&params.0.name, &params.0.value)?;
         let mut settings = match read_settings(&self.settings_path).await {
             Ok(settings) => settings,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Default::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Value::Object(serde_json::Map::default())
+            }
             Err(e) => return Err(e.to_string()),
         };
         let Some(map) = settings.as_object_mut() else {
@@ -585,7 +587,11 @@ fn write_settings(
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
-    Some(std::env::home_dir()?.join("Library/Application Support/dev.snak.app/settings.json"))
+    // home_dir has not been deprecated since Rust 1.86; the MSRV is newer.
+    Some(
+        std::env::home_dir()? // skipcq: RS-W1128
+            .join("Library/Application Support/dev.snak.app/settings.json"),
+    )
 }
 
 /// Where the app keeps its refresh token, read from the same settings.json.

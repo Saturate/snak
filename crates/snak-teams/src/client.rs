@@ -469,7 +469,7 @@ impl TeamsClient {
     pub async fn search_people(&self, query: &str, limit: usize) -> Result<Vec<(String, Person)>> {
         // Graph's $search grammar quotes each clause; a stray quote or
         // backslash would end the clause early and fail the whole request.
-        let query: String = query.chars().filter(|c| !matches!(c, '"' | '\\')).collect();
+        let query: String = query.matches(|c| !matches!(c, '"' | '\\')).collect();
         let search = format!("\"displayName:{query}\" OR \"mail:{query}\"");
         let top = limit.to_string();
         let url = "https://graph.microsoft.com/v1.0/users";
@@ -590,7 +590,7 @@ async fn send_throttled(build: impl Fn() -> reqwest::RequestBuilder) -> Result<r
             return Ok(res);
         }
         let wait = retry_after(&res)
-            .unwrap_or(Duration::from_secs(2 << attempt))
+            .unwrap_or_else(|| Duration::from_secs(2 << attempt))
             .min(MAX_THROTTLE_WAIT);
         let path = res.url().path().to_string();
         tracing::info!(

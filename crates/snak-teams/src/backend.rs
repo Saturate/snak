@@ -394,10 +394,8 @@ fn person_object_id(key: &str, addresses: &HashMap<ConversationId, Address>) -> 
     let id = match addresses.get(&ConversationId(key.to_string())) {
         Some(Address::Chat { others, .. }) if !others.is_empty() => others[0].clone(),
         _ => {
-            let id = key
-                .trim()
-                .strip_prefix("snak-mention:")
-                .unwrap_or(key.trim());
+            let key = key.trim();
+            let id = key.strip_prefix("snak-mention:").unwrap_or(key);
             id.rsplit(':').next().unwrap_or(id).to_string()
         }
     };

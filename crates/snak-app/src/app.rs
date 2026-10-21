@@ -1130,11 +1130,17 @@ impl Snak {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let key = key.to_string();
         cx.spawn(async move |this, cx| {
             let result = io(async move {
-                let Some(person) = backend.person(&key).await.ok().flatten() else {
-                    return Ok(None);
+                // A fetch that failed is not the same as nobody: log it so a
+                // token refresh race or a blip isn't silent.
+                let person = match backend.person(&key).await {
+                    Ok(Some(person)) => person,
+                    Ok(None) => return Ok(None),
+                    Err(error) => {
+                        tracing::warn!(%error, "profile panel person fetch failed");
+                        return Err(error);
+                    }
                 };
                 let rows = match person.dm.as_ref() {
                     Some(dm) => backend.messages(dm).await.ok().unwrap_or_default(),
@@ -1543,6 +1549,10 @@ fn activity_text(activity: &str) -> String {
 /// When a person was last seen, from Teams' UTC timestamp.
 fn last_online_text(iso: &str) -> Option<String> {
     let seen = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
+    // Teams' never-online sentinel parses fine and reads as centuries ago.
+    if chrono::Datelike::year(&seen) < 2000 {
+        return None;
+    }
     let minutes = chrono::Utc::now()
         .signed_duration_since(seen)
         .num_minutes()

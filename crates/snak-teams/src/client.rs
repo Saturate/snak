@@ -296,7 +296,7 @@ impl TeamsClient {
             return Err(CoreError::Http {
                 status: status.as_u16(),
                 url: url.path().to_string(),
-                body: String::new(),
+                body: String::default(),
             });
         }
         // Capped while streaming, not after: the server picks the body size.
@@ -334,7 +334,7 @@ impl TeamsClient {
             return Err(CoreError::Http {
                 status: status.as_u16(),
                 url: url.clone(),
-                body: String::new(),
+                body: String::default(),
             });
         }
         let mut bytes = Vec::new();

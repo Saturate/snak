@@ -88,11 +88,13 @@ pub enum PushEvent {
         conversation_id: String,
         message: Message,
     },
-    /// Someone is typing. Teams sends no "stopped" event; expire it after a
-    /// few seconds (Squads uses 4).
+    /// Someone started or stopped typing. The stop (`Control/ClearTyping`)
+    /// doesn't always come, so expire a start after a few seconds too.
     Typing {
         conversation_id: String,
         user_mri: String,
+        /// `Control/ClearTyping`: they stopped without sending.
+        stopped: bool,
     },
     /// Conversation metadata (title, members, read state) changed.
     ConversationUpdated { conversation_id: String },
@@ -101,7 +103,7 @@ pub enum PushEvent {
 }
 
 /// Identifies one live Trouter session, for subscribing to extra feeds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushSession {
     endpoint_id: String,
     surl: String,
@@ -702,12 +704,13 @@ fn parse_notification(body: &Value) -> Option<PushEvent> {
             let conversation_id = conversation_id?;
             let message: Message = serde_json::from_value(resource.clone()).ok()?;
             let kind = message.message_type.as_deref().unwrap_or_default();
-            if kind == "Control/Typing" {
+            if kind == "Control/Typing" || kind == "Control/ClearTyping" {
                 let from = message.from.as_deref()?;
                 let user_mri = from.rsplit('/').next().unwrap_or(from).to_string();
                 return Some(PushEvent::Typing {
                     conversation_id,
                     user_mri,
+                    stopped: kind == "Control/ClearTyping",
                 });
             }
             if kind.starts_with("Control/") {
@@ -927,6 +930,7 @@ mod tests {
         let Some(PushEvent::Typing {
             conversation_id,
             user_mri,
+            stopped: false,
         }) = parse_notification(&body)
         else {
             panic!("expected Typing");
@@ -935,7 +939,10 @@ mod tests {
         assert_eq!(user_mri, "8:orgid:00000000-0000-0000-0000-000000000001");
 
         let clear = message_body("NewMessage", "Control/ClearTyping", json!({}));
-        assert!(parse_notification(&clear).is_none());
+        assert!(matches!(
+            parse_notification(&clear),
+            Some(PushEvent::Typing { stopped: true, .. })
+        ));
     }
 
     #[test]

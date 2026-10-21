@@ -404,7 +404,9 @@ impl TeamsClient {
                     json!({
                         "id": i.to_string(),
                         "method": "GET",
-                        "url": format!("/users/{id}?$select=id,displayName,userPrincipalName"),
+                        "url": format!(
+                            "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle"
+                        ),
                     })
                 })
                 .collect();
@@ -421,6 +423,12 @@ impl TeamsClient {
                         id.to_string(),
                         Person {
                             display_name: user["displayName"].as_str().map(str::to_string),
+                            // Graph's `mail` is missing for guests; the UPN still works.
+                            mail: user["mail"]
+                                .as_str()
+                                .or(user["userPrincipalName"].as_str())
+                                .map(str::to_string),
+                            job_title: user["jobTitle"].as_str().map(str::to_string),
                             upn: user["userPrincipalName"].as_str().map(str::to_string),
                         },
                     );

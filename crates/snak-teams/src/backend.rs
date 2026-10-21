@@ -65,6 +65,33 @@ impl TeamsBackend {
         self.directory.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// One person's details by whatever key a caller has: a DM id, a member
+    /// id or a mention link. Distinct from the profile-panel work's
+    /// `ChatBackend::person`, which this method will back one day.
+    pub async fn lookup_person(
+        &self,
+        key: &str,
+    ) -> snak_chat::Result<Option<crate::models::Person>> {
+        let object_id = match self
+            .directory()
+            .addresses
+            .get(&ConversationId(key.to_string()))
+        {
+            Some(Address::Chat { others, .. }) if !others.is_empty() => others[0].clone(),
+            _ => key.strip_prefix("snak-mention:").unwrap_or(key).to_string(),
+        };
+        let people = self.client.people(std::slice::from_ref(&object_id)).await?;
+        let Some(person) = people.get(&object_id) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::models::Person {
+            display_name: person.display_name.clone(),
+            mail: person.mail.clone(),
+            job_title: person.job_title.clone(),
+            upn: person.upn.clone(),
+        }))
+    }
+
     fn address(&self, id: &ConversationId) -> Result<Address, ChatError> {
         self.directory()
             .addresses

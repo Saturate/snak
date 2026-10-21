@@ -17,6 +17,8 @@ use std::sync::Arc;
 /// Reads and writes chat through the Teams backend the app itself uses.
 struct Mcp {
     backend: Arc<dyn snak_chat::ChatBackend>,
+    /// The concrete Teams backend, for person lookups the trait does not know.
+    teams: Arc<snak_teams::TeamsBackend>,
     settings_path: std::path::PathBuf,
 }
 
@@ -81,6 +83,20 @@ struct DoneOut {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct PersonParams {
+    /// A DM id, a member id or a mention link.
+    key: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct PersonOut {
+    display_name: Option<String>,
+    /// Graph's `mail`, or the UPN for guests.
+    mail: Option<String>,
+    job_title: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct SendParams {
     conversation_id: String,
     text: String,
@@ -102,9 +118,14 @@ struct SetSettingParams {
 
 #[tool_router]
 impl Mcp {
-    fn new(backend: Arc<dyn snak_chat::ChatBackend>, settings_path: std::path::PathBuf) -> Self {
+    fn new(
+        backend: Arc<dyn snak_chat::ChatBackend>,
+        teams: Arc<snak_teams::TeamsBackend>,
+        settings_path: std::path::PathBuf,
+    ) -> Self {
         Self {
             backend,
+            teams,
             settings_path,
         }
     }
@@ -149,6 +170,24 @@ impl Mcp {
         };
         let out = rows.iter().map(message_out).collect();
         Ok(Json(MessagesOut { messages: out }))
+    }
+
+    #[tool(
+        description = "One person's details: display name, mail and job title, by DM id, member id or mention link."
+    )]
+    async fn get_person(
+        &self,
+        params: Parameters<PersonParams>,
+    ) -> Result<Json<PersonOut>, String> {
+        match self.teams.lookup_person(&params.0.key).await {
+            Ok(Some(person)) => Ok(Json(PersonOut {
+                display_name: person.display_name,
+                mail: person.mail,
+                job_title: person.job_title,
+            })),
+            Ok(None) => Err("nobody by that key".into()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     #[tool(description = "Send a message to a conversation; reply_to threads a channel post.")]
@@ -309,9 +348,10 @@ async fn run_async() -> snak_chat::Result<()> {
     };
     let http = reqwest::Client::new();
     let client = snak_teams::TeamsClient::connect(http, login).await?;
-    let backend: Arc<dyn snak_chat::ChatBackend> = Arc::new(snak_teams::TeamsBackend::new(client));
+    let teams = Arc::new(snak_teams::TeamsBackend::new(client));
+    let backend: Arc<dyn snak_chat::ChatBackend> = teams.clone();
     let settings_path = settings_path().unwrap_or_else(|| "settings.json".into());
-    let server = Mcp::new(backend, settings_path);
+    let server = Mcp::new(backend, teams, settings_path);
     let running = server
         .serve(rmcp::transport::stdio())
         .await

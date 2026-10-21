@@ -2,3 +2,8 @@
 # version in Cargo.lock, so the release commit would leave the lock stale.
 [hooks]
 post_bump = ["cargo update --workspace"]
+
+# CI-only changesets (`changesetter add --no-bump`) stay out of the changelog
+# and the release notes; nothing in them is for users.
+[changelog]
+none_bump = "omit"

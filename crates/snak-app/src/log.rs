@@ -21,15 +21,17 @@ fn open() -> Option<File> {
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
         let _ = std::fs::rename(&path, path.with_extension("log.1"));
     }
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
     // Owner-only: error lines can include request paths and Microsoft's error text.
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
-        .ok()?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    // Windows has no owner-only file mode; its user dirs are ACL-protected instead.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(0o600);
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    let file = options.open(&path).ok()?;
     Some(file)
 }
 
@@ -47,7 +49,8 @@ pub fn init() {
             .with_ansi(false)
             .with_writer(Mutex::new(file).and(std::io::stderr))
             .init(),
-        None => builder.init(),
+        // Never the default stdout: under `--stdio` that is the MCP channel.
+        None => builder.with_writer(std::io::stderr).init(),
     }
 
     let default_hook = std::panic::take_hook();

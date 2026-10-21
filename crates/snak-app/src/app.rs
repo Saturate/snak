@@ -37,6 +37,9 @@ use crate::*;
 
 // Push is the main update path; polling is the fallback when push is down
 // or a backend doesn't have it.
+/// How long a typing indicator lives without a fresh "typing" from Teams,
+/// which repeats it every few seconds while someone types (Squads uses 4).
+const TYPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 272.;
 const THREAD_WIDTH: f32 = 400.;
@@ -179,7 +182,7 @@ pub struct Snak {
     avatars: HashMap<String, Arc<Image>>,
     /// Names whose photo is on its way.
     avatar_pending: HashSet<String>,
-    /// Who is typing where, and until when: no "stopped" arrives.
+    /// Who is typing where, and until when: a "stopped" doesn't always arrive.
     typing: HashMap<ConversationId, (String, std::time::Instant)>,
     thread_root: Option<MessageId>,
     thread_rows: Rc<Vec<Message>>,
@@ -457,6 +460,8 @@ impl Snak {
         self.profile_task = None;
         self.profile_refetch_task = None;
         self.profile_opened += 1;
+        self.presences.clear();
+        self.typing.clear();
         self.pending.clear();
         self.error = None;
         self.set_rows(Vec::new(), cx);
@@ -540,16 +545,37 @@ impl Snak {
                 }
             }
             Event::ConversationsChanged => self.load_conversations(cx),
-            Event::Typing { conversation, user } => {
-                // No "stopped" arrives, so it expires on its own.
+            Event::Typing {
+                conversation,
+                user,
+                stopped: true,
+            } => {
+                if self
+                    .typing
+                    .get(&conversation)
+                    .is_some_and(|(who, _)| *who == user)
+                {
+                    self.typing.remove(&conversation);
+                    cx.notify();
+                }
+            }
+            Event::Typing {
+                conversation,
+                user,
+                stopped: false,
+            } => {
                 self.typing.insert(
                     conversation,
-                    (
-                        user,
-                        std::time::Instant::now() + std::time::Duration::from_secs(4),
-                    ),
+                    (user, std::time::Instant::now() + TYPING_TIMEOUT),
                 );
                 cx.notify();
+                // Repaint once it has expired, or the label stays until
+                // something unrelated redraws.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TYPING_TIMEOUT).await;
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                })
+                .detach();
             }
             Event::PresenceChanged {
                 user,
@@ -2830,10 +2856,20 @@ impl Snak {
                     .child(Textarea::new(&self.composer)),
             )
             .when_some(self.typing_in(&selected.id), |el, user| {
-                el.child(div().flex_none().pt_0().px_1().text_sm().child(format!(
-                    // Unknown people still type; they just go no name.
-                    "{user} is typing…"
-                )))
+                // Unknown people still type; they just go without a name.
+                let who = if user.is_empty() {
+                    "Someone".to_string()
+                } else {
+                    user
+                };
+                el.child(
+                    div()
+                        .flex_none()
+                        .pt_0()
+                        .px_1()
+                        .text_sm()
+                        .child(format!("{who} is typing…")),
+                )
             })
             .into_any_element()
     }

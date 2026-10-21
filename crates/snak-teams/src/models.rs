@@ -162,6 +162,12 @@ fn lenient_i64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>
     })
 }
 
+/// It's unclear whether the last page omits a link or sends it blank, so
+/// both read as absent.
+fn non_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|s| !s.is_empty()))
+}
+
 impl Message {
     pub fn sent_at(&self) -> Option<DateTime<Utc>> {
         let raw = self
@@ -262,10 +268,17 @@ pub struct Reaction {
 pub struct MessagePage {
     #[serde(default)]
     pub messages: Vec<Message>,
-    /// Where the next, older page of this chat keeps going. The service
-    /// returns it while messages remain before this page.
-    #[serde(default)]
-    pub sync_state: Option<String>,
+    #[serde(default, rename = "_metadata")]
+    pub metadata: PageMetadata,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageMetadata {
+    /// The URL of the next, older page of this chat. Its `syncState` is a
+    /// sibling field that syncs forward, not back.
+    #[serde(default, deserialize_with = "non_empty")]
+    pub backward_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -337,11 +350,19 @@ mod tests {
 
     #[test]
     fn pages_parse_their_older_cursors() {
+        let link = "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c/messages?startTime=1&syncState=back&pageSize=200&view=msnp24Equivalent";
         let chat: MessagePage = serde_json::from_value(serde_json::json!({
-            "messages": [], "syncState": "next"
+            "_metadata": {
+                "backwardLink": link,
+                "syncState": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c/messages?syncState=forward",
+                "lastCompleteSegmentStartTime": 1,
+                "lastCompleteSegmentEndTime": 2
+            },
+            "messages": [],
+            "tenantId": "t"
         }))
         .expect("parses");
-        assert_eq!(chat.sync_state.as_deref(), Some("next"));
+        assert_eq!(chat.metadata.backward_link.as_deref(), Some(link));
 
         let channel: ChannelPage = serde_json::from_value(serde_json::json!({
             "replyChains": [], "continuationToken": "next", "hasMore": true
@@ -351,11 +372,16 @@ mod tests {
         assert!(channel.has_more);
 
         // A page with nothing older behind it carries no cursor.
-        let done: MessagePage = serde_json::from_value(serde_json::json!({
-            "messages": []
-        }))
-        .expect("parses");
-        assert_eq!(done.sync_state, None);
+        for metadata in [
+            serde_json::json!({ "syncState": "forward" }),
+            serde_json::json!({ "backwardLink": "", "syncState": "forward" }),
+        ] {
+            let done: MessagePage = serde_json::from_value(serde_json::json!({
+                "_metadata": metadata, "messages": []
+            }))
+            .expect("parses");
+            assert_eq!(done.metadata.backward_link, None);
+        }
         let done: ChannelPage = serde_json::from_value(serde_json::json!({
             "replyChains": [], "hasMore": false
         }))

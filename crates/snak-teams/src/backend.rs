@@ -186,7 +186,7 @@ impl ChatBackend for TeamsBackend {
                     let page = self.client.chat_messages(&id).await?;
                     MessagesPage {
                         messages: chat_messages(&page.messages, &self.me.id),
-                        older: page.sync_state,
+                        older: page.metadata.backward_link,
                     }
                 }
             })
@@ -213,11 +213,11 @@ impl ChatBackend for TeamsBackend {
                         older: page.continuation_token.filter(|_| page.has_more),
                     }
                 }
-                Address::Chat { id, .. } => {
-                    let page = self.client.chat_messages_before(&id, older).await?;
+                Address::Chat { .. } => {
+                    let page = self.client.chat_messages_before(older).await?;
                     MessagesPage {
                         messages: chat_messages(&page.messages, &self.me.id),
-                        older: page.sync_state,
+                        older: page.metadata.backward_link,
                     }
                 }
             })

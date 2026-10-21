@@ -29,6 +29,9 @@ pub enum CoreError {
     Push(String),
     #[error("keychain: {0}")]
     Keychain(String),
+    /// A link from a response body pointed somewhere the token doesn't go.
+    #[error("refusing to follow a link outside the chat service")]
+    UntrustedLink,
     #[error("background task stopped: {0}")]
     TaskFailed(String),
 }

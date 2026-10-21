@@ -251,20 +251,15 @@ impl TeamsClient {
         self.get_json(scope::CHAT, &url).await
     }
 
-    /// The page of a chat's messages older than `sync_state`, a cursor from
-    /// an earlier [`Self::chat_messages`] or `chat_messages_before` response.
-    pub async fn chat_messages_before(
-        &self,
-        conversation_id: &str,
-        sync_state: &str,
-    ) -> Result<MessagePage> {
-        let url = format!(
-            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/messages?pageSize=200&syncState={}",
-            self.region,
-            urlencode(conversation_id),
-            urlencode(sync_state)
-        );
-        self.get_json(scope::CHAT, &url).await
+    /// The page of a chat's messages behind `backward_link`, the link an
+    /// earlier [`Self::chat_messages`] or `chat_messages_before` page gave.
+    pub async fn chat_messages_before(&self, backward_link: &str) -> Result<MessagePage> {
+        // The link comes out of a response body; the bearer token only goes
+        // where chat_messages itself would send it.
+        if !is_chat_link(backward_link, &self.region) {
+            return Err(CoreError::UntrustedLink);
+        }
+        self.get_json(scope::CHAT, backward_link).await
     }
 
     /// Recent channel posts, each with its replies, with where the next,
@@ -493,6 +488,17 @@ pub(crate) async fn decode<T: DeserializeOwned>(res: reqwest::Response, url: &st
     })
 }
 
+fn is_chat_link(url: &str, region: &str) -> bool {
+    let prefix = format!("{TEAMS}/api/chatsvc/{region}/v1/users/ME/conversations/");
+    // `..`, spelled any way the URL parser accepts, would walk out of the
+    // conversations path once the URL is parsed.
+    !region.is_empty()
+        && url.strip_prefix(&prefix).is_some_and(|rest| {
+            let rest = rest.to_ascii_lowercase();
+            !rest.contains("..") && !rest.contains("%2e") && !rest.contains('\\')
+        })
+}
+
 // Conversation IDs look like `19:abc@thread.v2`; Teams expects them unescaped
 // apart from characters that would break the path.
 fn urlencode(id: &str) -> String {
@@ -515,4 +521,29 @@ fn urlencode(id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_chat_link;
+
+    #[test]
+    fn only_chatsvc_links_in_our_region_get_the_token() {
+        let ok = "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/19:a@thread.v2/messages?startTime=1&syncState=x&pageSize=200";
+        assert!(is_chat_link(ok, "emea"));
+        assert!(!is_chat_link(ok, "amer"));
+        assert!(!is_chat_link(ok, ""));
+        for bad in [
+            "https://evil.example/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
+            "https://teams.microsoft.com.evil.example/api/chatsvc/emea/v1/users/ME/conversations/c",
+            "http://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c/messages",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/properties",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/../../../x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/c\\..\\x",
+            "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/%2E%2e/%2e./x",
+            "",
+        ] {
+            assert!(!is_chat_link(bad, "emea"), "{bad}");
+        }
+    }
 }

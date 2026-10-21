@@ -489,7 +489,6 @@ fn token_file() -> Option<PathBuf> {
 }
 
 fn write_file(token: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let io_error = |e: std::io::Error| CoreError::Keychain(format!("token file: {e}"));
     let path = token_path()?;
     if let Some(dir) = path.parent() {
@@ -499,13 +498,15 @@ fn write_file(token: &str) -> Result<()> {
     // A leftover from a crash keeps its old mode through `create`, so start fresh.
     let _ = std::fs::remove_file(&tmp);
     // Created owner-only from the start, so the token is never briefly world-readable.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(io_error)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Windows has no owner-only file mode; its user profile dir is ACL-protected instead.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).map_err(io_error)?;
     file.write_all(token.as_bytes()).map_err(io_error)?;
     std::fs::rename(tmp, path).map_err(io_error)
 }
@@ -686,6 +687,9 @@ mod tests {
         assert_eq!(loaded().await.as_deref(), Some("NEW"));
     }
 
+    // A FIFO and O_NONBLOCK are Unix-only; the sign-out race is worth keeping
+    // covered wherever the platform allows the setup.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restore_read_during_sign_out_is_discarded() {
         let _serial = setup();

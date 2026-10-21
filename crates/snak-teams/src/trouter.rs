@@ -435,9 +435,14 @@ impl Link {
             field: "socket.io session id",
         })?;
         // Issue #19: the handshake body says what socket.io dialect Trouter
-        // speaks; log its parts (ids and timeouts only) to check the
-        // `1::` handshake guess.
-        tracing::debug!(handshake = %body.chars().take(60).collect::<String>(), "trouter handshake");
+        // speaks; log the timeouts and transports to check the `1::`
+        // handshake guess. The session id goes into the socket URL, so it
+        // stays out.
+        let mut parts = body.splitn(4, ':').skip(1);
+        let heartbeat = parts.next().unwrap_or_default();
+        let close = parts.next().unwrap_or_default();
+        let transports: String = parts.next().unwrap_or_default().chars().take(60).collect();
+        tracing::debug!(heartbeat, close, %transports, "trouter handshake");
         Ok(session_id)
     }
 
@@ -551,9 +556,37 @@ fn trusted_url(raw: &str) -> Result<Url> {
     }
 }
 
-/// Frame text can carry message bodies; only a shape prefix reaches logs.
-fn truncate(text: &str) -> String {
-    text.chars().take(120).collect()
+/// Frames carry skype tokens and message text, so a raw frame only reaches
+/// logs as its socket.io kind, byte length and, for a JSON object payload,
+/// the field names from [`field_names`].
+fn frame_shape(text: &str) -> String {
+    let mut parts = text.splitn(4, ':');
+    let kind = parts.next().unwrap_or_default();
+    let kind = if kind.len() == 1 && kind.bytes().all(|b| b.is_ascii_digit()) {
+        kind
+    } else {
+        "?"
+    };
+    let data = parts.nth(2).unwrap_or_default();
+    let fields = match serde_json::from_str::<Value>(data) {
+        Ok(Value::Object(object)) => field_names(&object),
+        Ok(_) => "non object".into(),
+        Err(_) => "not json".into(),
+    };
+    format!("kind={kind} len={} fields={fields}", text.len())
+}
+
+/// Object keys are field names in most payloads, but some key maps by user
+/// id or carry free text; only short identifier-like keys are named, the
+/// rest are counted.
+fn field_names(object: &Map<String, Value>) -> String {
+    let named =
+        |k: &&String| k.len() <= 32 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let mut names: Vec<&str> = object.keys().filter(named).map(String::as_str).collect();
+    let other = object.len() - names.len();
+    let other = (other > 0).then(|| format!("+{other} other"));
+    names.extend(other.as_deref());
+    names.join(",")
 }
 
 fn redact(url: &Url) -> String {
@@ -658,10 +691,13 @@ fn handle_frame(text: &str) -> Handled {
         Frame::Event { ack_id, data } => {
             // Events Trouter itself sends (`trouter.connected` and friends);
             // the name is all we log, acked or not.
-            let name = serde_json::from_str::<Value>(data)
-                .ok()
-                .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string));
-            tracing::debug!(event = name.as_deref(), "trouter event frame");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let name = serde_json::from_str::<Value>(data)
+                    .ok()
+                    .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string));
+                let name: Option<String> = name.map(|n| n.chars().take(60).collect());
+                tracing::debug!(event = name.as_deref(), "trouter event frame");
+            }
             // Unacked events are redelivered and hold back later ones (per ost).
             if let Some(id) = ack_id {
                 tracing::debug!(%id, "acknowledging event");
@@ -670,7 +706,7 @@ fn handle_frame(text: &str) -> Handled {
         }
         Frame::Message(data) => {
             let Ok(request) = serde_json::from_str::<Value>(data) else {
-                tracing::debug!(frame = %truncate(text), "unreadable push frame");
+                tracing::debug!(frame = %frame_shape(text), "unreadable push frame");
                 return handled;
             };
             // Each `3:::` frame is an HTTP request relayed from a backend;
@@ -679,24 +715,23 @@ fn handle_frame(text: &str) -> Handled {
                 let response = json!({ "id": id, "status": 200 });
                 handled.replies.push(format!("3:::{response}"));
             }
-            if let Some(body) = request.get("body") {
-                log_push_shape(body);
-                if let Some(event) = parse_notification(body) {
-                    handled.events.push(event);
-                }
-            } else {
-                log_push_shape(&request);
+            let body = request.get("body");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                log_push_shape(body.unwrap_or(&request));
+            }
+            if let Some(event) = body.and_then(parse_notification) {
+                handled.events.push(event);
             }
         }
         // Ack frames can carry data; their raw shape is what the guess
         // verification needs, never their payload.
         Frame::Ack => {
-            tracing::debug!(frame = %truncate(text), "trouter ack frame");
+            tracing::debug!(frame = %frame_shape(text), "trouter ack frame");
         }
         Frame::Connect => tracing::debug!("trouter connect frame"),
         Frame::Noop => tracing::debug!("trouter noop frame"),
         Frame::Unknown => {
-            tracing::debug!(frame = %truncate(text), "unknown trouter frame");
+            tracing::debug!(frame = %frame_shape(text), "unknown trouter frame");
         }
     }
     handled
@@ -719,11 +754,7 @@ fn log_push_shape(body: &Value) {
         tracing::debug!(kind = "non object", "push body ignored");
         return;
     };
-    let keys: String = object
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(",");
+    let keys = field_names(object);
     match body.get("presence") {
         Some(list) => {
             let count = list.as_array().map_or(0, Vec::len);
@@ -732,14 +763,13 @@ fn log_push_shape(body: &Value) {
         None => {
             let resource_type = body.get("resourceType").and_then(Value::as_str);
             let Some(resource) = body.get("resource").and_then(Value::as_object) else {
-                tracing::debug!(%keys, ?resource_type, "push body without resource");
+                // Without a resource the keys are anyone's guess (presence
+                // style maps key by user id), so only their count is safe.
+                let key_count = object.len();
+                tracing::debug!(key_count, ?resource_type, "push body without resource");
                 return;
             };
-            let resource_keys = resource
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(",");
+            let resource_keys = field_names(resource);
             let message_type = resource.get("messagetype").and_then(Value::as_str);
             // A resourceType outside the handled set says exactly what to add
             // next; flag it so a shared debug log greps straight to it.
@@ -1115,13 +1145,83 @@ mod tests {
         }
     }
 
+    const TOKEN: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.secret";
+    const BODY: &str = "meet me at the usual place";
+
+    fn frames_with_secrets() -> Vec<String> {
+        let payload = json!({
+            "skypetoken": TOKEN,
+            "8:orgid:00000000-0000-0000-0000-000000000001": BODY,
+            "content": BODY,
+        });
+        vec![
+            format!("6:::{payload}"),
+            format!("9:::{payload}"),
+            format!("3:::{{not json {TOKEN} {BODY}"),
+            format!("{TOKEN}:{BODY}"),
+            format!(
+                "3:::{}",
+                json!({ "id": 1, "body": { "resourceType": "Odd", "skypetoken": TOKEN, "text": BODY } })
+            ),
+            format!(
+                "3:::{}",
+                json!({ "id": 1, "body": { "x-token": TOKEN, "content": BODY } })
+            ),
+        ]
+    }
+
     #[test]
-    fn truncate_stays_on_char_boundaries() {
-        assert_eq!(truncate("plain"), "plain");
-        // The euro sign is four bytes; slicing by bytes would panic.
-        let long: String = "€".repeat(50);
-        assert_eq!(truncate(&long).chars().count(), 50);
-        assert_eq!(truncate(&"x".repeat(300)).chars().count(), 120);
+    fn frame_shape_names_fields_not_values() {
+        let shape = frame_shape(&frames_with_secrets()[0]);
+        assert!(shape.starts_with("kind=6 len="), "{shape}");
+        // Key order follows serde_json's `preserve_order` feature, which the
+        // workspace may or may not unify in.
+        for part in ["content", "skypetoken", "+1 other"] {
+            assert!(shape.contains(part), "{shape}");
+        }
+        assert_eq!(frame_shape("2::"), "kind=2 len=3 fields=not json");
+        assert!(frame_shape("€€€:x").starts_with("kind=? len=11"));
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_logs_carry_no_tokens_or_text() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        // With a single live dispatcher, tracing computes a callsite's
+        // interest from whichever thread registers it first, and parallel
+        // tests register these with no subscriber. A second dispatcher makes
+        // registration consult every live one, this capture included.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        tracing::subscriber::with_default(subscriber, || {
+            for frame in frames_with_secrets() {
+                handle_frame(&frame);
+            }
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("trouter ack frame"), "{log}");
+        assert!(log.contains("unknown trouter frame"), "{log}");
+        assert!(log.contains("unreadable push frame"), "{log}");
+        assert!(log.contains("push body without resource"), "{log}");
+        for secret in [TOKEN, BODY, "eyJ0eXAi", "usual place", "00000000-0000"] {
+            assert!(!log.contains(secret), "{secret} leaked: {log}");
+        }
     }
 
     #[test]

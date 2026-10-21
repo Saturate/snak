@@ -866,8 +866,15 @@ impl Snak {
                 }
                 match result {
                     Ok(page) => {
+                        let fetched_first = page.messages.first().map(|m| m.id.clone());
                         let rows = keep_older_rows(&this.rows, page.messages);
-                        this.older = page.older;
+                        this.older = older_after_refetch(
+                            &this.rows,
+                            &rows,
+                            fetched_first.as_ref(),
+                            this.older.take(),
+                            page.older,
+                        );
                         this.set_rows(rows, cx);
                         this.mark_read(&requested, cx);
                     }
@@ -899,6 +906,7 @@ impl Snak {
         };
         self.older_task = Some(cx.spawn(async move |this, cx| {
             let requested = id.clone();
+            let used = older.clone();
             let result = io(async move { backend.older_messages(&id, &older).await }).await;
             this.update(cx, |this, cx| {
                 this.older_task = None;
@@ -909,7 +917,7 @@ impl Snak {
                     return;
                 }
                 match result {
-                    Ok(page) => this.prepend_rows(page, cx),
+                    Ok(page) => this.prepend_rows(page, &used, cx),
                     // The latch drops too, so a failed page doesn't retry on
                     // every render; the reader scrolling again brings it back.
                     Err(e) => {
@@ -924,9 +932,8 @@ impl Snak {
 
     /// Older messages go in front of the timeline, keeping the reader's
     /// place in it.
-    fn prepend_rows(&mut self, page: MessagesPage, cx: &mut Context<Self>) {
+    fn prepend_rows(&mut self, page: MessagesPage, used: &str, cx: &mut Context<Self>) {
         let MessagesPage { messages, older } = page;
-        self.older = older;
         // A page can lap rows already here, e.g. when the service reshuffled
         // them; each id shows once.
         let ids: std::collections::HashSet<MessageId> =
@@ -936,10 +943,12 @@ impl Snak {
             .filter(|m| !ids.contains(&m.id))
             .collect();
         older_rows.sort_by_key(|m| m.sent_at);
+        self.older = older_after_prepend(used, older, !older_rows.is_empty());
         let Some(older_rows) = (!older_rows.is_empty()).then_some(older_rows) else {
-            // Nothing new came back; a service that keeps claiming more
-            // while serving nothing is done.
-            self.older = None;
+            // A page of only filtered events or repeats still moves the
+            // cursor back; row 0 is still on screen, so the next page goes
+            // now rather than waiting for another scroll.
+            self.check_older(cx);
             return;
         };
         let count = older_rows.len();
@@ -1408,6 +1417,31 @@ fn keep_older_rows(old: &[Message], new: Vec<Message>) -> Vec<Message> {
         merged.drain(..merged.len() - MAX_ROWS);
     }
     merged
+}
+
+/// Rows kept from before the refetched page came from earlier pages, so
+/// the cursor that reached them still points past the oldest one; the
+/// fresh page's cursor would only serve rows already shown.
+fn older_after_refetch(
+    old: &[Message],
+    merged: &[Message],
+    fetched_first: Option<&MessageId>,
+    current: Option<String>,
+    fetched: Option<String>,
+) -> Option<String> {
+    let oldest_kept = merged.first().filter(|m| Some(&m.id) != fetched_first);
+    match (oldest_kept, old.first()) {
+        // The row cap trims from the top; once the oldest is gone the
+        // current cursor would skip what was trimmed.
+        (Some(kept), Some(oldest)) if kept.id == oldest.id => current,
+        _ => fetched,
+    }
+}
+
+/// An empty page ends paging only when the service stops handing out a
+/// cursor or hands back the one just used, so it can't loop in place.
+fn older_after_prepend(used: &str, older: Option<String>, any_new: bool) -> Option<String> {
+    older.filter(|next| any_new || next != used)
 }
 
 fn put_draft<K: std::hash::Hash + Eq>(drafts: &mut HashMap<K, String>, key: K, text: String) {
@@ -3012,6 +3046,7 @@ mod tests {
     use super::{
         Body, ConversationId, ImageFormat, ImageRef, Message, MessageId, Pending, arrived,
         first_frame_png, image_format, image_size, join_drafts, keep_older_rows,
+        older_after_prepend, older_after_refetch,
     };
 
     fn at(mut m: Message, seconds_ago: i64) -> Message {
@@ -3079,6 +3114,76 @@ mod tests {
             .map(|m| m.id.0)
             .collect();
         assert_eq!(ids, ["1", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn a_refetch_keeps_the_cursor_of_pages_loaded_before_it() {
+        let rows = |ids: std::ops::RangeInclusive<i64>| -> Vec<Message> {
+            ids.map(|i| {
+                at(
+                    message(&i.to_string(), "a", Body::Text("x".into()), false),
+                    100 - i,
+                )
+            })
+            .collect()
+        };
+        let cursor = |s: &str| Some(s.to_string());
+        // 1..=3 came from an older page, 4..=6 from the newest one.
+        let old = rows(1..=6);
+        let new = rows(4..=7);
+        let first = new.first().map(|m| m.id.clone());
+        let merged = keep_older_rows(&old, new);
+        assert_eq!(
+            older_after_refetch(
+                &old,
+                &merged,
+                first.as_ref(),
+                cursor("page3"),
+                cursor("page2")
+            ),
+            cursor("page3")
+        );
+        // History already ran out above row 1; the fresh cursor would
+        // reopen it.
+        assert_eq!(
+            older_after_refetch(&old, &merged, first.as_ref(), None, cursor("page2")),
+            None
+        );
+
+        // Nothing loaded yet: the fetched page's cursor is the only one.
+        let new = rows(4..=7);
+        let first = new.first().map(|m| m.id.clone());
+        let merged = keep_older_rows(&[], new);
+        assert_eq!(
+            older_after_refetch(&[], &merged, first.as_ref(), None, cursor("page2")),
+            cursor("page2")
+        );
+
+        // The fetched page reaches back past everything shown.
+        let old = rows(4..=6);
+        let new = rows(2..=7);
+        let first = new.first().map(|m| m.id.clone());
+        let merged = keep_older_rows(&old, new);
+        assert_eq!(
+            older_after_refetch(
+                &old,
+                &merged,
+                first.as_ref(),
+                cursor("old"),
+                cursor("page2")
+            ),
+            cursor("page2")
+        );
+    }
+
+    #[test]
+    fn an_empty_older_page_keeps_paging_while_the_cursor_moves() {
+        let next = Some("b".to_string());
+        assert_eq!(older_after_prepend("a", next.clone(), false), next);
+        assert_eq!(older_after_prepend("a", next.clone(), true), next);
+        assert_eq!(older_after_prepend("b", next.clone(), false), None);
+        assert_eq!(older_after_prepend("b", next.clone(), true), next);
+        assert_eq!(older_after_prepend("a", None, false), None);
     }
 
     #[test]

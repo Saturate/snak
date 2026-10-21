@@ -349,6 +349,8 @@ async fn run_async() -> snak_chat::Result<()> {
     let http = reqwest::Client::new();
     let client = snak_teams::TeamsClient::connect(http, login).await?;
     let teams = Arc::new(snak_teams::TeamsBackend::new(client));
+    // Directory addresses only fill in as conversations() walks the chats.
+    let _ = snak_chat::ChatBackend::conversations(teams.as_ref()).await;
     let backend: Arc<dyn snak_chat::ChatBackend> = teams.clone();
     let settings_path = settings_path().unwrap_or_else(|| "settings.json".into());
     let server = Mcp::new(backend, teams, settings_path);

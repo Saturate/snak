@@ -77,7 +77,14 @@ impl TeamsBackend {
             .addresses
             .get(&ConversationId(key.to_string()))
         {
-            Some(Address::Chat { others, .. }) if !others.is_empty() => others[0].clone(),
+            Some(Address::Chat { others, .. }) if !others.is_empty() => {
+                // In a DM the interesting person is the other one, not me.
+                others
+                    .iter()
+                    .find(|o| **o != self.me.id)
+                    .unwrap_or(&others[0])
+                    .clone()
+            }
             _ => key.strip_prefix("snak-mention:").unwrap_or(key).to_string(),
         };
         let people = self.client.people(std::slice::from_ref(&object_id)).await?;

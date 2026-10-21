@@ -867,7 +867,10 @@ impl Snak {
                 match result {
                     Ok(page) => {
                         let fetched_first = page.messages.first().map(|m| m.id.clone());
-                        let rows = keep_older_rows(&this.rows, page.messages);
+                        // Trimming moves row 0, which resets the scroller to
+                        // the bottom; only a reader already there won't feel it.
+                        let cap = (!this.scroller.read(cx).is_scrolled_up()).then_some(MAX_ROWS);
+                        let rows = keep_older_rows(&this.rows, page.messages, cap);
                         this.older = older_after_refetch(
                             &this.rows,
                             &rows,
@@ -914,6 +917,12 @@ impl Snak {
                 // cursor belonged to that conversation.
                 if this.selected.as_ref() != Some(&requested) {
                     this.older = None;
+                    return;
+                }
+                // A refetch meanwhile trimmed the rows this page would sit
+                // in front of and swapped the cursor; prepending would
+                // leave a gap.
+                if this.older.as_deref() != Some(used.as_str()) {
                     return;
                 }
                 match result {
@@ -1394,11 +1403,14 @@ fn arrival(
         .map(|m| m.id.clone())
 }
 
+/// Bounds memory over a long session; older pages the reader scrolled to
+/// can go past it until they're back at the bottom.
+const MAX_ROWS: usize = 2000;
+
 /// A refetch returns the newest page only. When a new message pushes the
 /// oldest off, keep the rows already shown so the list grows at the end
 /// instead of shifting, which would jump the reader to the bottom.
-fn keep_older_rows(old: &[Message], new: Vec<Message>) -> Vec<Message> {
-    const MAX_ROWS: usize = 2000;
+fn keep_older_rows(old: &[Message], new: Vec<Message>, cap: Option<usize>) -> Vec<Message> {
     let Some(first) = new.first() else {
         return new;
     };
@@ -1412,10 +1424,13 @@ fn keep_older_rows(old: &[Message], new: Vec<Message>) -> Vec<Message> {
         })
         .cloned()
         .collect();
-    merged.extend(new);
-    if merged.len() > MAX_ROWS {
-        merged.drain(..merged.len() - MAX_ROWS);
+    // Past the cap only the fresh page stays, so the rows line up with its
+    // cursor; trimming part of the history would leave no cursor for the
+    // rows just above what's kept.
+    if cap.is_some_and(|cap| merged.len() + new.len() > cap) {
+        return new;
     }
+    merged.extend(new);
     merged
 }
 
@@ -1431,8 +1446,6 @@ fn older_after_refetch(
 ) -> Option<String> {
     let oldest_kept = merged.first().filter(|m| Some(&m.id) != fetched_first);
     match (oldest_kept, old.first()) {
-        // The row cap trims from the top; once the oldest is gone the
-        // current cursor would skip what was trimmed.
         (Some(kept), Some(oldest)) if kept.id == oldest.id => current,
         _ => fetched,
     }
@@ -3109,7 +3122,7 @@ mod tests {
                 )
             })
             .collect();
-        let ids: Vec<String> = keep_older_rows(&old, new)
+        let ids: Vec<String> = keep_older_rows(&old, new, Some(super::MAX_ROWS))
             .into_iter()
             .map(|m| m.id.0)
             .collect();
@@ -3132,7 +3145,7 @@ mod tests {
         let old = rows(1..=6);
         let new = rows(4..=7);
         let first = new.first().map(|m| m.id.clone());
-        let merged = keep_older_rows(&old, new);
+        let merged = keep_older_rows(&old, new, Some(super::MAX_ROWS));
         assert_eq!(
             older_after_refetch(
                 &old,
@@ -3153,7 +3166,7 @@ mod tests {
         // Nothing loaded yet: the fetched page's cursor is the only one.
         let new = rows(4..=7);
         let first = new.first().map(|m| m.id.clone());
-        let merged = keep_older_rows(&[], new);
+        let merged = keep_older_rows(&[], new, Some(super::MAX_ROWS));
         assert_eq!(
             older_after_refetch(&[], &merged, first.as_ref(), None, cursor("page2")),
             cursor("page2")
@@ -3163,13 +3176,61 @@ mod tests {
         let old = rows(4..=6);
         let new = rows(2..=7);
         let first = new.first().map(|m| m.id.clone());
-        let merged = keep_older_rows(&old, new);
+        let merged = keep_older_rows(&old, new, Some(super::MAX_ROWS));
         assert_eq!(
             older_after_refetch(
                 &old,
                 &merged,
                 first.as_ref(),
                 cursor("old"),
+                cursor("page2")
+            ),
+            cursor("page2")
+        );
+    }
+
+    #[test]
+    fn the_row_cap_waits_for_the_reader_and_keeps_the_fresh_cursor() {
+        let rows = |ids: std::ops::RangeInclusive<i64>| -> Vec<Message> {
+            ids.map(|i| {
+                at(
+                    message(&i.to_string(), "a", Body::Text("x".into()), false),
+                    100 - i,
+                )
+            })
+            .collect()
+        };
+        let cursor = |s: &str| Some(s.to_string());
+        let old = rows(1..=6);
+        let new = rows(4..=7);
+        let first = new.first().map(|m| m.id.clone());
+
+        // Scrolled up into history: nothing is trimmed, so the cursor
+        // that reached row 1 still holds.
+        let merged = keep_older_rows(&old, new.clone(), None);
+        assert_eq!(merged.len(), 7);
+        assert_eq!(
+            older_after_refetch(
+                &old,
+                &merged,
+                first.as_ref(),
+                cursor("deep"),
+                cursor("page2")
+            ),
+            cursor("deep")
+        );
+
+        // At the bottom and over the cap: only the fresh page stays, with
+        // its own cursor, and no rows are left between it and the next page.
+        let merged = keep_older_rows(&old, new, Some(5));
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.0.as_str()).collect();
+        assert_eq!(ids, ["4", "5", "6", "7"]);
+        assert_eq!(
+            older_after_refetch(
+                &old,
+                &merged,
+                first.as_ref(),
+                cursor("deep"),
                 cursor("page2")
             ),
             cursor("page2")

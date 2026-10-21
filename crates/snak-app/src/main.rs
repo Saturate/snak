@@ -77,7 +77,7 @@ fn connector() -> Arc<dyn Connector> {
 }
 
 // Lucide icons Snak uses beyond GPUI Kit's default set.
-gpui_kit::assets::icon_assets!(ExtraIcons, [Users]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [Users, Phone]);
 
 /// GPUI Kit's default icons, then [`ExtraIcons`].
 struct SnakAssets;
@@ -102,7 +102,8 @@ impl AssetSource for SnakAssets {
 /// The first window's size; `SNAK_WINDOW_SIZE=1440x900` overrides it, which
 /// `scripts/screenshot.sh` uses for a consistent capture.
 fn window_size() -> Size<Pixels> {
-    std::env::var("SNAK_WINDOW_SIZE")
+    const SNAK_WINDOW_SIZE: &str = "SNAK_WINDOW_SIZE";
+    std::env::var(SNAK_WINDOW_SIZE)
         .ok()
         .and_then(|v| {
             let (w, h) = v.split_once('x')?;
@@ -113,7 +114,7 @@ fn window_size() -> Size<Pixels> {
             };
             Some(size(px(side(w)?), px(side(h)?)))
         })
-        .unwrap_or(size(px(1280.), px(820.)))
+        .unwrap_or_else(|| size(px(1280.), px(820.)))
 }
 
 fn main() {

@@ -185,7 +185,7 @@ impl ChatBackend for TeamsBackend {
             Ok(Some(Profile {
                 display_name: person.display_name.clone().unwrap_or_default(),
                 // Graph's `mail` is missing for guests; the UPN still works.
-                mail: person.mail.clone().or(person.upn.clone()),
+                mail: person.mail.clone().or_else(|| person.upn.clone()),
                 job_title: person.job_title.clone(),
                 phones: person.phones.clone(),
                 photo,

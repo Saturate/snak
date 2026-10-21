@@ -1934,32 +1934,30 @@ fn render_row(
         .pb_0p5()
         .hover(|s| s.bg(theme.muted))
         .when(row.mentions_me, |el| mentioned(el, cx))
-        .child(
-            avatars
-                .get(&row.author)
-                .map(|avatar| {
-                    Avatar::new()
-                        .src(avatar.clone())
-                        .name(row.author.clone())
-                        .small()
-                        .into_any_element()
-                })
-                .unwrap_or_else(|| {
-                    div()
-                        .flex_none()
-                        .size(px(32.))
-                        .rounded_md()
-                        .bg(avatar_color(&row.author))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(white())
-                        .child(initials(&row.author))
-                        .into_any_element()
-                }),
-        )
+        .child(avatars.get(&row.author).map_or_else(
+            || {
+                div()
+                    .flex_none()
+                    .size(px(32.))
+                    .rounded_md()
+                    .bg(avatar_color(&row.author))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(white())
+                    .child(initials(&row.author))
+                    .into_any_element()
+            },
+            |avatar| {
+                Avatar::new()
+                    .src(avatar.clone())
+                    .name(row.author.clone())
+                    .small()
+                    .into_any_element()
+            },
+        ))
         .child(
             v_flex()
                 .flex_1()

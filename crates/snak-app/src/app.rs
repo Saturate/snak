@@ -460,6 +460,7 @@ impl Snak {
         self.selected = None;
         self.showing_unreads = true;
         self.thread_root = None;
+        self.image_viewer = None;
         self.profile = None;
         self.profile_rows = Rc::default();
         self.profile_task = None;
@@ -890,6 +891,7 @@ impl Snak {
                 .update(cx, |state, cx| state.set_value(draft, window, cx));
             self.selected = Some(id);
             self.thread_root = None;
+            self.image_viewer = None;
             self.set_rows(Vec::new(), cx);
         }
         self.composer
@@ -1121,6 +1123,12 @@ impl Snak {
     // Removing the focused composer would leave key presses with no target
     // under this view, which silently disables every shortcut.
     fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape closes the topmost thing first, and the viewer sits over
+        // every panel.
+        if self.image_viewer.is_some() {
+            self.close_image_viewer(window, cx);
+            return;
+        }
         // Escape reaches here from the main composer too; with no thread
         // open there's nothing to close and focus must stay put.
         if self.thread_root.is_none() {
@@ -1241,7 +1249,13 @@ impl Snak {
         }))
     }
 
-    fn open_image_viewer(&mut self, images: Vec<ImageRef>, index: usize) {
+    fn open_image_viewer(
+        &mut self,
+        images: Vec<ImageRef>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if images.is_empty() {
             return;
         }
@@ -1250,6 +1264,9 @@ impl Snak {
             images,
             index: index.min(count - 1),
         });
+        // A focused composer would keep the keys meant for the viewer.
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     fn close_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2874,9 +2891,11 @@ impl Snak {
         let open_image_viewer: OpenImageViewer = {
             let weak = cx.entity().downgrade();
             Arc::new(
-                move |images: Vec<ImageRef>, index: usize, _: &mut Window, cx: &mut App| {
-                    weak.update(cx, |this, _cx| this.open_image_viewer(images, index))
-                        .ok();
+                move |images: Vec<ImageRef>, index: usize, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| {
+                        this.open_image_viewer(images, index, window, cx)
+                    })
+                    .ok();
                 },
             ) as OpenImageViewer
         };
@@ -3459,9 +3478,11 @@ impl Render for Snak {
         let open_image_viewer: OpenImageViewer = {
             let weak = cx.entity().downgrade();
             Arc::new(
-                move |images: Vec<ImageRef>, index: usize, _: &mut Window, cx: &mut App| {
-                    weak.update(cx, |this, _cx| this.open_image_viewer(images, index))
-                        .ok();
+                move |images: Vec<ImageRef>, index: usize, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| {
+                        this.open_image_viewer(images, index, window, cx)
+                    })
+                    .ok();
                 },
             ) as OpenImageViewer
         };

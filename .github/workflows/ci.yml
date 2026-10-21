@@ -12,8 +12,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Snak targets macOS first; GPUI's Linux build needs a pile of X11/Wayland
-  # system packages that the app doesn't support yet.
+  # lint, test and msrv run on macOS, Snak's main platform. Windows and Linux
+  # get their own jobs below.
   lint:
     runs-on: macos-latest
     steps:
@@ -74,8 +74,10 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-  # The release workflow only builds after a version is cut, so these checks
+  # The release workflow only builds after a version is cut, so these jobs
   # are what keeps Windows and Linux compiling between releases.
+  # Windows stays at `cargo check`: it links against the Windows SDK that ships
+  # on the runner, so a link step adds codegen time without catching much.
   check-windows:
     runs-on: windows-latest
     steps:
@@ -90,7 +92,9 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets
 
-  check-linux:
+  # Linux builds and links rather than checks: a missing or renamed system
+  # library only shows up at link time, and should fail here, not mid-release.
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -100,13 +104,9 @@ jobs:
           toolchain: "1.97"
 
       - name: Install Linux system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
-            libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
-            libssl-dev libzstd-dev libasound2-dev libvulkan1
+        run: ./scripts/linux-deps.sh
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Check
-        run: cargo check --workspace --all-targets
+      - name: Build
+        run: cargo build --workspace --all-targets

@@ -67,6 +67,9 @@ jobs:
       group: build-${{ needs.release.outputs.version }}-${{ matrix.target }}
       cancel-in-progress: false
     strategy:
+      # The release is already tagged; one platform failing shouldn't cancel
+      # the uploads for the others.
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -98,15 +101,9 @@ jobs:
           toolchain: "1.97"
           targets: ${{ matrix.target }}
 
-      # GPUI's Linux build links against Wayland/X11/fontconfig and the rest
-      # of gpui-kit's system libraries (script/install-linux.sh upstream).
       - name: Install Linux system libraries
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
-            libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
-            libssl-dev libzstd-dev libasound2-dev libvulkan1
+        run: ./scripts/linux-deps.sh
 
       - name: Build Snak.app
         if: matrix.os == 'macos-latest'
@@ -131,7 +128,8 @@ jobs:
 
       - name: Package Linux binary
         if: matrix.os == 'ubuntu-latest'
-        run: zip "${{ matrix.archive }}" "target/${{ matrix.target }}/release/snak"
+        # -j stores just `snak`, like the Windows archive holds just snak.exe.
+        run: zip -j "${{ matrix.archive }}" "target/${{ matrix.target }}/release/snak"
 
       - name: Upload to release
         run: gh release upload "v${{ needs.release.outputs.version }}" "${{ matrix.archive }}" --clobber

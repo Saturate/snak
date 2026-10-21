@@ -347,8 +347,7 @@ impl TeamsClient {
             .headers()
             .get(reqwest::header::LOCATION)
             .and_then(|l| l.to_str().ok())
-            .and_then(|l| l.rsplit('/').next())
-            .map(str::to_string);
+            .and_then(thread_id_from_location);
         let _: Value = decode(res, &url).await?;
         location.ok_or(CoreError::MissingField {
             url,
@@ -555,6 +554,27 @@ fn graph_person(user: &Value) -> Person {
     }
 }
 
+/// The conversation id at the end of a thread's Location, decoded, since
+/// `urlencode` encodes it again on every later call.
+fn thread_id_from_location(location: &str) -> Option<String> {
+    let path = location.split(['?', '#']).next()?;
+    let raw = path.rsplit('/').next()?.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            let hex = std::str::from_utf8(raw.get(i + 1..i + 3)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    let id = String::from_utf8(bytes).ok()?;
+    id.starts_with("19:").then_some(id)
+}
+
 // Two retries ride out Graph's short per-app bursts; a longer block (minutes)
 // should surface as an error rather than freeze the UI or a tool call.
 const THROTTLE_RETRIES: u32 = 2;
@@ -652,6 +672,26 @@ fn urlencode(id: &str) -> String {
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn thread_location_gives_the_bare_conversation_id() {
+        let id = "19:a_b@unq.gbl.spaces";
+        let base = "https://teams.microsoft.com/api/chatsvc/emea/v1/threads/";
+        assert_eq!(
+            thread_id_from_location(&format!("{base}{id}")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            thread_id_from_location(&format!("{base}19%3Aa_b%40unq.gbl.spaces?x=1#f")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            thread_id_from_location(base),
+            None,
+            "a trailing slash names nothing"
+        );
+        assert_eq!(thread_id_from_location(&format!("{base}19%3")), None);
+    }
 
     /// Answers each connection with the next canned response, then stops.
     fn serve(responses: &'static [&'static str]) -> String {

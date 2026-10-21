@@ -282,6 +282,14 @@ impl Mcp {
         }
     }
 
+    /// The object id behind whatever key a tool got, the same way get_person
+    /// reads it, so an MRI or a mention link works everywhere.
+    fn person_id(&self, key: &str) -> Result<String, String> {
+        self.teams
+            .person_id(key)
+            .ok_or_else(|| "not a person's object id, MRI, DM id or mention link".into())
+    }
+
     #[tool(
         description = "The signed-in user's chats and channels, most recently active first.",
         annotations(read_only_hint = true, open_world_hint = true)
@@ -302,7 +310,7 @@ impl Mcp {
         conversations.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
         let out = conversations
             .iter()
-            .take(params.0.limit)
+            .take(params.0.limit.clamp(1, 500))
             .map(conversation_out)
             .collect();
         Ok(Json(ConversationsOut { conversations: out }))
@@ -324,7 +332,7 @@ impl Mcp {
             Ok(rows) => rows,
             Err(e) => return Err(e.to_string()),
         };
-        let skip = rows.len().saturating_sub(params.0.limit);
+        let skip = rows.len().saturating_sub(params.0.limit.clamp(1, 200));
         let out = rows[skip..].iter().map(message_out).collect();
         Ok(Json(MessagesOut { messages: out }))
     }
@@ -353,12 +361,13 @@ impl Mcp {
         params: Parameters<SearchPeopleParams>,
     ) -> Result<Json<PeopleOut>, String> {
         let query = params.0.query.trim();
-        if query.is_empty() {
+        // The client drops quotes and backslashes, which would leave nothing.
+        if !query.chars().any(|c| !matches!(c, '"' | '\\')) {
             return Err("query is empty".into());
         }
         let hits = self
             .teams
-            .search_people(query, params.0.limit)
+            .search_people(query, params.0.limit.clamp(1, 50))
             .await
             .map_err(|e| e.to_string())?;
         let people = hits
@@ -376,9 +385,8 @@ impl Mcp {
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn find_dm(&self, params: Parameters<FindDmParams>) -> Result<Json<DmOut>, String> {
-        let person = params.0.person_id.trim();
-        let person = person.strip_prefix("snak-mention:").unwrap_or(person);
-        match self.teams.direct_chat_with(person).await {
+        let person = self.person_id(&params.0.person_id)?;
+        match self.teams.direct_chat_with(&person).await {
             Ok(Some(id)) => Ok(Json(DmOut {
                 conversation_id: id.0,
             })),
@@ -397,12 +405,11 @@ impl Mcp {
         )
     )]
     async fn start_dm(&self, params: Parameters<FindDmParams>) -> Result<Json<DmOut>, String> {
-        let person = params.0.person_id.trim();
-        let person = person.strip_prefix("snak-mention:").unwrap_or(person);
+        let person = self.person_id(&params.0.person_id)?;
         if person.eq_ignore_ascii_case(&self.backend.me().id) {
             return Err("that's the signed-in user".into());
         }
-        match self.teams.open_direct_chat(person).await {
+        match self.teams.open_direct_chat(&person).await {
             Ok(id) => Ok(Json(DmOut {
                 conversation_id: id.0,
             })),
@@ -463,7 +470,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Set one appearance or display setting by name; applies on the app's next launch. Sign-in settings can't be changed here.",
+        description = "Set one appearance or display setting by name, for the app's next launch. Use it while snak is closed: a running snak rewrites the file from memory on its next settings change. Sign-in settings can't be changed here.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -583,15 +590,19 @@ fn settings_path() -> Option<std::path::PathBuf> {
 
 /// Where the app keeps its refresh token, read from the same settings.json.
 fn storage() -> snak_teams::store::Storage {
-    let Some(path) = settings_path() else {
-        return snak_teams::store::Storage::default();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return snak_teams::store::Storage::default(),
-    }) else {
-        return snak_teams::store::Storage::default();
-    };
+    let value = settings_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    storage_from(&value)
+}
+
+/// The mapping in app settings' `credential_storage()`, including the
+/// `insecure_credentials` key `login_storage` replaced.
+fn storage_from(value: &Value) -> snak_teams::store::Storage {
+    if value.get("insecure_credentials").and_then(Value::as_bool) == Some(true) {
+        return snak_teams::store::Storage::File;
+    }
     let storage = value.get("login_storage").and_then(|s| s.as_str());
     let account = value
         .get("onepassword_account")
@@ -683,25 +694,22 @@ mod tests {
 
     #[test]
     fn storage_maps_the_settings_file() {
-        // The mapping mirrors app settings' credential_storage().
-        let json = serde_json::json!({
-            "login_storage": "onepassword",
-            "onepassword_account": "acme"
-        });
-        let value: Value = serde_json::from_value(json).unwrap();
-        let account = value
-            .get("onepassword_account")
-            .and_then(|a| a.as_str().map(String::from));
-        let storage = match value.get("login_storage").and_then(|s| s.as_str()) {
-            Some("file") => snak_teams::store::Storage::File,
-            Some("onepassword") if account.is_some() => snak_teams::store::Storage::OnePassword {
-                account: account.unwrap(),
-            },
-            _ => snak_teams::store::Storage::default(),
-        };
+        use serde_json::json;
+        use snak_teams::store::Storage;
+        let one = json!({ "login_storage": "OnePassword", "onepassword_account": "acme" });
+        assert!(
+            matches!(storage_from(&one), Storage::OnePassword { account } if account == "acme")
+        );
         assert!(matches!(
-            storage,
-            snak_teams::store::Storage::OnePassword { .. }
+            storage_from(&json!({ "login_storage": "File" })),
+            Storage::File
         ));
+        assert!(matches!(
+            storage_from(&json!({ "insecure_credentials": true })),
+            Storage::File
+        ));
+        // 1Password without an account falls back like the app does.
+        let bare = storage_from(&json!({ "login_storage": "OnePassword" }));
+        assert!(matches!(bare, Storage::Keychain));
     }
 }

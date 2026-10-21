@@ -47,7 +47,8 @@ pub fn init() {
             .with_ansi(false)
             .with_writer(Mutex::new(file).and(std::io::stderr))
             .init(),
-        None => builder.init(),
+        // Never the default stdout: under `--stdio` that is the MCP channel.
+        None => builder.with_writer(std::io::stderr).init(),
     }
 
     let default_hook = std::panic::take_hook();

@@ -296,7 +296,7 @@ impl TeamsClient {
             return Err(CoreError::Http {
                 status: status.as_u16(),
                 url: url.path().to_string(),
-                body: String::new(),
+                body: String::default(),
             });
         }
         // Capped while streaming, not after: the server picks the body size.
@@ -311,6 +311,40 @@ impl TeamsClient {
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
+    }
+
+    /// A person's profile photo, as raw image bytes. People without a photo
+    /// get a 404, which is a person, not a failure.
+    pub async fn photo(&self, object_id: &str) -> Result<Option<Vec<u8>>> {
+        const MAX_BYTES: usize = 1024 * 1024;
+        let url = format!("https://graph.microsoft.com/v1.0/users/{object_id}/photo/$value");
+        let token = self.token(scope::GRAPH).await?;
+        let request = |url: &str, token: String| self.http.get(url).bearer_auth(token);
+        let mut res = request(&url, token).send().await?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            res = request(&url, self.token(scope::GRAPH).await?)
+                .send()
+                .await?;
+        }
+        let status = res.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(CoreError::Http {
+                status: status.as_u16(),
+                url: url.clone(),
+                body: String::default(),
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = res.chunk().await? {
+            if bytes.len() + chunk.len() > MAX_BYTES {
+                return Err(CoreError::Push("photo too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes))
     }
 
     /// Moves the read marker to now, which clears unread in every Teams client.
@@ -404,7 +438,9 @@ impl TeamsClient {
                     json!({
                         "id": i.to_string(),
                         "method": "GET",
-                        "url": format!("/users/{id}?$select=id,displayName,userPrincipalName"),
+                        "url": format!(
+                        "/users/{id}?$select=id,displayName,userPrincipalName,mail,jobTitle,businessPhones,mobilePhone"
+                    ),
                     })
                 })
                 .collect();
@@ -417,11 +453,24 @@ impl TeamsClient {
             for response in body["responses"].as_array().into_iter().flatten() {
                 let user = &response["body"];
                 if let Some(id) = user["id"].as_str() {
+                    let mut phones = user["businessPhones"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect::<Vec<_>>();
+                    if let Some(mobile) = user["mobilePhone"].as_str() {
+                        phones.push(mobile.to_string());
+                    }
                     people.insert(
                         id.to_string(),
                         Person {
                             display_name: user["displayName"].as_str().map(str::to_string),
                             upn: user["userPrincipalName"].as_str().map(str::to_string),
+                            mail: user["mail"].as_str().map(str::to_string),
+                            job_title: user["jobTitle"].as_str().map(str::to_string),
+                            phones,
+                            photo: None,
                         },
                     );
                 }

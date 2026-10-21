@@ -8,7 +8,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
-    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, MessagesPage, Reaction,
+    ConversationKind, Event, Group, LoginPrompt, Me, Message, MessageId, MessagesPage, Profile,
+    Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -20,28 +21,34 @@ const PAGE: usize = 20;
 struct Person {
     id: &'static str,
     name: &'static str,
+    title: &'static str,
 }
 
 const PEOPLE: [Person; 5] = [
     Person {
         id: "maja",
         name: "Maja Holm",
+        title: "Product Designer",
     },
     Person {
         id: "jonas",
         name: "Jonas Berg",
+        title: "Backend Engineer",
     },
     Person {
         id: "sara",
         name: "Sara Lind",
+        title: "Engineering Manager",
     },
     Person {
         id: "omar",
         name: "Omar Haddad",
+        title: "Site Reliability Engineer",
     },
     Person {
         id: "ida",
         name: "Ida Kjær",
+        title: "Frontend Engineer",
     },
 ];
 
@@ -232,6 +239,23 @@ impl ChatBackend for DemoBackend {
 
     fn image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async { Err(ChatError::Other("the demo has no images".into())) })
+    }
+
+    fn person(&self, key: &str) -> BoxFuture<'_, Option<Profile>> {
+        // Keys are a person id from a message's author, or their DM's id.
+        let id = key.strip_prefix("dm-").unwrap_or(key);
+        let profile = PEOPLE.iter().find(|p| p.id == id).map(|p| {
+            let dm = ConversationId(format!("dm-{}", p.id));
+            Profile {
+                display_name: p.name.to_string(),
+                photo: None,
+                mail: Some(format!("{}@example.com", p.id)),
+                job_title: Some(p.title.to_string()),
+                phones: Vec::new(),
+                dm: self.state().thread(&dm).is_some().then_some(dm),
+            }
+        });
+        Box::pin(async move { Ok(profile) })
     }
 
     fn call_url(&self, id: &ConversationId) -> Option<String> {

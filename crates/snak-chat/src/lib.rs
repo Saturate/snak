@@ -159,6 +159,19 @@ pub struct MessagesPage {
     pub older: Option<String>,
 }
 
+/// One person's own details, for the profile panel.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub display_name: String,
+    /// Profile photo bytes, when the backend can fetch one.
+    pub photo: Option<Vec<u8>>,
+    pub mail: Option<String>,
+    pub job_title: Option<String>,
+    pub phones: Vec<String>,
+    /// Their 1:1 chat, when one exists.
+    pub dm: Option<ConversationId>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Something changed in this conversation; refetch its messages.
@@ -179,10 +192,13 @@ pub enum Event {
         stopped: bool,
     },
     /// Someone's presence changed; `presence` is the service's own word for
-    /// it, e.g. Teams' `Available`, `Away` or `Offline`.
+    /// it, e.g. Teams' `Available`, `Away` or `Offline`. `activity` is what
+    /// they're doing, and `last_online` when they were last seen, if known.
     PresenceChanged {
         user: String,
         presence: String,
+        activity: Option<String>,
+        last_online: Option<String>,
     },
 }
 
@@ -221,6 +237,13 @@ pub trait ChatBackend: Send + Sync {
 
     /// Link that hands a call for this conversation to another app, if any.
     fn call_url(&self, id: &ConversationId) -> Option<String>;
+
+    /// A person's own details. The key is a conversation id, a member id or
+    /// whatever the backend's mention links carry; backends that know no
+    /// people of their own return `None`.
+    fn person(&self, _key: &str) -> BoxFuture<'_, Option<Profile>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Push updates. Backends without push return a receiver that never fires.
     fn subscribe(self: Arc<Self>) -> mpsc::Receiver<Event>;

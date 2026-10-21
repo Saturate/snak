@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
     ConversationKind, CredentialStorage, Event, Group, ImageRef, LoginPrompt, Me, Message,
-    MessageId, MessagesPage, Reaction,
+    MessageId, MessagesPage, Profile, Reaction,
 };
 use tokio::sync::mpsc;
 
@@ -41,6 +41,8 @@ struct Directory {
     upns: HashMap<String, String>,
     /// Member MRI by object id, to subscribe presence for DM partners.
     mris: HashMap<String, String>,
+    /// DM conversation by the other member's object id.
+    dms: HashMap<String, ConversationId>,
     /// MRIs subscribed on the current push session.
     subscribed: std::collections::HashSet<String>,
 }
@@ -163,6 +165,33 @@ impl TeamsBackend {
 impl ChatBackend for TeamsBackend {
     fn me(&self) -> &Me {
         &self.me
+    }
+
+    fn person(&self, key: &str) -> BoxFuture<'_, Option<Profile>> {
+        let client = self.client.clone();
+        let key = key.to_string();
+        Box::pin(async move {
+            // Keys arrive as a DM id, an MRI, a mention link or an author id;
+            // all narrow to one object id.
+            let object_id = person_object_id(&key, &self.directory().addresses);
+            let dm = self.directory().dms.get(&object_id).cloned();
+            let Some(people) = client.people(std::slice::from_ref(&object_id)).await.ok() else {
+                return Ok(None);
+            };
+            let Some(person) = people.get(&object_id) else {
+                return Ok(None);
+            };
+            let photo = client.photo(&object_id).await.ok().flatten();
+            Ok(Some(Profile {
+                display_name: person.display_name.clone().unwrap_or_default(),
+                // Graph's `mail` is missing for guests; the UPN still works.
+                mail: person.mail.clone().or(person.upn.clone()),
+                job_title: person.job_title.clone(),
+                phones: person.phones.clone(),
+                photo,
+                dm,
+            }))
+        })
     }
 
     fn conversations(&self) -> BoxFuture<'_, Vec<Conversation>> {
@@ -319,6 +348,18 @@ impl ChatBackend for TeamsBackend {
     }
 }
 
+/// The one person a profile key names: a DM id, an MRI, a mention link or an
+/// author id all narrow to one object id.
+fn person_object_id(key: &str, addresses: &HashMap<ConversationId, Address>) -> String {
+    match addresses.get(&ConversationId(key.to_string())) {
+        Some(Address::Chat { others, .. }) if !others.is_empty() => others[0].clone(),
+        _ => {
+            let id = key.strip_prefix("snak-mention:").unwrap_or(key);
+            id.rsplit(':').next().unwrap_or(id).to_string()
+        }
+    }
+}
+
 fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> Vec<Event> {
     // Channel replies arrive addressed as `<channel>;messageid=<root>`.
     let conversation = |id: &str| ConversationId(id.split(';').next().unwrap_or(id).to_string());
@@ -356,6 +397,8 @@ fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> 
             .map(|p| Event::PresenceChanged {
                 user: name(&p.mri).cloned().unwrap_or_default(),
                 presence: p.availability.clone().unwrap_or_else(|| "Offline".into()),
+                activity: p.activity.clone(),
+                last_online: p.last_active_time.clone(),
             })
             .collect(),
     }
@@ -539,6 +582,9 @@ fn chat_conversations(
                         directory
                             .mris
                             .insert(object_id.clone(), member_mri.to_string());
+                        directory
+                            .dms
+                            .insert(object_id.clone(), ConversationId(chat.id.clone()));
                     }
                 }
             }
@@ -1047,16 +1093,18 @@ fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[Str
             .collect::<Vec<_>>()
             .join(" ");
         out.push_str(&html[copied..start]);
-        let label = html_escape::encode_text(&name);
         // Compared raw; encoding is only for the attribute it goes into.
         let mine = my_mentions.contains(&item);
-        let item = html_escape::encode_double_quoted_attribute(&item);
+        let label = html_escape::encode_text(&name);
+        // The link carries the person's MRI, so a click can open their panel.
+        let href = person(&item);
+        let href = html_escape::encode_double_quoted_attribute(&href);
         if mine {
             out.push_str(&format!(
-                "<a href=\"snak-mention:{item}\"><b>@{label}</b></a>"
+                "<a href=\"snak-mention:{href}\"><b>@{label}</b></a>"
             ));
         } else {
-            out.push_str(&format!("<a href=\"snak-mention:{item}\">@{label}</a>"));
+            out.push_str(&format!("<a href=\"snak-mention:{href}\">@{label}</a>"));
         }
         copied = end;
         at = end;
@@ -1375,7 +1423,7 @@ mod tests {
         );
         assert_eq!(
             display_html(html, &[], &["0".to_string()]),
-            r#"<p>hi <a href="snak-mention:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:1">@Maja</a></p>"#
+            r#"<p>hi <a href="snak-mention:item:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:item:1">@Maja</a></p>"#
         );
     }
 
@@ -1453,7 +1501,7 @@ mod tests {
                 &mentions,
                 &["0".to_string(), "1".to_string(), "2".to_string()]
             ),
-            r#"<p><a href="snak-mention:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:3">@Maja</a></p>"#
+            r#"<p><a href="snak-mention:8:orgid:me"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:8:orgid:maja">@Maja</a></p>"#
         );
     }
 
@@ -1661,8 +1709,12 @@ mod tests {
         );
         assert!(matches!(
             events.as_slice(),
-            [Event::PresenceChanged { user, presence }]
-                if user == "Maja" && presence == "Available"
+            [Event::PresenceChanged {
+                user,
+                presence,
+                activity: None,
+                last_online: None,
+            }] if user == "Maja" && presence == "Available"
         ));
     }
 
@@ -1681,6 +1733,38 @@ mod tests {
         let mut mris: Vec<&str> = directory.mris.values().map(String::as_str).collect();
         mris.sort();
         assert_eq!(mris, ["8:orgid:y"]);
+    }
+
+    #[test]
+    fn profile_keys_narrow_to_one_object_id() {
+        let mut addresses = HashMap::new();
+        addresses.insert(
+            ConversationId("19:a@thread.tacv2".into()),
+            Address::Chat {
+                id: "19:a@thread.tacv2".into(),
+                others: vec!["b".into()],
+            },
+        );
+        assert_eq!(
+            person_object_id("19:a@thread.tacv2", &addresses),
+            "b",
+            "a DM names its other member"
+        );
+        assert_eq!(
+            person_object_id("8:orgid:c", &addresses),
+            "c",
+            "an MRI names its object id"
+        );
+        assert_eq!(
+            person_object_id("snak-mention:8:orgid:c", &addresses),
+            "c",
+            "a mention link names its MRI"
+        );
+        assert_eq!(
+            person_object_id("d", &addresses),
+            "d",
+            "an author id names itself"
+        );
     }
 
     #[test]

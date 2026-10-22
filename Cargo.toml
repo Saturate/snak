@@ -4,7 +4,7 @@ members = ["crates/*", "tools/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.0"
+version = "0.1.0"
 rust-version = "1.95"
 
 [workspace.dependencies]

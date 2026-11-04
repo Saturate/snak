@@ -349,6 +349,31 @@ impl ChatBackend for TeamsBackend {
         Box::pin(async move { Ok(self.client.image(url).await?) })
     }
 
+    fn edit<'a>(
+        &'a self,
+        id: &'a ConversationId,
+        message: &'a MessageId,
+        text: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let target = match self.address(id)? {
+                Address::Channel { channel_id, .. } => channel_id,
+                Address::Chat { id, .. } => id,
+            };
+            Ok(self.client.edit_message(&target, &message.0, text).await?)
+        })
+    }
+
+    fn delete<'a>(&'a self, id: &'a ConversationId, message: &'a MessageId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let target = match self.address(id)? {
+                Address::Channel { channel_id, .. } => channel_id,
+                Address::Chat { id, .. } => id,
+            };
+            Ok(self.client.delete_message(&target, &message.0).await?)
+        })
+    }
+
     fn mark_read<'a>(&'a self, id: &'a ConversationId) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let target = match self.address(id)? {

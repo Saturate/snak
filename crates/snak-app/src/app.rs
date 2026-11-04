@@ -124,6 +124,8 @@ type ImageCache = Rc<RefCell<HashMap<String, ImageState>>>;
 
 /// Opens the thread panel for a channel post.
 type OnThread = Rc<dyn Fn(MessageId, &mut Window, &mut App)>;
+type OnEdit = Rc<dyn Fn(MessageId, String, &mut Window, &mut App)>;
+type OnDelete = Rc<dyn Fn(MessageId, &mut Window, &mut App)>;
 type OpenProfile = Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>;
 /// Opens the image viewer over a message's images, starting at `index`.
 type OpenImageViewer = Arc<dyn Fn(Vec<ImageRef>, usize, &mut Window, &mut App) + Send + Sync>;
@@ -1580,6 +1582,157 @@ impl Snak {
         }));
     }
 
+    fn edit_message(
+        &mut self,
+        message_id: MessageId,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(backend), Some(conversation)) = (self.backend.clone(), self.selected.clone())
+        else {
+            return;
+        };
+        let edit_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder("Edit message")
+        });
+        edit_input.update(cx, |state, cx| state.set_value(text, window, cx));
+        let edit_input_focus = edit_input.clone();
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let edit_input = edit_input.clone();
+            let view = view.clone();
+            let message_id = message_id.clone();
+            let backend = backend.clone();
+            let conversation = conversation.clone();
+            dialog
+                .title("Edit message")
+                .child(Textarea::new(&edit_input))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("cancel").label("Cancel").outline()),
+                        )
+                        .child(
+                            DialogAction::new().child(Button::new("save").label("Save").primary()),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let new_text = edit_input.read(cx).value().trim().to_string();
+                    if new_text.is_empty() {
+                        return true;
+                    }
+                    view.update(cx, |this, cx| {
+                        this.do_edit(
+                            backend.clone(),
+                            conversation.clone(),
+                            message_id.clone(),
+                            new_text,
+                            cx,
+                        );
+                    });
+                    true
+                })
+        });
+        edit_input_focus.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    fn do_edit(
+        &mut self,
+        backend: Arc<dyn ChatBackend>,
+        conversation: ConversationId,
+        message_id: MessageId,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.session;
+        cx.spawn(async move |this, cx| {
+            let result =
+                io(async move { backend.edit(&conversation, &message_id, &text).await }).await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) if this.session == session => this.refetch_soon(cx),
+                Ok(()) => {}
+                Err(e) if this.session == session => this.show_error(e, cx),
+                Err(_) => {}
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn delete_message(
+        &mut self,
+        message_id: MessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(backend), Some(conversation)) = (self.backend.clone(), self.selected.clone())
+        else {
+            return;
+        };
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            let message_id = message_id.clone();
+            let backend = backend.clone();
+            let conversation = conversation.clone();
+            dialog
+                .title("Delete message")
+                .child(
+                    div()
+                        .text_sm()
+                        .child("Are you sure you want to delete this message?"),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("cancel").label("Cancel").outline()),
+                        )
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("delete").label("Delete").primary()),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.do_delete(
+                            backend.clone(),
+                            conversation.clone(),
+                            message_id.clone(),
+                            cx,
+                        );
+                    });
+                    true
+                })
+        });
+    }
+
+    fn do_delete(
+        &mut self,
+        backend: Arc<dyn ChatBackend>,
+        conversation: ConversationId,
+        message_id: MessageId,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.session;
+        cx.spawn(async move |this, cx| {
+            let result = io(async move { backend.delete(&conversation, &message_id).await }).await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) if this.session == session => this.refetch_soon(cx),
+                Ok(()) => {}
+                Err(e) if this.session == session => this.show_error(e, cx),
+                Err(_) => {}
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn start_call(&self, cx: &mut Context<Self>) {
         let (Some(backend), Some(id)) = (&self.backend, &self.selected) else {
             return;
@@ -2067,6 +2220,9 @@ fn render_row(
     row: &Message,
     previous: Option<&Message>,
     on_thread: Option<OnThread>,
+    on_edit: Option<OnEdit>,
+    on_delete: Option<OnDelete>,
+    me_id: Option<&str>,
     open_profile: OpenProfile,
     index: usize,
     images: &ImageCache,
@@ -2141,27 +2297,30 @@ fn render_row(
             )
         })
         // A pending post has no id Teams knows, so it can't be replied to yet.
-        .when_some(on_thread.filter(|_| !row.pending), |el, on_thread| {
-            let label: SharedString = match row.replies.len() {
-                0 => "Reply in thread".into(),
-                1 => "1 reply".into(),
-                n => format!("{n} replies").into(),
-            };
-            let id = row.id.clone();
-            el.child(
-                div()
-                    .id(("thread-link", index))
-                    .cursor_pointer()
-                    .text_color(if !row.replies.is_empty() {
-                        theme.link
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .hover(|s| s.underline())
-                    .child(label)
-                    .on_click(move |_, window, cx| on_thread(id.clone(), window, cx)),
-            )
-        });
+        .when_some(
+            on_thread.clone().filter(|_| !row.pending),
+            |el, on_thread| {
+                let label: SharedString = match row.replies.len() {
+                    0 => "Reply in thread".into(),
+                    1 => "1 reply".into(),
+                    n => format!("{n} replies").into(),
+                };
+                let id = row.id.clone();
+                el.child(
+                    div()
+                        .id(("thread-link", index))
+                        .cursor_pointer()
+                        .text_color(if !row.replies.is_empty() {
+                            theme.link
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .hover(|s| s.underline())
+                        .child(label)
+                        .on_click(move |_, window, cx| on_thread(id.clone(), window, cx)),
+                )
+            },
+        );
 
     let content = v_flex()
         .flex_1()
@@ -2178,9 +2337,85 @@ fn render_row(
         ))
         .child(footer);
 
+    let show_toolbar = !row.pending && !matches!(row.body, Body::Deleted | Body::Event(_));
+    let is_mine = me_id.is_some_and(|me| row.author_id.as_deref() == Some(me));
+
+    let toolbar = show_toolbar.then(|| {
+        let plain_text = match &row.body {
+            Body::Html(html) => strip_tags(html),
+            Body::Text(text) => text.clone(),
+            _ => String::new(),
+        };
+        let copy_text = plain_text.clone();
+        let mut bar = h_flex()
+            .id(("toolbar", index))
+            .absolute()
+            .top_0()
+            .right_4()
+            .mt(px(-4.))
+            .px_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .shadow_sm()
+            .opacity(0.)
+            .group_hover("msg", |s| s.opacity(1.))
+            .child(
+                Button::new(("copy", index))
+                    .xsmall()
+                    .ghost()
+                    .icon(Icon::new(IconName::Copy))
+                    .tooltip("Copy text")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    }),
+            );
+        if let Some(on_thread) = on_thread.clone().filter(|_| !row.pending) {
+            let id = row.id.clone();
+            bar = bar.child(
+                Button::new(("thread", index))
+                    .xsmall()
+                    .ghost()
+                    .icon(Icon::new(gpui_kit::assets::IconName::CornerUpLeft))
+                    .tooltip("Reply in thread")
+                    .on_click(move |_, window, cx| on_thread(id.clone(), window, cx)),
+            );
+        }
+        if is_mine {
+            if let Some(on_edit) = on_edit {
+                let id = row.id.clone();
+                bar = bar.child(
+                    Button::new(("edit", index))
+                        .xsmall()
+                        .ghost()
+                        .icon(Icon::new(gpui_kit::assets::IconName::Pen))
+                        .tooltip("Edit message")
+                        .on_click(move |_, window, cx| {
+                            on_edit(id.clone(), plain_text.clone(), window, cx)
+                        }),
+                );
+            }
+            if let Some(on_delete) = on_delete {
+                let id = row.id.clone();
+                bar = bar.child(
+                    Button::new(("delete", index))
+                        .xsmall()
+                        .ghost()
+                        .icon(Icon::new(gpui_kit::assets::IconName::Trash))
+                        .tooltip("Delete message")
+                        .on_click(move |_, window, cx| on_delete(id.clone(), window, cx)),
+                );
+            }
+        }
+        bar
+    });
+
     if continues {
         return div()
             .id(("row", index))
+            .group("msg")
+            .relative()
             .w_full()
             .pl(px(60.))
             .pr_4()
@@ -2188,11 +2423,14 @@ fn render_row(
             .hover(|s| s.bg(theme.muted))
             .when(row.mentions_me, |el| mentioned(el, cx))
             .child(content)
+            .children(toolbar)
             .into_any_element();
     }
 
     h_flex()
         .id(("row", index))
+        .group("msg")
+        .relative()
         .w_full()
         .items_start()
         .gap_3()
@@ -2240,7 +2478,6 @@ fn render_row(
                                 .text_sm()
                                 .font_weight(FontWeight::BOLD)
                                 .child(row.author.clone())
-                                // The name opens the person's profile panel.
                                 .when_some(row.author_id.clone(), |el, author_id| {
                                     let open_profile = open_profile.clone();
                                     el.on_click(move |_, window, cx| {
@@ -2257,6 +2494,7 @@ fn render_row(
                 )
                 .child(content),
         )
+        .children(toolbar)
         .into_any_element()
 }
 
@@ -2910,6 +3148,9 @@ impl Snak {
         scroller: &Entity<MessageScrollerState>,
         rows: Rc<Vec<Message>>,
         on_thread: Option<OnThread>,
+        on_edit: Option<OnEdit>,
+        on_delete: Option<OnDelete>,
+        me_id: Option<String>,
         open_profile: OpenProfile,
         images: ImageCache,
         gif_toggles: GifToggles,
@@ -2933,6 +3174,9 @@ impl Snak {
                 row,
                 previous,
                 on_thread.clone(),
+                on_edit.clone(),
+                on_delete.clone(),
+                me_id.as_deref(),
                 open_profile.clone(),
                 index,
                 &images,
@@ -3071,6 +3315,25 @@ impl Snak {
                     .ok();
             }) as OnThread
         });
+        let on_edit: Option<OnEdit> = {
+            let weak = cx.entity().downgrade();
+            Some(Rc::new(
+                move |id: MessageId, text: String, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| this.edit_message(id, text, window, cx))
+                        .ok();
+                },
+            ) as OnEdit)
+        };
+        let on_delete: Option<OnDelete> = {
+            let weak = cx.entity().downgrade();
+            Some(
+                Rc::new(move |id: MessageId, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| this.delete_message(id, window, cx))
+                        .ok();
+                }) as OnDelete,
+            )
+        };
+        let me_id = self.backend.as_ref().map(|b| b.me().id.clone());
         let open_profile: OpenProfile = {
             let weak = cx.entity().downgrade();
             Arc::new(move |key: String, _: &mut Window, cx: &mut App| {
@@ -3131,6 +3394,9 @@ impl Snak {
                 &self.scroller,
                 self.rows.clone(),
                 on_thread,
+                on_edit,
+                on_delete,
+                me_id,
                 open_profile.clone(),
                 self.images.clone(),
                 self.gif_toggles.clone(),
@@ -3172,6 +3438,25 @@ impl Snak {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let on_edit: Option<OnEdit> = {
+            let weak = cx.entity().downgrade();
+            Some(Rc::new(
+                move |id: MessageId, text: String, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| this.edit_message(id, text, window, cx))
+                        .ok();
+                },
+            ) as OnEdit)
+        };
+        let on_delete: Option<OnDelete> = {
+            let weak = cx.entity().downgrade();
+            Some(
+                Rc::new(move |id: MessageId, window: &mut Window, cx: &mut App| {
+                    weak.update(cx, |this, cx| this.delete_message(id, window, cx))
+                        .ok();
+                }) as OnDelete,
+            )
+        };
+        let me_id = self.backend.as_ref().map(|b| b.me().id.clone());
         v_flex()
             .flex_none()
             .w(px(THREAD_WIDTH))
@@ -3203,6 +3488,9 @@ impl Snak {
                 &self.thread_scroller,
                 self.thread_rows.clone(),
                 None,
+                on_edit,
+                on_delete,
+                me_id,
                 open_profile.clone(),
                 self.images.clone(),
                 self.gif_toggles.clone(),
@@ -3517,6 +3805,9 @@ impl Snak {
                 "profile",
                 &self.profile_scroller,
                 self.profile_rows.clone(),
+                None,
+                None,
+                None,
                 None,
                 open_profile,
                 self.images.clone(),

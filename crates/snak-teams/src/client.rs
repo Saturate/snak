@@ -494,6 +494,59 @@ impl TeamsClient {
         Ok(())
     }
 
+    /// Replaces a message's content with new text.
+    pub async fn edit_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let body = json!({
+            "content": crate::html::from_text(text),
+            "messagetype": "RichText/Html",
+            "contenttype": "Text",
+            "properties": {
+                "edittime": now,
+                "skypeeditedid": message_id,
+            }
+        });
+        let url = format!(
+            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/messages/{}",
+            self.region,
+            urlencode(conversation_id),
+            urlencode(message_id)
+        );
+        let _: Value = self
+            .call(scope::CHAT, &url, |http, token| {
+                http.put(&url).bearer_auth(token).json(&body)
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Soft-deletes a message by setting its deletetime.
+    pub async fn delete_message(&self, conversation_id: &str, message_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis().to_string();
+        let body = json!({
+            "properties": {
+                "deletetime": now,
+            }
+        });
+        let url = format!(
+            "{TEAMS}/api/chatsvc/{}/v1/users/ME/conversations/{}/messages/{}",
+            self.region,
+            urlencode(conversation_id),
+            urlencode(message_id)
+        );
+        let _: Value = self
+            .call(scope::CHAT, &url, |http, token| {
+                http.put(&url).bearer_auth(token).json(&body)
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Directory users whose name or mail matches `query`, keyed by object id.
     pub async fn search_people(&self, query: &str, limit: usize) -> Result<Vec<(String, Person)>> {
         // Graph's $search grammar quotes each clause; a stray quote or

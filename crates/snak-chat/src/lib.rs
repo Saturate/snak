@@ -245,6 +245,25 @@ pub trait ChatBackend: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Replaces a message's content. Only the author's own messages can be edited.
+    fn edit<'a>(
+        &'a self,
+        _conversation: &'a ConversationId,
+        _message: &'a MessageId,
+        _text: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(ChatError::Other("editing not supported".into())) })
+    }
+
+    /// Soft-deletes a message. Only the author's own messages can be deleted.
+    fn delete<'a>(
+        &'a self,
+        _conversation: &'a ConversationId,
+        _message: &'a MessageId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(ChatError::Other("deleting not supported".into())) })
+    }
+
     /// Push updates. Backends without push return a receiver that never fires.
     fn subscribe(self: Arc<Self>) -> mpsc::Receiver<Event>;
 }

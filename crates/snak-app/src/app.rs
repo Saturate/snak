@@ -1582,6 +1582,53 @@ impl Snak {
         }));
     }
 
+    fn edit_last(&mut self, _: &EditLastMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let me_id = match self.backend.as_ref().map(|b| b.me().id.clone()) {
+            Some(id) => id,
+            None => return,
+        };
+        let in_thread = self
+            .thread_composer
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        let in_main = self.composer.read(cx).focus_handle(cx).is_focused(window);
+        if !in_main && !in_thread {
+            return;
+        }
+        let composer = if in_thread {
+            &self.thread_composer
+        } else {
+            &self.composer
+        };
+        if !composer.read(cx).value().trim().is_empty() {
+            return;
+        }
+        let messages: Vec<&Message> = if in_thread {
+            self.thread_rows
+                .iter()
+                .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
+                .collect()
+        } else {
+            self.rows
+                .iter()
+                .flat_map(|m| std::iter::once(m).chain(m.replies.iter()))
+                .collect()
+        };
+        let last = messages.into_iter().rev().find(|m| {
+            m.author_id.as_deref() == Some(&me_id) && !m.pending && !matches!(m.body, Body::Deleted)
+        });
+        let Some(last) = last else {
+            return;
+        };
+        let plain = match &last.body {
+            Body::Html(html) => strip_tags(html),
+            Body::Text(text) => text.clone(),
+            _ => return,
+        };
+        self.edit_message(last.id.clone(), plain, window, cx);
+    }
+
     fn edit_message(
         &mut self,
         message_id: MessageId,
@@ -4019,6 +4066,7 @@ impl Render for Snak {
                 cx.listener(|this, _: &CycleTheme, window, cx| this.cycle_appearance(window, cx)),
             )
             .on_action(cx.listener(|this, _: &SignOut, _, cx| this.sign_out(cx)))
+            .on_action(cx.listener(Self::edit_last))
             .when(self.image_viewer.is_some(), |el| {
                 el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     match event.keystroke.key.as_str() {

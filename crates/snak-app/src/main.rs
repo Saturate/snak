@@ -26,6 +26,7 @@ actions!(
         NextConversation,
         PreviousConversation,
         CloseThread,
+        EditLastMessage,
         OpenSettings,
         Quit,
         CommandPalette,
@@ -165,6 +166,7 @@ fn main() {
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("alt-down", NextConversation, None),
                 KeyBinding::new("alt-up", PreviousConversation, None),
+                KeyBinding::new("up", EditLastMessage, Some("Snak")),
                 KeyBinding::new("escape", CloseThread, Some("Snak")),
             ]);
 

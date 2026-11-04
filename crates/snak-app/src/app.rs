@@ -440,6 +440,12 @@ impl Snak {
         self.load_conversations(cx);
         self.listen(backend, cx);
         self.start_polling(cx);
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .spawn(async { crate::image_cache::evict() })
+                .await;
+        })
+        .detach();
     }
 
     fn show_error(&mut self, error: ChatError, cx: &mut Context<Self>) {
@@ -1267,43 +1273,72 @@ impl Snak {
                 .insert(url.clone(), ImageState::Loading);
             let backend = backend.clone();
             cx.spawn(async move |this, cx| {
-                let fetched = {
-                    let url = url.clone();
-                    io(async move { backend.image(&url).await }).await
+                let cached = cx
+                    .background_executor()
+                    .spawn({
+                        let url = url.clone();
+                        async move { crate::image_cache::read(&url) }
+                    })
+                    .await;
+                let bytes = match cached {
+                    Some(bytes) => bytes,
+                    None => {
+                        let fetched = {
+                            let url = url.clone();
+                            io(async move { backend.image(&url).await }).await
+                        };
+                        match fetched {
+                            Ok(bytes) => {
+                                let save_url = url.clone();
+                                let save_bytes = bytes.clone();
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        crate::image_cache::write(&save_url, &save_bytes);
+                                    })
+                                    .detach();
+                                bytes
+                            }
+                            Err(e) => {
+                                tracing::warn!(url = crate::log::redact_url(&url), error = %e, "image failed");
+                                this.update(cx, |this, cx| {
+                                    this.images.borrow_mut().insert(
+                                        url,
+                                        ImageState::Failed(std::time::Instant::now()),
+                                    );
+                                    cx.notify();
+                                })
+                                .ok();
+                                return;
+                            }
+                        }
+                    }
                 };
-                let state = match fetched {
-                    Ok(bytes) => match image_format(&bytes) {
-                        Some(format) => {
-                            let size = image::ImageReader::new(std::io::Cursor::new(&bytes))
-                                .with_guessed_format()
-                                .ok()
-                                .and_then(|r| r.into_dimensions().ok());
-                            let still = (format == ImageFormat::Gif)
-                                .then(|| first_frame_png(&bytes))
-                                .flatten();
-                            ImageState::Ready(LoadedImage {
-                                data: Arc::new(Image::from_bytes(format, bytes)),
-                                size,
-                                still,
-                            })
-                        }
-                        None => {
-                            tracing::warn!(
-                                url = crate::log::redact_url(&url),
-                                magic = ?&bytes[..bytes.len().min(8)],
-                                "image in an unknown format"
-                            );
-                            ImageState::Failed(std::time::Instant::now())
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(url = crate::log::redact_url(&url), error = %e, "image failed");
+                let state = match image_format(&bytes) {
+                    Some(format) => {
+                        let size = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                            .with_guessed_format()
+                            .ok()
+                            .and_then(|r| r.into_dimensions().ok());
+                        let still = (format == ImageFormat::Gif)
+                            .then(|| first_frame_png(&bytes))
+                            .flatten();
+                        ImageState::Ready(LoadedImage {
+                            data: Arc::new(Image::from_bytes(format, bytes)),
+                            size,
+                            still,
+                        })
+                    }
+                    None => {
+                        tracing::warn!(
+                            url = crate::log::redact_url(&url),
+                            magic = ?&bytes[..bytes.len().min(8)],
+                            "image in an unknown format"
+                        );
                         ImageState::Failed(std::time::Instant::now())
                     }
                 };
                 this.update(cx, |this, cx| {
                     this.images.borrow_mut().insert(url, state);
-                    // Loaded images can differ from the reserved size.
                     this.scroller.update(cx, |s, cx| s.remeasure(cx));
                     this.thread_scroller.update(cx, |s, cx| s.remeasure(cx));
                     cx.notify();

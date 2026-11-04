@@ -5,6 +5,7 @@
 
 mod app;
 mod code_blocks;
+mod image_cache;
 mod log;
 mod palette;
 mod prefs;

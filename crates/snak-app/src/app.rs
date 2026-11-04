@@ -41,8 +41,12 @@ use crate::*;
 /// which repeats it every few seconds while someone types (Squads uses 4).
 const TYPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
-const SIDEBAR_WIDTH: f32 = 272.;
-const THREAD_WIDTH: f32 = 400.;
+const DEFAULT_SIDEBAR_WIDTH: f32 = 272.;
+const MIN_SIDEBAR_WIDTH: f32 = 180.;
+const MAX_SIDEBAR_WIDTH: f32 = 480.;
+const DEFAULT_THREAD_WIDTH: f32 = 400.;
+const MIN_THREAD_WIDTH: f32 = 280.;
+const MAX_THREAD_WIDTH: f32 = 600.;
 const SNAK_OPEN: &str = "SNAK_OPEN";
 
 enum SidebarRow {
@@ -130,6 +134,18 @@ type OpenProfile = Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>;
 /// Opens the image viewer over a message's images, starting at `index`.
 type OpenImageViewer = Arc<dyn Fn(Vec<ImageRef>, usize, &mut Window, &mut App) + Send + Sync>;
 
+#[derive(Clone, Copy)]
+enum ResizeEdge {
+    Sidebar,
+    Thread,
+}
+
+struct Resizing {
+    edge: ResizeEdge,
+    start_x: f32,
+    start_width: f32,
+}
+
 enum Screen {
     Starting,
     Login { prompt: Option<LoginPrompt> },
@@ -216,6 +232,9 @@ pub struct Snak {
     /// carries this, not the latest count, so it loses to a pending click.
     profile_shown: u64,
     profile_scroller: Entity<MessageScrollerState>,
+
+    /// Panel being dragged: which edge and the mouse X when it started.
+    resizing: Option<Resizing>,
 
     auth_task: Option<Task<()>>,
     sidebar_task: Option<Task<()>>,
@@ -331,6 +350,7 @@ impl Snak {
             profile_opened: 0,
             profile_shown: 0,
             profile_scroller,
+            resizing: None,
             auth_task: None,
             sidebar_task: None,
             conversation_task: None,
@@ -781,6 +801,81 @@ impl Snak {
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
         self.end_session(true, cx);
         self.begin_login(cx);
+    }
+
+    fn resize_handle(&self, edge: ResizeEdge, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .id(match edge {
+                ResizeEdge::Sidebar => "resize-sidebar",
+                ResizeEdge::Thread => "resize-thread",
+            })
+            .flex_none()
+            .w(px(4.))
+            .h_full()
+            .cursor_col_resize()
+            .hover(|s| s.bg(theme.primary.opacity(0.3)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let start_width = match edge {
+                        ResizeEdge::Sidebar => this.sidebar_width(),
+                        ResizeEdge::Thread => this.thread_width(),
+                    };
+                    this.resizing = Some(Resizing {
+                        edge,
+                        start_x: f32::from(event.position.x),
+                        start_width,
+                    });
+                    cx.notify();
+                }),
+            )
+    }
+
+    fn on_resize_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(resizing) = &self.resizing else {
+            return;
+        };
+        let delta = f32::from(event.position.x) - resizing.start_x;
+        let (new_width, min, max) = match resizing.edge {
+            ResizeEdge::Sidebar => (
+                resizing.start_width + delta,
+                MIN_SIDEBAR_WIDTH,
+                MAX_SIDEBAR_WIDTH,
+            ),
+            ResizeEdge::Thread => (
+                resizing.start_width - delta,
+                MIN_THREAD_WIDTH,
+                MAX_THREAD_WIDTH,
+            ),
+        };
+        let clamped = new_width.clamp(min, max);
+        match resizing.edge {
+            ResizeEdge::Sidebar => self.prefs.sidebar_width = Some(clamped),
+            ResizeEdge::Thread => self.prefs.thread_width = Some(clamped),
+        }
+        cx.notify();
+    }
+
+    fn on_resize_up(&mut self, cx: &mut Context<Self>) {
+        if self.resizing.take().is_some() {
+            let _ = self.prefs.save(self.connector.service_name());
+            cx.notify();
+        }
+    }
+
+    fn sidebar_width(&self) -> f32 {
+        self.prefs
+            .sidebar_width
+            .unwrap_or(DEFAULT_SIDEBAR_WIDTH)
+            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+    }
+
+    fn thread_width(&self) -> f32 {
+        self.prefs
+            .thread_width
+            .unwrap_or(DEFAULT_THREAD_WIDTH)
+            .clamp(MIN_THREAD_WIDTH, MAX_THREAD_WIDTH)
     }
 
     fn update_prefs(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Prefs)) {
@@ -3125,7 +3220,7 @@ impl Snak {
         let unreads_only = self.prefs.unreads_only;
         v_flex()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width()))
             .h_full()
             .bg(theme.sidebar)
             .border_r_1()
@@ -3504,9 +3599,10 @@ impl Snak {
             )
         };
         let me_id = self.backend.as_ref().map(|b| b.me().id.clone());
+        let thread_w = self.thread_width();
         v_flex()
             .flex_none()
-            .w(px(THREAD_WIDTH))
+            .w(px(thread_w))
             .h_full()
             .border_l_1()
             .border_color(theme.border)
@@ -3706,9 +3802,10 @@ impl Snak {
             .dm
             .as_ref()
             .and_then(|dm| self.backend.as_ref().and_then(|b| b.call_url(dm)));
+        let thread_w = self.thread_width();
         v_flex()
             .flex_none()
-            .w(px(THREAD_WIDTH))
+            .w(px(thread_w))
             .h_full()
             .border_l_1()
             .border_color(theme.border)
@@ -4067,6 +4164,15 @@ impl Render for Snak {
             )
             .on_action(cx.listener(|this, _: &SignOut, _, cx| this.sign_out(cx)))
             .on_action(cx.listener(Self::edit_last))
+            .when(self.resizing.is_some(), |el| {
+                el.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.on_resize_move(event, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.on_resize_up(cx)),
+                )
+            })
             .when(self.image_viewer.is_some(), |el| {
                 el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     match event.keystroke.key.as_str() {
@@ -4127,20 +4233,25 @@ impl Render for Snak {
                                 .flex_1()
                                 .min_h_0()
                                 .child(self.render_sidebar(cx))
+                                .child(self.resize_handle(ResizeEdge::Sidebar, cx))
                                 .child(self.render_conversation(cx))
                                 .when(self.thread_root.is_some(), |el| {
-                                    el.child(self.render_thread(
-                                        open_profile.clone(),
-                                        open_image_viewer.clone(),
-                                        cx,
-                                    ))
+                                    el.child(self.resize_handle(ResizeEdge::Thread, cx)).child(
+                                        self.render_thread(
+                                            open_profile.clone(),
+                                            open_image_viewer.clone(),
+                                            cx,
+                                        ),
+                                    )
                                 })
-                                .when(self.profile.is_some(), |el| {
-                                    el.child(self.render_profile(
-                                        open_profile.clone(),
-                                        open_image_viewer.clone(),
-                                        cx,
-                                    ))
+                                .when(self.profile.is_some() && self.thread_root.is_none(), |el| {
+                                    el.child(self.resize_handle(ResizeEdge::Thread, cx)).child(
+                                        self.render_profile(
+                                            open_profile.clone(),
+                                            open_image_viewer.clone(),
+                                            cx,
+                                        ),
+                                    )
                                 }),
                         )
                         .child(self.render_status_bar(cx)),

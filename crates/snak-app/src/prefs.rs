@@ -16,6 +16,10 @@ pub struct Prefs {
     pub unreads_only: bool,
     /// Keys of collapsed sidebar groups (see [`group_key`]).
     pub collapsed: HashSet<String>,
+    /// Sidebar width in pixels; `None` uses the default.
+    pub sidebar_width: Option<f32>,
+    /// Thread/profile panel width in pixels; `None` uses the default.
+    pub thread_width: Option<f32>,
 }
 
 /// Sidebar groups and whole teams share one key space with conversations,

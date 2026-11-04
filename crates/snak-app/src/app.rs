@@ -1126,6 +1126,7 @@ impl Snak {
                             page.older,
                         );
                         this.set_rows(rows, cx);
+                        this.update_preview(&requested);
                         this.mark_read(&requested, cx);
                     }
                     Err(e) => this.show_error(e, cx),
@@ -1224,6 +1225,20 @@ impl Snak {
 
     /// Only conversations the service still calls unread get a request, so
     /// refetches of an already-read conversation stay free.
+    fn update_preview(&mut self, id: &ConversationId) {
+        let last = self
+            .rows
+            .iter()
+            .rev()
+            .flat_map(|m| std::iter::once(m).chain(m.replies.iter().rev()))
+            .find(|m| !m.pending && !matches!(m.body, Body::Deleted));
+        if let Some(preview) = last.and_then(message_preview) {
+            if let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) {
+                conversation.preview = Some(preview);
+            }
+        }
+    }
+
     fn mark_read(&mut self, id: &ConversationId, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -2204,6 +2219,19 @@ fn strip_tags(html: &str) -> String {
         }
     }
     html_escape::decode_html_entities(&out).into_owned()
+}
+
+fn message_preview(message: &Message) -> Option<String> {
+    const MAX_CHARS: usize = 160;
+    let text = match &message.body {
+        Body::Html(html) => strip_tags(html),
+        Body::Text(text) => text.clone(),
+        Body::Event(text) => text.clone(),
+        Body::Deleted => return None,
+    };
+    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    let line: String = line.chars().take(MAX_CHARS).collect();
+    Some(format!("{}: {line}", message.author))
 }
 
 fn normalise(text: &str) -> String {

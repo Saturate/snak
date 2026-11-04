@@ -791,13 +791,17 @@ fn to_message(message: &models::Message, me_id: &str) -> Option<Message> {
         .map(|(item, _)| item.clone())
         .collect();
     let message_type = message.message_type.as_deref().unwrap_or("");
-    if message_type.starts_with("Control/") || message_type.starts_with("ThreadActivity/") {
+    if message_type.starts_with("Control/") {
         return None;
     }
     let body = if message.is_deleted() {
         Body::Deleted
+    } else if message_type.starts_with("ThreadActivity/") {
+        Body::Event(thread_activity_text(message_type))
     } else if message_type.starts_with("Event/Call") {
-        Body::Event("Call".into())
+        Body::Event(event_call_text(message_type))
+    } else if has_cards(message) {
+        Body::Event("[Card]".into())
     } else {
         let content = message.content.as_deref().unwrap_or("");
         let subject = message.subject();
@@ -1278,6 +1282,38 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 /// underscore (`1f389_partypopper`), a name (`like`, `clappinghands`), and
 /// either one with a skin tone (`yes-tone1`). An unknown name shows as
 /// `:name:` so it still reads as a reaction.
+fn thread_activity_text(message_type: &str) -> String {
+    let activity = message_type
+        .strip_prefix("ThreadActivity/")
+        .unwrap_or(message_type);
+    match activity {
+        "MemberJoined" | "AddMember" => "joined the conversation".into(),
+        "MemberLeft" | "DeleteMember" => "left the conversation".into(),
+        "TopicUpdate" => "changed the topic".into(),
+        "HistoryDisclosed" | "HistoryDisclosedUpdate" => "shared chat history".into(),
+        "TabUpdated" => "updated a tab".into(),
+        other => other.into(),
+    }
+}
+
+fn event_call_text(message_type: &str) -> String {
+    match message_type {
+        "Event/Call" => "Call".into(),
+        "Event/CallEnd" | "Event/CallEnded" => "Call ended".into(),
+        "Event/CallMissed" => "Missed call".into(),
+        other => other.strip_prefix("Event/").unwrap_or(other).to_string(),
+    }
+}
+
+fn has_cards(message: &models::Message) -> bool {
+    message
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("cards"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.trim() != "[]" && !s.trim().is_empty())
+}
+
 fn reaction_glyph(key: &str) -> String {
     let (base, tone) = match key.rsplit_once("-tone") {
         Some((base, n)) => (base, n.parse::<u32>().ok().filter(|n| (1..=5).contains(n))),

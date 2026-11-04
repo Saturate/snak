@@ -1250,9 +1250,7 @@ fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[Str
                 "<a href=\"snak://mention/{href}\"><b>@{label}</b></a>"
             ));
         } else {
-            out.push_str(&format!(
-                "<a href=\"snak://mention/{href}\">@{label}</a>"
-            ));
+            out.push_str(&format!("<a href=\"snak://mention/{href}\">@{label}</a>"));
         }
         copied = end;
         at = end;
@@ -1618,7 +1616,7 @@ mod tests {
         );
         assert_eq!(
             display_html(html, &[], &["0".to_string()]),
-            r#"<p>hi <a href="snak-mention:item:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:item:1">@Maja</a></p>"#
+            r#"<p>hi <a href="snak://mention/item:0"><b>@Allan Kimmer Jensen</b></a> and <a href="snak://mention/item:1">@Maja</a></p>"#
         );
     }
 
@@ -1696,7 +1694,7 @@ mod tests {
                 &mentions,
                 &["0".to_string(), "1".to_string(), "2".to_string()]
             ),
-            r#"<p><a href="snak-mention:8:orgid:me"><b>@Allan Kimmer Jensen</b></a> and <a href="snak-mention:8:orgid:maja">@Maja</a></p>"#
+            r#"<p><a href="snak://mention/8:orgid:me"><b>@Allan Kimmer Jensen</b></a> and <a href="snak://mention/8:orgid:maja">@Maja</a></p>"#
         );
     }
 
@@ -1954,13 +1952,13 @@ mod tests {
             "an MRI names its object id"
         );
         assert_eq!(
-            id(&format!("snak-mention:8:orgid:{C}")).as_deref(),
+            id(&format!("snak://mention/8:orgid:{C}")).as_deref(),
             Some(C),
             "a mention link names its MRI"
         );
         assert_eq!(id(C).as_deref(), Some(C), "an author id names itself");
         assert_eq!(
-            id("snak-mention:0"),
+            id("snak://mention/0"),
             None,
             "an unresolved mention names nobody"
         );

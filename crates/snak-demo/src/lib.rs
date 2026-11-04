@@ -524,7 +524,7 @@ fn seed(now: DateTime<Utc>) -> State {
         id(),
         "omar",
         ago(12),
-        "<p><a href=\"snak-mention:0\">@Demo User</a> could you look at the pool-size alert before we merge? \
+        "<p><a href=\"snak://mention/0\">@Demo User</a> could you look at the pool-size alert before we merge? \
          It pages at 80% for five minutes.</p>",
     );
     review_post.mentions_me = true;

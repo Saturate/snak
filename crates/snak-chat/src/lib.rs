@@ -56,6 +56,8 @@ pub struct Conversation {
     pub last_activity: Option<DateTime<Utc>>,
     /// Latest message as "Author: text".
     pub preview: Option<String>,
+    /// Hidden by the service (e.g. a chat closed in Teams), not by the user.
+    pub service_hidden: bool,
 }
 
 impl Conversation {
@@ -172,10 +174,20 @@ pub struct Profile {
     pub dm: Option<ConversationId>,
 }
 
+/// A new message worth notifying about.
+#[derive(Debug, Clone)]
+pub struct IncomingMessage {
+    pub author: String,
+    pub preview: String,
+    pub mentions_me: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Something changed in this conversation; refetch its messages.
-    MessagesChanged(ConversationId),
+    /// When the change is a new message from someone else, the hint
+    /// carries enough to show a notification without fetching first.
+    MessagesChanged(ConversationId, Option<IncomingMessage>),
     /// Unread state or the conversation list changed.
     ConversationsChanged,
     Connected,

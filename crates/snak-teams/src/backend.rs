@@ -484,12 +484,42 @@ fn translate(event: PushEvent, names: &HashMap<String, String>, me_id: &str) -> 
         PushEvent::Reconnecting { .. } => vec![Event::Reconnecting],
         PushEvent::SessionExpired => vec![Event::SessionExpired],
         PushEvent::NewMessage {
-            conversation_id, ..
+            conversation_id,
+            message,
+        } => {
+            let from_me = message
+                .sender_id()
+                .is_some_and(|id| id.eq_ignore_ascii_case(me_id));
+            let hint = if from_me {
+                None
+            } else {
+                let author = message
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".into());
+                let preview = crate::html::to_text(message.content.as_deref().unwrap_or(""));
+                let mentions = message.mentions();
+                let mentions_me = !me_id.is_empty()
+                    && mentions.iter().any(|(_, mri)| {
+                        mri.rsplit(':')
+                            .next()
+                            .is_some_and(|id| id.eq_ignore_ascii_case(me_id))
+                    });
+                Some(snak_chat::IncomingMessage {
+                    author,
+                    preview,
+                    mentions_me,
+                })
+            };
+            vec![
+                Event::MessagesChanged(conversation(&conversation_id), hint),
+                Event::ConversationsChanged,
+            ]
         }
-        | PushEvent::MessageEdited {
+        PushEvent::MessageEdited {
             conversation_id, ..
         } => vec![
-            Event::MessagesChanged(conversation(&conversation_id)),
+            Event::MessagesChanged(conversation(&conversation_id), None),
             Event::ConversationsChanged,
         ],
         PushEvent::ConversationUpdated { .. } => vec![Event::ConversationsChanged],
@@ -645,6 +675,7 @@ fn channel_conversations(
                 muted: channel.is_muted == Some(true),
                 last_activity: channel.last_activity(),
                 preview: preview(channel.last_message.as_ref()),
+                service_hidden: false,
             });
         }
     }
@@ -712,6 +743,7 @@ fn chat_conversations(
                 muted: false,
                 last_activity: chat.last_message.as_ref().and_then(|m| m.sent_at()),
                 preview: preview(chat.last_message.as_ref()),
+                service_hidden: chat.hidden == Some(true),
             }
         })
         .collect()
@@ -1913,6 +1945,6 @@ mod tests {
             &HashMap::new(),
             "me",
         );
-        assert!(matches!(&events[0], Event::MessagesChanged(id) if id.0 == "19:a@thread.tacv2"));
+        assert!(matches!(&events[0], Event::MessagesChanged(id, _) if id.0 == "19:a@thread.tacv2"));
     }
 }

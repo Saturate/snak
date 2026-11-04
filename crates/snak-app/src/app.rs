@@ -26,7 +26,7 @@ use gpui_kit::*;
 use crate::code_blocks;
 use snak_chat::{
     Body, ChatBackend, ChatError, Connector, Conversation, ConversationId, ConversationKind, Event,
-    Group, ImageRef, LoginPrompt, Message, MessageId, MessagesPage, Profile,
+    Group, ImageRef, IncomingMessage, LoginPrompt, Message, MessageId, MessagesPage, Profile,
 };
 
 use crate::prefs::{Placement, Prefs, group_key, team_key};
@@ -362,6 +362,7 @@ impl Snak {
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);
+        Self::setup_notifications(cx.entity().downgrade(), cx);
         this.restore(cx);
         this
     }
@@ -564,6 +565,55 @@ impl Snak {
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
+    fn setup_notifications(weak: WeakEntity<Self>, cx: &mut App) {
+        cx.on_system_notification_response(move |response, cx| {
+            let tag = response.tag.to_string();
+            if let Some(id) = tag.strip_prefix("msg:") {
+                let id = ConversationId(id.to_string());
+                cx.activate(true);
+                if let Some(window) = cx.windows().into_iter().next() {
+                    window
+                        .update(cx, |_, window, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.select(id, window, cx);
+                            })
+                            .ok();
+                        })
+                        .ok();
+                }
+            }
+        });
+    }
+
+    fn maybe_notify(&self, conversation: &ConversationId, incoming: &IncomingMessage, cx: &App) {
+        let Some(conv) = self.conversations.iter().find(|c| &c.id == conversation) else {
+            return;
+        };
+        if self.is_muted(conv) {
+            return;
+        }
+        let dominated =
+            matches!(conv.kind, ConversationKind::Channel { .. }) && !incoming.mentions_me;
+        if dominated {
+            return;
+        }
+        const MAX_PREVIEW: usize = 120;
+        let preview: String = incoming.preview.chars().take(MAX_PREVIEW).collect();
+        let title: SharedString = match &conv.kind {
+            ConversationKind::Channel { .. } => {
+                format!("{} in #{}", incoming.author, conv.title).into()
+            }
+            _ => incoming.author.clone().into(),
+        };
+        let tag: SharedString = format!("msg:{}", conversation.0).into();
+        cx.show_system_notification(SystemNotification {
+            tag,
+            title,
+            body: preview.into(),
+            actions: Vec::new(),
+        });
+    }
+
     // Updates
 
     fn listen(&mut self, backend: Arc<dyn ChatBackend>, cx: &mut Context<Self>) {
@@ -583,11 +633,13 @@ impl Snak {
 
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
-            Event::MessagesChanged(id) => {
+            Event::MessagesChanged(id, hint) => {
                 // A message arriving ends any typing indicator for it.
                 self.typing.remove(&id);
                 if self.selected.as_ref() == Some(&id) && !self.showing_unreads {
                     self.refetch_soon(cx);
+                } else if let Some(incoming) = hint {
+                    self.maybe_notify(&id, &incoming, cx);
                 }
                 // Messages arriving in the profile panel's DM belong to it.
                 if let Some(dm) = self.profile.as_ref().and_then(|p| p.dm.clone())
@@ -2958,7 +3010,14 @@ impl Snak {
         // A collapsed group still shows what needs attention, as Slack does.
         let shown_when_collapsed =
             |c: &Conversation| is_selected(c) || (c.unread && !self.is_muted(c));
-        let collapsed = |key: &str| !searching && prefs.collapsed.contains(key);
+        let collapsed = |key: &str| {
+            !searching
+                && if key == "service-hidden" {
+                    !prefs.collapsed.contains(key)
+                } else {
+                    prefs.collapsed.contains(key)
+                }
+        };
         let filtering = searching || prefs.unreads_only;
 
         let all: Vec<&Conversation> = self.conversations.iter().filter(visible).collect();
@@ -3068,7 +3127,7 @@ impl Snak {
         }
 
         let mut dms: Vec<&Conversation> = placed(Placement::Default)
-            .filter(|c| !c.is_channel())
+            .filter(|c| !c.is_channel() && !c.service_hidden)
             .collect();
         dms.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
         dms.truncate(if searching { usize::MAX } else { dm_limit });
@@ -3078,6 +3137,17 @@ impl Snak {
             dms,
             false,
             true,
+        );
+
+        let mut hidden: Vec<&Conversation> =
+            all.iter().copied().filter(|c| c.service_hidden).collect();
+        hidden.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
+        push_group(
+            &mut rows,
+            Header::new("service-hidden", "Hidden chats", 0),
+            hidden,
+            false,
+            false,
         );
         rows
     }

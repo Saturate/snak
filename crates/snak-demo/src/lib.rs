@@ -292,7 +292,7 @@ impl ChatBackend for DemoBackend {
                 let Some(changed) = backend.simulate_activity() else {
                     continue;
                 };
-                let delivered = tx.send(Event::MessagesChanged(changed)).await.is_ok()
+                let delivered = tx.send(Event::MessagesChanged(changed, None)).await.is_ok()
                     && tx.send(Event::ConversationsChanged).await.is_ok();
                 if !delivered {
                     return;
@@ -428,6 +428,7 @@ fn seed(now: DateTime<Utc>) -> State {
         muted: false,
         last_activity: None,
         preview: None,
+        service_hidden: false,
     };
     let chat = |id: &str, kind: ConversationKind, title: &str| Conversation {
         id: ConversationId(id.into()),
@@ -437,6 +438,7 @@ fn seed(now: DateTime<Utc>) -> State {
         muted: false,
         last_activity: None,
         preview: None,
+        service_hidden: false,
     };
 
     let mut releases_post = message(

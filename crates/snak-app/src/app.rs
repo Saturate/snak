@@ -146,6 +146,19 @@ struct Resizing {
     start_width: f32,
 }
 
+/// A thread the user participated in, cached for the threads view.
+#[derive(Clone)]
+struct ThreadEntry {
+    conversation: ConversationId,
+    root_id: MessageId,
+    channel_title: String,
+    team_name: Option<String>,
+    author: String,
+    preview: String,
+    reply_count: usize,
+    last_activity: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 enum Screen {
     Starting,
     Login { prompt: Option<LoginPrompt> },
@@ -176,6 +189,9 @@ pub struct Snak {
 
     selected: Option<ConversationId>,
     showing_unreads: bool,
+    showing_threads: bool,
+    /// Threads the user posted in or started, collected as channels load.
+    my_threads: Vec<ThreadEntry>,
     /// A conversation to open once the list has loaded (`SNAK_OPEN`), so
     /// `scripts/screenshot.sh` can start on a channel without clicking.
     open_on_load: Option<ConversationId>,
@@ -316,6 +332,8 @@ impl Snak {
             section_name: cx.new(|cx| InputState::new(window, cx).placeholder("Section name")),
             selected: None,
             showing_unreads: true,
+            showing_threads: false,
+            my_threads: Vec::new(),
             open_on_load: std::env::var(SNAK_OPEN).ok().map(ConversationId),
             rows: Rc::default(),
             scroller,
@@ -507,6 +525,8 @@ impl Snak {
         self.conversations.clear();
         self.selected = None;
         self.showing_unreads = true;
+        self.showing_threads = false;
+        self.my_threads.clear();
         self.thread_root = None;
         self.image_viewer = None;
         self.profile = None;
@@ -636,7 +656,10 @@ impl Snak {
             Event::MessagesChanged(id, hint) => {
                 // A message arriving ends any typing indicator for it.
                 self.typing.remove(&id);
-                if self.selected.as_ref() == Some(&id) && !self.showing_unreads {
+                if self.selected.as_ref() == Some(&id)
+                    && !self.showing_unreads
+                    && !self.showing_threads
+                {
                     self.refetch_soon(cx);
                 } else if let Some(incoming) = hint {
                     self.maybe_notify(&id, &incoming, cx);
@@ -704,7 +727,7 @@ impl Snak {
                 self.load_conversations(cx);
                 self.load_avatars(cx);
                 // Loading marks it read, so only when it's actually on screen.
-                if !self.showing_unreads {
+                if !self.showing_unreads && !self.showing_threads {
                     self.load_conversation(cx);
                 }
             }
@@ -1046,6 +1069,7 @@ impl Snak {
         cx: &mut Context<Self>,
     ) {
         self.showing_unreads = false;
+        self.showing_threads = false;
         if self.selected.as_ref() != Some(&id) {
             // Each conversation keeps its own unsent text, so switching never
             // carries a half-written message into the wrong place.
@@ -1275,6 +1299,7 @@ impl Snak {
         sync_scroller(&self.scroller, &self.rows, &rows, cx);
         self.rows = Rc::new(rows);
         self.load_images(cx);
+        self.collect_threads();
 
         if let Some(root_id) = self.thread_root.clone() {
             match self.rows.iter().find(|r| r.id == root_id).map(thread_rows) {
@@ -1614,8 +1639,72 @@ impl Snak {
         cx.notify();
     }
 
+    fn collect_threads(&mut self) {
+        let Some(me_id) = self.backend.as_ref().map(|b| b.me().id.clone()) else {
+            return;
+        };
+        let Some(conversation_id) = self.selected.clone() else {
+            return;
+        };
+        let conversation = self.conversations.iter().find(|c| c.id == conversation_id);
+        let Some(conversation) = conversation else {
+            return;
+        };
+        if !conversation.is_channel() {
+            return;
+        }
+        let channel_title = conversation.title.clone();
+        let team_name = conversation.group().map(|g| g.name.clone());
+        self.my_threads
+            .retain(|t| t.conversation != conversation_id);
+        for post in self.rows.iter() {
+            if post.replies.is_empty() {
+                continue;
+            }
+            let i_posted = post.author_id.as_deref() == Some(&me_id);
+            let i_replied = post
+                .replies
+                .iter()
+                .any(|r| r.author_id.as_deref() == Some(&me_id));
+            if !i_posted && !i_replied {
+                continue;
+            }
+            let last_reply = post.replies.last();
+            let preview_text = match &post.body {
+                Body::Html(html) => strip_tags(html),
+                Body::Text(text) => text.clone(),
+                _ => String::new(),
+            };
+            let preview: String = preview_text.chars().take(120).collect();
+            self.my_threads.push(ThreadEntry {
+                conversation: conversation_id.clone(),
+                root_id: post.id.clone(),
+                channel_title: channel_title.clone(),
+                team_name: team_name.clone(),
+                author: post.author.clone(),
+                preview,
+                reply_count: post.replies.len(),
+                last_activity: last_reply.and_then(|r| r.sent_at).or(post.sent_at),
+            });
+        }
+        self.my_threads
+            .sort_by_key(|t| std::cmp::Reverse(t.last_activity));
+    }
+
     fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.showing_unreads = true;
+        self.showing_threads = false;
+        if self.thread_root.is_some() {
+            self.put_away_thread_draft(window, cx);
+        }
+        self.thread_root = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn show_threads(&mut self, _: &ShowThreads, window: &mut Window, cx: &mut Context<Self>) {
+        self.showing_threads = true;
+        self.showing_unreads = false;
         if self.thread_root.is_some() {
             self.put_away_thread_draft(window, cx);
         }
@@ -2422,7 +2511,7 @@ fn message_text(view: TextView, dark: bool, open_profile: OpenProfile) -> TextVi
     // smb: or some app's custom scheme.
     view.on_link_click(move |url, _, window, cx| {
         // Mentions open the person's profile panel.
-        if let Some(key) = url.strip_prefix("snak-mention:") {
+        if let Some(key) = url.strip_prefix("snak://mention/") {
             open_profile(key.to_string(), window, cx);
         } else if is_safe_link(url) {
             cx.open_url(url);
@@ -2816,7 +2905,9 @@ impl Snak {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let key = entry.id.0.clone();
-        let active = !self.showing_unreads && self.selected.as_ref() == Some(&entry.id);
+        let active = !self.showing_unreads
+            && !self.showing_threads
+            && self.selected.as_ref() == Some(&entry.id);
         let muted = self.is_muted(entry);
         let hidden = self.prefs.hidden.contains(&key);
         // Muted entries never shout; that is the point of muting.
@@ -3276,36 +3367,70 @@ impl Snak {
 
         let unread_count = self.unread_entries().len();
         let theme = cx.theme();
-        let mut list = v_flex().px_2().pb_4().child(
-            h_flex()
-                .id("all-unreads")
-                .mt_1()
-                .px_2()
-                .py(px(3.))
-                .gap_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .text_sm()
-                .map(|el| {
-                    if self.showing_unreads {
-                        el.bg(theme.sidebar_primary)
-                            .text_color(theme.sidebar_primary_foreground)
-                    } else {
-                        el.text_color(theme.sidebar_foreground)
-                            .hover(|s| s.bg(theme.sidebar_accent))
-                    }
-                })
-                .child(div().flex_1().child("All unreads"))
-                .when(unread_count > 0, |el| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .child(unread_count.to_string()),
-                    )
-                })
-                .on_click(cx.listener(|this, _, window, cx| this.show_unreads(window, cx))),
-        );
+        let mut list = v_flex()
+            .px_2()
+            .pb_4()
+            .child(
+                h_flex()
+                    .id("all-unreads")
+                    .mt_1()
+                    .px_2()
+                    .py(px(3.))
+                    .gap_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .map(|el| {
+                        if self.showing_unreads {
+                            el.bg(theme.sidebar_primary)
+                                .text_color(theme.sidebar_primary_foreground)
+                        } else {
+                            el.text_color(theme.sidebar_foreground)
+                                .hover(|s| s.bg(theme.sidebar_accent))
+                        }
+                    })
+                    .child(div().flex_1().child("All unreads"))
+                    .when(unread_count > 0, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .child(unread_count.to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.show_unreads(window, cx))),
+            )
+            .child(
+                h_flex()
+                    .id("threads-view")
+                    .px_2()
+                    .py(px(3.))
+                    .gap_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .map(|el| {
+                        if self.showing_threads {
+                            el.bg(theme.sidebar_primary)
+                                .text_color(theme.sidebar_primary_foreground)
+                        } else {
+                            el.text_color(theme.sidebar_foreground)
+                                .hover(|s| s.bg(theme.sidebar_accent))
+                        }
+                    })
+                    .child(div().flex_1().child("Threads"))
+                    .when(!self.my_threads.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .child(self.my_threads.len().to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_threads(&ShowThreads, window, cx)
+                    })),
+            );
         for (ix, row) in rows.iter().enumerate() {
             list = match row {
                 SidebarRow::Header(header) => {
@@ -3541,7 +3666,110 @@ impl Snak {
             .into_any_element()
     }
 
+    fn render_threads(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let mut list = v_flex().gap_1().p_4();
+        if self.my_threads.is_empty() {
+            list = list.child(
+                div()
+                    .pt_16()
+                    .w_full()
+                    .text_center()
+                    .text_color(theme.muted_foreground)
+                    .child("No threads yet. Open a channel to see threads you posted in."),
+            );
+        }
+        for (i, entry) in self.my_threads.iter().enumerate() {
+            let channel: SharedString = format!("# {}", entry.channel_title).into();
+            let conversation = entry.conversation.clone();
+            let root_id = entry.root_id.clone();
+            let replies: SharedString = match entry.reply_count {
+                1 => "1 reply".into(),
+                n => format!("{n} replies").into(),
+            };
+            list = list.child(
+                v_flex()
+                    .id(("thread-entry", i))
+                    .w_full()
+                    .gap_1()
+                    .px_4()
+                    .py_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(channel),
+                            )
+                            .when_some(entry.team_name.clone(), |el, team| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(team),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex().gap_2().child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .text_sm()
+                                .child(entry.author.clone()),
+                        ),
+                    )
+                    .when(!entry.preview.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .line_clamp(2)
+                                .child(entry.preview.clone()),
+                        )
+                    })
+                    .child(div().text_xs().text_color(theme.link).child(replies))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select(conversation.clone(), window, cx);
+                        this.open_thread(root_id.clone(), window, cx);
+                    })),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(48.))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().font_weight(FontWeight::BOLD).child("Threads")),
+            )
+            .child(
+                div()
+                    .id("threads-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .into_any_element()
+    }
+
     fn render_conversation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.showing_threads {
+            return self.render_threads(cx);
+        }
         let theme = cx.theme();
         let selected = match self.selected_conversation() {
             Some(selected) if !self.showing_unreads => selected,
@@ -4269,6 +4497,7 @@ impl Render for Snak {
             )
             .on_action(cx.listener(|this, _: &SignOut, _, cx| this.sign_out(cx)))
             .on_action(cx.listener(Self::edit_last))
+            .on_action(cx.listener(Self::show_threads))
             .when(self.resizing.is_some(), |el| {
                 el.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                     this.on_resize_move(event, cx);

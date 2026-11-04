@@ -458,7 +458,10 @@ fn person_object_id(key: &str, addresses: &HashMap<ConversationId, Address>) -> 
         Some(Address::Chat { others, .. }) if !others.is_empty() => others[0].clone(),
         _ => {
             let key = key.trim();
-            let id = key.strip_prefix("snak-mention:").unwrap_or(key);
+            let id = key
+                .strip_prefix("snak://mention/")
+                .or_else(|| key.strip_prefix("snak-mention:"))
+                .unwrap_or(key);
             id.rsplit(':').next().unwrap_or(id).to_string()
         }
     };
@@ -1155,7 +1158,7 @@ fn trim_line_ends(html: &str) -> String {
 /// itemid="N">Name</span>`, and splits a full name into one span per word.
 /// The words may share an itemid or get one each; `mentions` (itemid, mri)
 /// ties them to one person either way. Each run becomes one `@Full Name` link
-/// to `snak-mention:N`, bold when it's the signed-in user. The link scheme is
+/// to `snak://mention/N`, bold when it's the signed-in user. The link scheme is
 /// never opened.
 fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[String]) -> String {
     // The person behind an itemid: their MRI when listed, else the itemid.
@@ -1244,10 +1247,12 @@ fn render_mentions(html: &str, mentions: &[(String, String)], my_mentions: &[Str
         let href = html_escape::encode_double_quoted_attribute(&href);
         if mine {
             out.push_str(&format!(
-                "<a href=\"snak-mention:{href}\"><b>@{label}</b></a>"
+                "<a href=\"snak://mention/{href}\"><b>@{label}</b></a>"
             ));
         } else {
-            out.push_str(&format!("<a href=\"snak-mention:{href}\">@{label}</a>"));
+            out.push_str(&format!(
+                "<a href=\"snak://mention/{href}\">@{label}</a>"
+            ));
         }
         copied = end;
         at = end;

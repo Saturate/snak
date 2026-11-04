@@ -32,6 +32,7 @@ actions!(
         Quit,
         CommandPalette,
         ShowUnreads,
+        ShowThreads,
         ToggleUnreadsOnly,
         ToggleStar,
         ToggleMute,

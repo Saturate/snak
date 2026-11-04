@@ -146,6 +146,15 @@ struct Resizing {
     start_width: f32,
 }
 
+/// One message in the cross-conversation timeline, carrying enough context
+/// to render without looking up the conversation again.
+#[derive(Clone)]
+struct TimelineEntry {
+    conversation: ConversationId,
+    conversation_title: String,
+    message: Message,
+}
+
 /// A thread the user participated in, cached for the threads view.
 #[derive(Clone)]
 struct ThreadEntry {
@@ -190,8 +199,12 @@ pub struct Snak {
     selected: Option<ConversationId>,
     showing_unreads: bool,
     showing_threads: bool,
+    showing_timeline: bool,
     /// Threads the user posted in or started, collected as channels load.
     my_threads: Vec<ThreadEntry>,
+    /// Cross-conversation timeline, loaded on demand.
+    timeline_entries: Vec<TimelineEntry>,
+    timeline_task: Option<Task<()>>,
     /// A conversation to open once the list has loaded (`SNAK_OPEN`), so
     /// `scripts/screenshot.sh` can start on a channel without clicking.
     open_on_load: Option<ConversationId>,
@@ -249,6 +262,12 @@ pub struct Snak {
     profile_shown: u64,
     profile_scroller: Entity<MessageScrollerState>,
 
+    /// Message search state.
+    search_input: Entity<InputState>,
+    search_results: Vec<snak_chat::SearchResult>,
+    search_task: Option<Task<()>>,
+    searching: bool,
+
     /// Panel being dragged: which edge and the mouse X when it started.
     resizing: Option<Resizing>,
 
@@ -282,6 +301,7 @@ impl Snak {
                 .submit_on_enter(true)
                 .placeholder("Reply")
         });
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search messages…"));
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let thread_scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let profile_scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
@@ -301,6 +321,15 @@ impl Snak {
                 InputEvent::PressEnter { .. } => this.open_first_match(window, cx),
                 _ => {}
             }),
+            cx.subscribe_in(
+                &search_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Change => this.run_search(cx),
+                    InputEvent::PressEnter { .. } => this.open_first_search_result(window, cx),
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = event {
                     this.send(false, window, cx);
@@ -333,7 +362,10 @@ impl Snak {
             selected: None,
             showing_unreads: true,
             showing_threads: false,
+            showing_timeline: false,
             my_threads: Vec::new(),
+            timeline_entries: Vec::new(),
+            timeline_task: None,
             open_on_load: std::env::var(SNAK_OPEN).ok().map(ConversationId),
             rows: Rc::default(),
             scroller,
@@ -368,6 +400,10 @@ impl Snak {
             profile_opened: 0,
             profile_shown: 0,
             profile_scroller,
+            search_input,
+            search_results: Vec::new(),
+            search_task: None,
+            searching: false,
             resizing: None,
             auth_task: None,
             sidebar_task: None,
@@ -526,7 +562,10 @@ impl Snak {
         self.selected = None;
         self.showing_unreads = true;
         self.showing_threads = false;
+        self.showing_timeline = false;
         self.my_threads.clear();
+        self.timeline_entries.clear();
+        self.timeline_task = None;
         self.thread_root = None;
         self.image_viewer = None;
         self.profile = None;
@@ -659,6 +698,7 @@ impl Snak {
                 if self.selected.as_ref() == Some(&id)
                     && !self.showing_unreads
                     && !self.showing_threads
+                    && !self.showing_timeline
                 {
                     self.refetch_soon(cx);
                 } else if let Some(incoming) = hint {
@@ -727,7 +767,7 @@ impl Snak {
                 self.load_conversations(cx);
                 self.load_avatars(cx);
                 // Loading marks it read, so only when it's actually on screen.
-                if !self.showing_unreads && !self.showing_threads {
+                if !self.showing_unreads && !self.showing_threads && !self.showing_timeline {
                     self.load_conversation(cx);
                 }
             }
@@ -1070,6 +1110,7 @@ impl Snak {
     ) {
         self.showing_unreads = false;
         self.showing_threads = false;
+        self.showing_timeline = false;
         if self.selected.as_ref() != Some(&id) {
             // Each conversation keeps its own unsent text, so switching never
             // carries a half-written message into the wrong place.
@@ -1232,10 +1273,10 @@ impl Snak {
             .rev()
             .flat_map(|m| std::iter::once(m).chain(m.replies.iter().rev()))
             .find(|m| !m.pending && !matches!(m.body, Body::Deleted));
-        if let Some(preview) = last.and_then(message_preview) {
-            if let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) {
-                conversation.preview = Some(preview);
-            }
+        if let Some(preview) = last.and_then(message_preview)
+            && let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id)
+        {
+            conversation.preview = Some(preview);
         }
     }
 
@@ -1469,6 +1510,10 @@ impl Snak {
     // Removing the focused composer would leave key presses with no target
     // under this view, which silently disables every shortcut.
     fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.searching {
+            self.close_search(window, cx);
+            return;
+        }
         // Escape closes the topmost thing first, and the viewer sits over
         // every panel.
         if self.image_viewer.is_some() {
@@ -1709,6 +1754,7 @@ impl Snak {
     fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.showing_unreads = true;
         self.showing_threads = false;
+        self.showing_timeline = false;
         if self.thread_root.is_some() {
             self.put_away_thread_draft(window, cx);
         }
@@ -1720,12 +1766,154 @@ impl Snak {
     fn show_threads(&mut self, _: &ShowThreads, window: &mut Window, cx: &mut Context<Self>) {
         self.showing_threads = true;
         self.showing_unreads = false;
+        self.showing_timeline = false;
         if self.thread_root.is_some() {
             self.put_away_thread_draft(window, cx);
         }
         self.thread_root = None;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    fn show_timeline(&mut self, _: &ShowTimeline, window: &mut Window, cx: &mut Context<Self>) {
+        self.showing_timeline = true;
+        self.showing_unreads = false;
+        self.showing_threads = false;
+        if self.thread_root.is_some() {
+            self.put_away_thread_draft(window, cx);
+        }
+        self.thread_root = None;
+        window.focus(&self.focus, cx);
+        self.load_timeline(cx);
+        cx.notify();
+    }
+
+    fn open_search(&mut self, _: &SearchMessages, window: &mut Window, cx: &mut Context<Self>) {
+        self.searching = true;
+        self.search_results.clear();
+        self.search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.search_input
+            .update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.searching {
+            return;
+        }
+        self.searching = false;
+        self.search_results.clear();
+        self.search_task = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let query = self.search_input.read(cx).value().trim().to_string();
+        if query.is_empty() {
+            self.search_results.clear();
+            cx.notify();
+            return;
+        }
+        let conversations = self.conversations.clone();
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            let result = io(async move { backend.search(&query, 20).await }).await;
+            this.update(cx, |this, cx| match result {
+                Ok(mut results) => {
+                    for r in &mut results {
+                        if r.conversation_title.is_empty() {
+                            r.conversation_title = conversations
+                                .iter()
+                                .find(|c| c.id == r.conversation)
+                                .map(|c| c.title.clone())
+                                .unwrap_or_default();
+                        }
+                    }
+                    this.search_results = results;
+                    cx.notify();
+                }
+                Err(e) => this.show_error(e, cx),
+            })
+            .ok();
+        }));
+    }
+
+    fn open_first_search_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(result) = self.search_results.first().cloned() {
+            self.searching = false;
+            self.search_results.clear();
+            self.search_task = None;
+            self.select(result.conversation, window, cx);
+        }
+    }
+
+    fn load_timeline(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let mut active: Vec<Conversation> = self
+            .conversations
+            .iter()
+            .filter(|c| !c.service_hidden)
+            .filter(|c| c.last_activity.is_some())
+            .cloned()
+            .collect();
+        active.sort_by_key(|c| std::cmp::Reverse(c.last_activity));
+        active.truncate(20);
+        let titles: HashMap<ConversationId, String> = active
+            .iter()
+            .map(|c| {
+                let title = if c.is_channel() {
+                    match c.group() {
+                        Some(g) => format!("#{} ({})", c.title, g.name),
+                        None => format!("#{}", c.title),
+                    }
+                } else {
+                    c.title.clone()
+                };
+                (c.id.clone(), title)
+            })
+            .collect();
+        let ids: Vec<ConversationId> = active.iter().map(|c| c.id.clone()).collect();
+        self.timeline_task = Some(cx.spawn(async move |this, cx| {
+            let mut all_entries: Vec<TimelineEntry> = Vec::new();
+            for id in &ids {
+                let backend = backend.clone();
+                let id = id.clone();
+                let fetch_id = id.clone();
+                let result = io(async move { backend.messages(&fetch_id).await }).await;
+                if let Ok(page) = result {
+                    let title = titles.get(&id).cloned().unwrap_or_default();
+                    for msg in page.messages {
+                        for reply in &msg.replies {
+                            all_entries.push(TimelineEntry {
+                                conversation: id.clone(),
+                                conversation_title: title.clone(),
+                                message: reply.clone(),
+                            });
+                        }
+                        all_entries.push(TimelineEntry {
+                            conversation: id.clone(),
+                            conversation_title: title.clone(),
+                            message: msg,
+                        });
+                    }
+                }
+            }
+            all_entries.sort_by_key(|e| e.message.sent_at);
+            this.update(cx, |this, cx| {
+                this.timeline_entries = all_entries;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn send(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1854,7 +2042,9 @@ impl Snak {
                 waited = delay;
                 let still_here = this
                     .update(cx, |this, cx| {
-                        let same = this.selected == conversation && !this.showing_unreads;
+                        let same = this.selected == conversation
+                            && !this.showing_unreads
+                            && !this.showing_timeline;
                         if same {
                             this.load_conversation(cx);
                         }
@@ -2935,6 +3125,7 @@ impl Snak {
         let key = entry.id.0.clone();
         let active = !self.showing_unreads
             && !self.showing_threads
+            && !self.showing_timeline
             && self.selected.as_ref() == Some(&entry.id);
         let muted = self.is_muted(entry);
         let hidden = self.prefs.hidden.contains(&key);
@@ -3458,6 +3649,29 @@ impl Snak {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.show_threads(&ShowThreads, window, cx)
                     })),
+            )
+            .child(
+                h_flex()
+                    .id("timeline-view")
+                    .px_2()
+                    .py(px(3.))
+                    .gap_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .map(|el| {
+                        if self.showing_timeline {
+                            el.bg(theme.sidebar_primary)
+                                .text_color(theme.sidebar_primary_foreground)
+                        } else {
+                            el.text_color(theme.sidebar_foreground)
+                                .hover(|s| s.bg(theme.sidebar_accent))
+                        }
+                    })
+                    .child(div().flex_1().child("Timeline"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_timeline(&ShowTimeline, window, cx)
+                    })),
             );
         for (ix, row) in rows.iter().enumerate() {
             list = match row {
@@ -3794,7 +4008,242 @@ impl Snak {
             .into_any_element()
     }
 
+    fn render_timeline_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let mut list = v_flex().gap_0p5().p_4();
+        if self.timeline_entries.is_empty() {
+            list = list.child(
+                div()
+                    .pt_16()
+                    .w_full()
+                    .text_center()
+                    .text_color(theme.muted_foreground)
+                    .child("Loading timeline…"),
+            );
+        }
+        let mut current_day: Option<chrono::NaiveDate> = None;
+        let mut current_conversation: Option<String> = None;
+        for (i, entry) in self.timeline_entries.iter().enumerate() {
+            let day = entry
+                .message
+                .sent_at
+                .map(|t| t.with_timezone(&chrono::Local).date_naive());
+            if day != current_day {
+                current_day = day;
+                let label = match day {
+                    Some(d) if d == chrono::Local::now().date_naive() => "Today".to_string(),
+                    Some(d)
+                        if d == (chrono::Local::now() - chrono::Duration::days(1)).date_naive() =>
+                    {
+                        "Yesterday".to_string()
+                    }
+                    Some(d) => d.format("%A %e %B %Y").to_string(),
+                    None => "Unknown date".to_string(),
+                };
+                list = list.child(
+                    div()
+                        .pt_4()
+                        .pb_2()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                );
+                current_conversation = None;
+            }
+            if current_conversation.as_ref() != Some(&entry.conversation_title) {
+                current_conversation = Some(entry.conversation_title.clone());
+                let title = entry.conversation_title.clone();
+                let conversation = entry.conversation.clone();
+                list = list.child(
+                    div()
+                        .id(("tl-conv", i))
+                        .pt_2()
+                        .pb_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.link)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .child(title)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select(conversation.clone(), window, cx)
+                        })),
+                );
+            }
+            let preview = match &entry.message.body {
+                Body::Html(html) => strip_tags(html),
+                Body::Text(text) => text.clone(),
+                Body::Deleted => "deleted".to_string(),
+                Body::Event(text) => text.clone(),
+            };
+            let preview: String = preview.chars().take(200).collect();
+            let time = entry.message.time_label();
+            list = list.child(
+                h_flex()
+                    .gap_2()
+                    .py_0p5()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(40.))
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(time),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(entry.message.author.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.muted_foreground)
+                            .child(preview),
+                    ),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(48.))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().font_weight(FontWeight::BOLD).child("Timeline")),
+            )
+            .child(
+                div()
+                    .id("timeline-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .into_any_element()
+    }
+
+    fn render_search(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let mut list = v_flex().gap_1().p_4();
+        if self.search_results.is_empty() {
+            let hint = if self.search_input.read(cx).value().trim().is_empty() {
+                "Type to search messages…"
+            } else {
+                "No results"
+            };
+            list = list.child(
+                div()
+                    .pt_8()
+                    .w_full()
+                    .text_center()
+                    .text_color(theme.muted_foreground)
+                    .child(hint),
+            );
+        }
+        for (i, result) in self.search_results.iter().enumerate() {
+            let title = result.conversation_title.clone();
+            let clicked = result.conversation.clone();
+            list = list.child(
+                v_flex()
+                    .id(("search-result", i))
+                    .w_full()
+                    .gap_0p5()
+                    .px_4()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(result.author.clone()),
+                            )
+                            .when(!title.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(title),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .line_clamp(2)
+                            .child(result.snippet.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.searching = false;
+                        this.search_results.clear();
+                        this.search_task = None;
+                        this.select(clicked.clone(), window, cx);
+                    })),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(48.))
+                    .px_4()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().font_weight(FontWeight::BOLD).child("Search messages"))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("close-search")
+                            .small()
+                            .ghost()
+                            .label("Close")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_search(window, cx)),
+                            ),
+                    ),
+            )
+            .child(div().px_4().py_2().child(Input::new(&self.search_input)))
+            .child(
+                div()
+                    .id("search-results")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .into_any_element()
+    }
+
     fn render_conversation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.searching {
+            return self.render_search(cx);
+        }
+        if self.showing_timeline {
+            return self.render_timeline_view(cx);
+        }
         if self.showing_threads {
             return self.render_threads(cx);
         }
@@ -4525,7 +4974,9 @@ impl Render for Snak {
             )
             .on_action(cx.listener(|this, _: &SignOut, _, cx| this.sign_out(cx)))
             .on_action(cx.listener(Self::edit_last))
+            .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::show_threads))
+            .on_action(cx.listener(Self::show_timeline))
             .when(self.resizing.is_some(), |el| {
                 el.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                     this.on_resize_move(event, cx);

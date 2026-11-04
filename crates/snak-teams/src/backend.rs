@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use snak_chat::{
     Body, BoxFuture, ChatBackend, ChatError, Connector, Conversation, ConversationId,
     ConversationKind, CredentialStorage, Event, Group, ImageRef, LoginPrompt, Me, Message,
-    MessageId, MessagesPage, Profile, Reaction,
+    MessageId, MessagesPage, Profile, Reaction, SearchResult,
 };
 use tokio::sync::mpsc;
 
@@ -381,6 +381,30 @@ impl ChatBackend for TeamsBackend {
                 Address::Chat { id, .. } => id,
             };
             Ok(self.client.mark_read(&target).await?)
+        })
+    }
+
+    fn search<'a>(&'a self, query: &'a str, limit: usize) -> BoxFuture<'a, Vec<SearchResult>> {
+        Box::pin(async move {
+            let hits = self.client.search_messages(query, limit).await?;
+            Ok(hits
+                .into_iter()
+                .map(|hit| {
+                    let sent_at = hit
+                        .sent_at
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+                    SearchResult {
+                        conversation: ConversationId(hit.conversation_id),
+                        conversation_title: String::new(),
+                        message_id: MessageId(hit.message_id),
+                        author: hit.author,
+                        sent_at,
+                        snippet: hit.snippet,
+                    }
+                })
+                .collect())
         })
     }
 

@@ -28,6 +28,8 @@ actions!(
         PreviousConversation,
         CloseThread,
         EditLastMessage,
+        SearchMessages,
+        ShowTimeline,
         OpenSettings,
         Quit,
         CommandPalette,
@@ -168,6 +170,8 @@ fn main() {
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("alt-down", NextConversation, None),
                 KeyBinding::new("alt-up", PreviousConversation, None),
+                KeyBinding::new("cmd-shift-t", ShowTimeline, None),
+                KeyBinding::new("cmd-f", SearchMessages, Some("Snak")),
                 KeyBinding::new("up", EditLastMessage, Some("Snak")),
                 KeyBinding::new("escape", CloseThread, Some("Snak")),
             ]);

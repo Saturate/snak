@@ -21,6 +21,14 @@ const GRAPH_BATCH_LIMIT: usize = 20;
 // Skype tokens share the access token cache; this key can never collide with a scope URL.
 const SKYPE_TOKEN_KEY: &str = "skypetoken";
 
+pub struct SearchHit {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub author: String,
+    pub sent_at: Option<String>,
+    pub snippet: String,
+}
+
 pub struct TeamsClient {
     http: reqwest::Client,
     refresh_token: Mutex<String>,
@@ -545,6 +553,59 @@ impl TeamsClient {
             })
             .await?;
         Ok(())
+    }
+
+    /// Searches message history via the Graph search API.
+    pub async fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let query: String = query
+            .chars()
+            .filter(|&c| !matches!(c, '"' | '\\'))
+            .collect();
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = "https://graph.microsoft.com/v1.0/search/query";
+        let body = json!({
+            "requests": [{
+                "entityTypes": ["chatMessage"],
+                "query": { "queryString": query },
+                "from": 0,
+                "size": limit.min(25),
+            }]
+        });
+        let res: Value = self
+            .call(scope::GRAPH, url, |http, token| {
+                http.post(url).bearer_auth(token).json(&body)
+            })
+            .await?;
+        let hits = res["value"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|page| page["hitsContainers"].as_array().into_iter().flatten())
+            .flat_map(|container| container["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| {
+                let resource = &hit["resource"];
+                let summary = hit["summary"].as_str().unwrap_or("").to_string();
+                let channel_identity = &resource["channelIdentity"];
+                let chat_id = resource["chatId"].as_str().map(str::to_string);
+                let channel_id = channel_identity["channelId"].as_str().map(str::to_string);
+                let conversation_id = channel_id.or(chat_id)?;
+                Some(SearchHit {
+                    conversation_id,
+                    message_id: resource["id"].as_str()?.to_string(),
+                    author: resource["from"]
+                        .as_object()
+                        .and_then(|f| f["user"].as_object())
+                        .and_then(|u| u["displayName"].as_str())
+                        .unwrap_or("Unknown")
+                        .to_string(),
+                    sent_at: resource["createdDateTime"].as_str().map(str::to_string),
+                    snippet: summary,
+                })
+            })
+            .collect();
+        Ok(hits)
     }
 
     /// Directory users whose name or mail matches `query`, keyed by object id.

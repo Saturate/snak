@@ -276,8 +276,25 @@ pub trait ChatBackend: Send + Sync {
         Box::pin(async { Err(ChatError::Other("deleting not supported".into())) })
     }
 
+    /// Searches message history. Returns up to `limit` results matching `query`.
+    fn search<'a>(&'a self, _query: &'a str, _limit: usize) -> BoxFuture<'a, Vec<SearchResult>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Push updates. Backends without push return a receiver that never fires.
     fn subscribe(self: Arc<Self>) -> mpsc::Receiver<Event>;
+}
+
+/// One hit from [`ChatBackend::search`].
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub conversation: ConversationId,
+    pub conversation_title: String,
+    pub message_id: MessageId,
+    pub author: String,
+    pub sent_at: Option<DateTime<Utc>>,
+    /// Plain-text snippet with the match highlighted.
+    pub snippet: String,
 }
 
 /// What the user needs to sign in with a device code.
